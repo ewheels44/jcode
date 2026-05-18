@@ -466,6 +466,7 @@ fn test_grouped_batch_restore_uses_last_active_at_and_includes_debug_sessions() 
         .expect("expected eligible crashed sessions");
 
     assert_eq!(crashed.session_ids.len(), 2);
+    assert_eq!(crashed.omitted_crashed_count, 1);
     assert!(crashed.session_ids.contains(&recent_normal.id));
     assert!(crashed.session_ids.contains(&recent_debug.id));
     assert!(
@@ -474,6 +475,18 @@ fn test_grouped_batch_restore_uses_last_active_at_and_includes_debug_sessions() 
             .iter()
             .any(|id| id == "session_stale_crash")
     );
+
+    let mut picker = picker;
+    let action = picker
+        .handle_overlay_key(KeyCode::Char('R'), KeyModifiers::empty())
+        .expect("restore group key should be handled");
+    let OverlayAction::Selected(PickerResult::RestoreCrashedGroup(ids)) = action else {
+        panic!("expected restore group action");
+    };
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&recent_normal.id));
+    assert!(ids.contains(&recent_debug.id));
+    assert!(!ids.iter().any(|id| id == "session_stale_crash"));
 }
 
 #[test]

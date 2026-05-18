@@ -571,6 +571,50 @@ fn test_recover_crashed_sessions_preserves_debug_flag() -> Result<()> {
 }
 
 #[test]
+fn test_recover_crashed_sessions_by_ids_restores_only_selected_group() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-recover-selected-crash-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+    let _test_flag = EnvVarGuard::set("JCODE_TEST_SESSION", "0");
+
+    let now = Utc::now();
+    for (id, active_at) in [
+        ("session_selected_crash", now),
+        (
+            "session_stale_unselected_crash",
+            now - chrono::Duration::minutes(5),
+        ),
+    ] {
+        let mut crashed = Session::create_with_id(id.to_string(), None, Some(id.to_string()));
+        crashed.mark_crashed(Some("test crash".to_string()));
+        crashed.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("message from {id}"),
+                cache_control: None,
+            }],
+        );
+        crashed.last_active_at = Some(active_at);
+        crashed.save()?;
+    }
+
+    let recovered_ids = recover_crashed_sessions_by_ids(&["session_selected_crash".to_string()])?;
+    assert_eq!(recovered_ids.len(), 1);
+
+    let recovered = Session::load(&recovered_ids[0])?;
+    assert_eq!(
+        recovered.parent_id.as_deref(),
+        Some("session_selected_crash")
+    );
+    let stale = Session::load("session_stale_unselected_crash")?;
+    assert!(matches!(stale.status, SessionStatus::Crashed { .. }));
+    Ok(())
+}
+
+#[test]
 fn test_save_persists_full_session_content() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()

@@ -1225,6 +1225,7 @@ pub(super) fn crashed_sessions_from_all_sessions(
         return None;
     }
 
+    let total_unrecovered_crashed = crashed.len();
     let crash_timestamp =
         |session: &SessionInfo| session.last_active_at.unwrap_or(session.last_message_time);
     let most_recent = crashed
@@ -1246,6 +1247,7 @@ pub(super) fn crashed_sessions_from_all_sessions(
         session_ids: crashed.iter().map(|s| s.id.clone()).collect(),
         display_names: crashed.iter().map(|s| s.short_name.clone()).collect(),
         most_recent_crash: most_recent,
+        omitted_crashed_count: total_unrecovered_crashed.saturating_sub(crashed.len()),
     })
 }
 

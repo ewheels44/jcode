@@ -7,9 +7,28 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use std::collections::HashSet;
 
-/// Recover crashed sessions from the most recent crash window (text-only).
+const RELEVANT_CRASH_GROUP_WINDOW_SECS: i64 = 60;
+
+/// Recover crashed sessions from the most relevant crash group (text-only).
 /// Returns new recovery session IDs (most recent first).
 pub fn recover_crashed_sessions() -> Result<Vec<String>> {
+    recover_crashed_sessions_matching(None)
+}
+
+/// Recover the specific crashed sessions chosen by the picker.
+///
+/// This is intentionally stricter than `recover_crashed_sessions`: the picker has
+/// already guessed the relevant crash group, so this avoids restoring stale
+/// crashed sessions that happen to still exist on disk.
+pub fn recover_crashed_sessions_by_ids(session_ids: &[String]) -> Result<Vec<String>> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let allowed: HashSet<String> = session_ids.iter().cloned().collect();
+    recover_crashed_sessions_matching(Some(&allowed))
+}
+
+fn recover_crashed_sessions_matching(allowed_ids: Option<&HashSet<String>>) -> Result<Vec<String>> {
     let sessions_dir = storage::jcode_dir()?.join("sessions");
     if !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -43,30 +62,24 @@ pub fn recover_crashed_sessions() -> Result<Vec<String>> {
     let mut crashed: Vec<Session> = sessions
         .into_iter()
         .filter(|s| matches!(s.status, SessionStatus::Crashed { .. }))
+        .filter(|s| !recovered_parents.contains(&s.id))
         .collect();
+
+    if let Some(allowed_ids) = allowed_ids {
+        crashed.retain(|s| allowed_ids.contains(&s.id));
+    }
+
     if crashed.is_empty() {
         return Ok(Vec::new());
     }
 
-    let crash_window = Duration::seconds(60);
-    let most_recent = crashed
-        .iter()
-        .map(|s| s.last_active_at.unwrap_or(s.updated_at))
-        .max()
-        .unwrap_or_else(Utc::now);
-    crashed.retain(|s| {
-        let ts = s.last_active_at.unwrap_or(s.updated_at);
-        let delta = most_recent.signed_duration_since(ts);
-        delta >= Duration::zero() && delta <= crash_window
-    });
-    crashed.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    if allowed_ids.is_none() {
+        retain_relevant_crash_group(&mut crashed);
+    }
+    crashed.sort_by_key(|session| std::cmp::Reverse(crash_timestamp(session)));
 
     let mut new_ids = Vec::new();
     for mut old in crashed {
-        if recovered_parents.contains(&old.id) {
-            continue;
-        }
-
         let new_id = format!("session_recovery_{}", crate::id::new_id("rec"));
         let mut new_session =
             Session::create_with_id(new_id.clone(), Some(old.id.clone()), old.title.clone());
@@ -115,15 +128,31 @@ pub fn recover_crashed_sessions() -> Result<Vec<String>> {
     Ok(new_ids)
 }
 
+fn crash_timestamp(session: &Session) -> DateTime<Utc> {
+    session.last_active_at.unwrap_or(session.updated_at)
+}
+
+fn retain_relevant_crash_group(crashed: &mut Vec<Session>) -> Option<DateTime<Utc>> {
+    let most_recent = crashed.iter().map(crash_timestamp).max()?;
+    let crash_window = Duration::seconds(RELEVANT_CRASH_GROUP_WINDOW_SECS);
+    crashed.retain(|s| {
+        let delta = most_recent.signed_duration_since(crash_timestamp(s));
+        delta >= Duration::zero() && delta <= crash_window
+    });
+    Some(most_recent)
+}
+
 /// Info about crashed sessions pending batch restore
 #[derive(Debug, Clone)]
 pub struct CrashedSessionsInfo {
-    /// Session IDs that crashed
+    /// Session IDs in the guessed relevant restore group.
     pub session_ids: Vec<String>,
-    /// Display names of crashed sessions
+    /// Display names of sessions in the guessed relevant restore group.
     pub display_names: Vec<String>,
     /// When the most recent crash occurred
     pub most_recent_crash: DateTime<Utc>,
+    /// Crashed sessions excluded because they were outside the relevant group.
+    pub omitted_crashed_count: usize,
 }
 
 /// Detect crashed sessions that can be batch restored.
@@ -171,26 +200,15 @@ pub fn detect_crashed_sessions() -> Result<Option<CrashedSessionsInfo>> {
         return Ok(None);
     }
 
-    // Apply 60-second crash window filter
-    let crash_window = Duration::seconds(60);
-    let most_recent = crashed
-        .iter()
-        .map(|s| s.last_active_at.unwrap_or(s.updated_at))
-        .max()
-        .unwrap_or_else(Utc::now);
-
-    crashed.retain(|s| {
-        let ts = s.last_active_at.unwrap_or(s.updated_at);
-        let delta = most_recent.signed_duration_since(ts);
-        delta >= Duration::zero() && delta <= crash_window
-    });
+    let total_unrecovered_crashed = crashed.len();
+    let most_recent = retain_relevant_crash_group(&mut crashed).unwrap_or_else(Utc::now);
 
     if crashed.is_empty() {
         return Ok(None);
     }
 
     // Sort by most recent first
-    crashed.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    crashed.sort_by_key(|session| std::cmp::Reverse(crash_timestamp(session)));
 
     let session_ids: Vec<String> = crashed.iter().map(|s| s.id.clone()).collect();
     let display_names: Vec<String> = crashed
@@ -202,6 +220,7 @@ pub fn detect_crashed_sessions() -> Result<Option<CrashedSessionsInfo>> {
         session_ids,
         display_names,
         most_recent_crash: most_recent,
+        omitted_crashed_count: total_unrecovered_crashed.saturating_sub(crashed.len()),
     }))
 }
 
@@ -548,6 +567,7 @@ mod batch_crash_tests {
             session_ids: vec!["session_test_1".to_string(), "session_test_2".to_string()],
             display_names: vec!["fox".to_string(), "oak".to_string()],
             most_recent_crash: Utc::now(),
+            omitted_crashed_count: 0,
         };
         assert_eq!(info.session_ids.len(), 2);
         assert_eq!(info.display_names.len(), 2);
