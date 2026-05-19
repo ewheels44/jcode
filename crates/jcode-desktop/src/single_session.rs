@@ -3554,6 +3554,14 @@ fn take_current_inline_spans(
     spans
 }
 
+fn safe_utf8_prefix_len(text: &str, desired_len: usize) -> usize {
+    let mut len = desired_len.min(text.len());
+    while len > 0 && !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
 pub(crate) fn single_session_trimmed_line_end_preserving_inline_code_whitespace(
     text: &str,
     inline_spans: &[SingleSessionInlineSpan],
@@ -4244,12 +4252,10 @@ impl AssistantMarkdownRenderer {
             &self.current_inline_spans,
         );
         if trimmed_len > 0 {
-            let trimmed = self
-                .current
-                .get(..trimmed_len)
-                .expect("trimmed markdown line end should be a UTF-8 boundary");
+            let safe_trimmed_len = safe_utf8_prefix_len(&self.current, trimmed_len);
+            let trimmed = &self.current[..safe_trimmed_len];
             let inline_spans =
-                take_current_inline_spans(&mut self.current_inline_spans, trimmed_len);
+                take_current_inline_spans(&mut self.current_inline_spans, safe_trimmed_len);
             self.lines.push(SingleSessionStyledLine::with_inline_spans(
                 trimmed,
                 style,
@@ -5277,5 +5283,17 @@ mod tests {
             "{\"intent\":\"describe action\",\"query\":\"tool calls\"}",
         );
         assert_eq!(lines, vec!["query: tool calls", "intent: describe action"]);
+    }
+
+    #[test]
+    fn safe_utf8_prefix_len_rounds_down_to_char_boundary() {
+        let text = "aé🚀";
+
+        assert_eq!(safe_utf8_prefix_len(text, 0), 0);
+        assert_eq!(safe_utf8_prefix_len(text, 1), 1);
+        assert_eq!(safe_utf8_prefix_len(text, 2), 1);
+        assert_eq!(safe_utf8_prefix_len(text, 3), 3);
+        assert_eq!(safe_utf8_prefix_len(text, 6), 3);
+        assert_eq!(safe_utf8_prefix_len(text, usize::MAX), text.len());
     }
 }

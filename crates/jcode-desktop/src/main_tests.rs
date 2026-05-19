@@ -43,6 +43,35 @@ fn visible_column_count_is_clamped_and_safe_without_monitor() {
 }
 
 #[test]
+fn desktop_surface_size_renderable_requires_non_zero_dimensions() {
+    assert!(desktop_surface_size_is_renderable(PhysicalSize::new(1, 1)));
+    assert!(!desktop_surface_size_is_renderable(PhysicalSize::new(0, 1)));
+    assert!(!desktop_surface_size_is_renderable(PhysicalSize::new(1, 0)));
+    assert!(!desktop_surface_size_is_renderable(PhysicalSize::new(0, 0)));
+}
+
+#[test]
+fn surface_timeout_backoff_doubles_until_cap_and_resets() {
+    let mut backoff = SurfaceTimeoutBackoff::default();
+    let delays = (0..8)
+        .map(|_| backoff.record_timeout().0)
+        .collect::<Vec<_>>();
+
+    assert_eq!(delays[0], SURFACE_TIMEOUT_BACKOFF_MIN);
+    assert_eq!(delays[1], SURFACE_TIMEOUT_BACKOFF_MIN * 2);
+    assert_eq!(delays[2], SURFACE_TIMEOUT_BACKOFF_MIN * 4);
+    assert!(delays.windows(2).all(|pair| pair[1] >= pair[0]));
+    assert!(
+        delays
+            .iter()
+            .all(|delay| *delay <= SURFACE_TIMEOUT_BACKOFF_MAX)
+    );
+
+    backoff.reset();
+    assert_eq!(backoff.record_timeout().0, SURFACE_TIMEOUT_BACKOFF_MIN);
+}
+
+#[test]
 fn workspace_status_text_includes_build_hash() {
     let mut workspace = Workspace::fake();
 
