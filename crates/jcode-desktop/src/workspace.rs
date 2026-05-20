@@ -124,6 +124,10 @@ pub enum KeyOutcome {
     },
     CancelGeneration,
     CopyLatestResponse(String),
+    CopyText {
+        text: String,
+        success_notice: &'static str,
+    },
     CutDraftToClipboard(String),
     LoadModelCatalog,
     LoadSessionSwitcher,

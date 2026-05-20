@@ -998,6 +998,72 @@ fn single_session_slash_copy_reports_missing_response_locally() {
 }
 
 #[test]
+fn single_session_rich_copy_search_and_media_wiring_are_available() {
+    let mut app = SingleSessionApp::new(None);
+    app.messages.push(SingleSessionMessage::assistant(
+        "# Result\n\nAlpha text.\n\n```rust\nfn main() { let value = 42; }\n```",
+    ));
+    app.messages.push(SingleSessionMessage::tool(
+        "▾ shell running: cargo test\n  input: cargo test\n  \\x1b[32mok\\x1b[0m",
+    ));
+
+    app.handle_key(KeyInput::Character("/copy code".to_string()));
+    assert_eq!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::CopyText {
+            text: "fn main() { let value = 42; }\n".to_string(),
+            success_notice: "copied latest code block",
+        }
+    );
+
+    app.handle_key(KeyInput::Character("/search alpha".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(app.status.as_deref(), Some("1 match(es) for \"alpha\""));
+
+    app.pending_images
+        .push(("image/png".to_string(), "base64-data".to_string()));
+    app.handle_key(KeyInput::Character("attached".to_string()));
+    assert!(matches!(
+        app.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::StartFreshSession { .. }
+    ));
+    let document = app.rich_transcript_document();
+    assert!(document.blocks.iter().any(|block| matches!(
+        block.kind,
+        desktop_rich_text::TranscriptBlockKind::ImageAttachment { .. }
+    )));
+    assert!(document.jumps.iter().any(|jump| jump.kind == desktop_rich_text::TranscriptJumpKind::Media));
+}
+
+#[test]
+fn single_session_rich_transcript_virtualizes_and_copies_transcript() {
+    let mut app = SingleSessionApp::new(None);
+    for index in 0..120 {
+        app.messages.push(SingleSessionMessage::assistant(format!(
+            "line {index}\n\n```json\n{{\"index\": {index}}}\n```"
+        )));
+    }
+
+    let document = app.rich_transcript_document();
+    let window = desktop_rich_text::VirtualLineWindow::for_viewport(document.total_lines, 50, 10, 3);
+    assert!(window.start < window.end);
+    assert!(window.end - window.start <= 16);
+
+    app.handle_key(KeyInput::Character("/copy transcript".to_string()));
+    match app.handle_key(KeyInput::SubmitDraft) {
+        KeyOutcome::CopyText {
+            text,
+            success_notice,
+        } => {
+            assert_eq!(success_notice, "copied transcript");
+            assert!(text.contains("line 0"));
+            assert!(text.contains("line 119"));
+        }
+        other => panic!("expected transcript copy, got {other:?}"),
+    }
+}
+
+#[test]
 fn single_session_transcript_roles_render_without_stringly_labels() {
     let mut app = SingleSessionApp::new(None);
     app.messages.push(SingleSessionMessage::user("question"));
@@ -1927,7 +1993,7 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
     );
     assert_eq!(
         style_for_text(&lines, "  rust"),
-        Some(SingleSessionLineStyle::Code)
+        Some(SingleSessionLineStyle::CodeHeader)
     );
     assert_eq!(
         style_for_text(&lines, "  fn main() {}"),
@@ -2019,7 +2085,7 @@ fn glyphon_body_buffer_uses_line_style_colors() {
     );
     assert_eq!(
         first_glyph_color_for_text(body, "  rust"),
-        Some(single_session_line_color(SingleSessionLineStyle::Code))
+        Some(single_session_line_color(SingleSessionLineStyle::CodeHeader))
     );
     assert_eq!(
         first_glyph_color_for_text(body, "  bash done"),

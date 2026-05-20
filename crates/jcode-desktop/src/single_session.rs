@@ -1,4 +1,5 @@
 use crate::{
+    desktop_rich_text,
     session_launch::{
         DesktopModelChoice, DesktopSessionEvent, DesktopSessionHandle, DesktopSessionStatus,
     },
@@ -41,7 +42,8 @@ const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "reset to a fresh desktop session"),
     ("/sessions", "open the recent session switcher"),
     ("/model [name]", "open model picker or switch to a model"),
-    ("/copy", "copy the latest assistant response"),
+    ("/copy [latest|code|transcript]", "copy latest response, latest code block, or transcript"),
+    ("/search <query>", "count transcript matches and jump to the first one"),
     ("/stop", "interrupt the running generation"),
     ("/status", "show current desktop session status"),
     ("/quit", "exit the desktop app"),
@@ -775,6 +777,7 @@ impl SessionSwitcherState {
 #[derive(Clone, Debug)]
 pub(crate) struct SingleSessionMessage {
     display: DisplayMessage,
+    rich_attachments: Vec<desktop_rich_text::RichAttachment>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -790,6 +793,16 @@ pub(crate) enum SingleSessionRole {
 impl SingleSessionRole {
     pub(crate) fn is_user(self) -> bool {
         matches!(self, Self::User)
+    }
+}
+
+fn rich_role_from_single_session_role(role: SingleSessionRole) -> desktop_rich_text::TranscriptRole {
+    match role {
+        SingleSessionRole::User => desktop_rich_text::TranscriptRole::User,
+        SingleSessionRole::Assistant => desktop_rich_text::TranscriptRole::Assistant,
+        SingleSessionRole::Tool => desktop_rich_text::TranscriptRole::Tool,
+        SingleSessionRole::System => desktop_rich_text::TranscriptRole::System,
+        SingleSessionRole::Meta => desktop_rich_text::TranscriptRole::Meta,
     }
 }
 
@@ -817,7 +830,18 @@ impl SingleSessionMessage {
     }
 
     pub(crate) fn from_display_message(display: DisplayMessage) -> Self {
-        Self { display }
+        Self {
+            display,
+            rich_attachments: Vec::new(),
+        }
+    }
+
+    fn with_rich_attachments(
+        mut self,
+        attachments: Vec<desktop_rich_text::RichAttachment>,
+    ) -> Self {
+        self.rich_attachments = attachments;
+        self
     }
 
     fn role(&self) -> SingleSessionRole {
@@ -841,11 +865,17 @@ impl SingleSessionMessage {
     fn content_mut(&mut self) -> &mut String {
         &mut self.display.content
     }
+
+    fn rich_attachments(&self) -> &[desktop_rich_text::RichAttachment] {
+        &self.rich_attachments
+    }
 }
 
 impl PartialEq for SingleSessionMessage {
     fn eq(&self, other: &Self) -> bool {
-        self.display.role == other.display.role && self.display.content == other.display.content
+        self.display.role == other.display.role
+            && self.display.content == other.display.content
+            && self.rich_attachments == other.rich_attachments
     }
 }
 
@@ -882,6 +912,7 @@ fn hash_messages_cache_fingerprint<H: Hasher>(messages: &[SingleSessionMessage],
 fn hash_message_cache_fingerprint<H: Hasher>(message: &SingleSessionMessage, hasher: &mut H) {
     message.role().hash(hasher);
     hash_text_cache_fingerprint(message.content(), hasher);
+    message.rich_attachments.hash(hasher);
 }
 
 fn hash_text_cache_fingerprint<H: Hasher>(text: &str, hasher: &mut H) {
@@ -2167,6 +2198,80 @@ impl SingleSessionApp {
             .filter(|message| !message.is_empty())
     }
 
+    pub(crate) fn rich_transcript_document(&self) -> desktop_rich_text::RichTranscriptDocument {
+        desktop_rich_text::build_rich_transcript(
+            &self.rich_transcript_messages(true),
+            &desktop_rich_text::RichTranscriptBuildOptions::default(),
+        )
+    }
+
+    pub(crate) fn search_rich_transcript(
+        &self,
+        query: &str,
+    ) -> Vec<desktop_rich_text::TranscriptSearchMatch> {
+        let document = self.rich_transcript_document();
+        desktop_rich_text::search_transcript(&document, query, false)
+    }
+
+    pub(crate) fn copy_rich_transcript_text(
+        &self,
+        mode: desktop_rich_text::TranscriptCopyMode,
+    ) -> Option<String> {
+        let document = self.rich_transcript_document();
+        desktop_rich_text::copy_transcript_text(&document, mode)
+    }
+
+    pub(crate) fn latest_rich_code_block_text(&self) -> Option<String> {
+        let document = self.rich_transcript_document();
+        document.blocks.iter().rev().find_map(|block| {
+            matches!(block.kind, desktop_rich_text::TranscriptBlockKind::CodeBlock { .. })
+                .then(|| block.copy_text.clone())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rich_transcript_jump_targets(
+        &self,
+    ) -> Vec<desktop_rich_text::TranscriptJumpTarget> {
+        self.rich_transcript_document().jumps
+    }
+
+    fn rich_transcript_messages(
+        &self,
+        include_streaming_response: bool,
+    ) -> Vec<desktop_rich_text::RichTranscriptMessage> {
+        let mut messages = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let mut rich = desktop_rich_text::RichTranscriptMessage::new(
+                    format!("message-{index}"),
+                    rich_role_from_single_session_role(message.role()),
+                    message.content().to_string(),
+                );
+                rich.attachments = message.rich_attachments().to_vec();
+                rich
+            })
+            .collect::<Vec<_>>();
+
+        if include_streaming_response && !self.streaming_response.trim().is_empty() {
+            messages.push(desktop_rich_text::RichTranscriptMessage::new(
+                "streaming-assistant",
+                desktop_rich_text::TranscriptRole::Assistant,
+                self.streaming_response.trim().to_string(),
+            ));
+        }
+        if let Some(error) = &self.error {
+            messages.push(desktop_rich_text::RichTranscriptMessage::new(
+                "desktop-error",
+                desktop_rich_text::TranscriptRole::System,
+                format!("error: {error}"),
+            ));
+        }
+        messages
+    }
+
     pub(crate) fn jump_prompt(&mut self, direction: i32) {
         let lines = self.body_lines();
         let prompt_indices = lines
@@ -2280,7 +2385,7 @@ impl SingleSessionApp {
             return outcome;
         }
         let images = std::mem::take(&mut self.pending_images);
-        self.record_user_submit(&message);
+        self.record_user_submit(&message, &images);
         let Some(session) = &self.session else {
             return KeyOutcome::StartFreshSession { message, images };
         };
@@ -2357,8 +2462,9 @@ impl SingleSessionApp {
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.composer.input_undo_stack.clear();
-                return Some(
-                    self.latest_assistant_response()
+                return Some(match args {
+                    "" | "latest" | "response" => self
+                        .latest_assistant_response()
                         .map(KeyOutcome::CopyLatestResponse)
                         .unwrap_or_else(|| {
                             self.set_status(SingleSessionStatus::Info(
@@ -2366,7 +2472,63 @@ impl SingleSessionApp {
                             ));
                             KeyOutcome::Redraw
                         }),
-                );
+                    "code" | "codeblock" | "code-block" => self
+                        .latest_rich_code_block_text()
+                        .map(|text| KeyOutcome::CopyText {
+                            text,
+                            success_notice: "copied latest code block",
+                        })
+                        .unwrap_or_else(|| {
+                            self.set_status(SingleSessionStatus::Info(
+                                "no code block to copy".to_string(),
+                            ));
+                            KeyOutcome::Redraw
+                        }),
+                    "transcript" | "all" => self
+                        .copy_rich_transcript_text(
+                            desktop_rich_text::TranscriptCopyMode::TranscriptPlainText,
+                        )
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| KeyOutcome::CopyText {
+                            text,
+                            success_notice: "copied transcript",
+                        })
+                        .unwrap_or_else(|| {
+                            self.set_status(SingleSessionStatus::Info(
+                                "no transcript to copy".to_string(),
+                            ));
+                            KeyOutcome::Redraw
+                        }),
+                    _ => {
+                        self.set_status(SingleSessionStatus::Info(
+                            "usage: /copy [latest|code|transcript]".to_string(),
+                        ));
+                        KeyOutcome::Redraw
+                    }
+                });
+            }
+            "/search" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                if args.is_empty() {
+                    self.set_status(SingleSessionStatus::Info(
+                        "usage: /search <query>".to_string(),
+                    ));
+                    KeyOutcome::Redraw
+                } else {
+                    let matches = self.search_rich_transcript(args);
+                    if let Some(first) = matches.first() {
+                        let body_len = self.body_lines().len();
+                        self.body_scroll_lines = body_len.saturating_sub(first.line_index + 1) as f32;
+                    }
+                    self.set_status(SingleSessionStatus::Info(format!(
+                        "{} match(es) for \"{}\"",
+                        matches.len(),
+                        args
+                    )));
+                    KeyOutcome::Redraw
+                }
             }
             "/stop" | "/cancel" => {
                 self.draft.clear();
@@ -2504,7 +2666,7 @@ impl SingleSessionApp {
             return None;
         }
         let (message, images) = self.composer.queued_drafts.remove(0);
-        self.record_user_submit(&message);
+        self.record_user_submit(&message, &images);
         Some((message, images))
     }
 
@@ -2716,8 +2878,20 @@ impl SingleSessionApp {
         (!text.is_empty()).then_some(text)
     }
 
-    fn record_user_submit(&mut self, message: &str) {
-        self.messages.push(SingleSessionMessage::user(message));
+    fn record_user_submit(&mut self, message: &str, images: &[(String, String)]) {
+        let attachments = images
+            .iter()
+            .enumerate()
+            .map(|(index, (media_type, base64_data))| {
+                desktop_rich_text::RichAttachment::image(
+                    format!("user-{}-image-{index}", self.messages.len() + 1),
+                    media_type.clone(),
+                    format!("attached image {}", index + 1),
+                    base64_data.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.messages.push(SingleSessionMessage::user(message).with_rich_attachments(attachments));
         self.draft.clear();
         self.draft_cursor = 0;
         self.composer.input_undo_stack.clear();

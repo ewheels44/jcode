@@ -2,7 +2,9 @@ mod animation;
 mod desktop_config;
 mod desktop_log;
 mod desktop_prefs;
+mod desktop_rich_text;
 mod desktop_session_events;
+mod desktop_ui_engine;
 mod power_inhibit;
 mod render_helpers;
 mod session_data;
@@ -860,6 +862,14 @@ async fn run() -> Result<()> {
                         }
                         KeyOutcome::CopyLatestResponse(text) => {
                             copy_text_to_clipboard(&text, "copied latest response", &mut app);
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::CopyText {
+                            text,
+                            success_notice,
+                        } => {
+                            copy_text_to_clipboard(&text, success_notice, &mut app);
                             window.set_title(&app.status_title());
                             window.request_redraw();
                         }
