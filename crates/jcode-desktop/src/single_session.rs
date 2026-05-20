@@ -38,10 +38,23 @@ pub(crate) const HANDWRITTEN_WELCOME_PHRASES: &[&str] = &["Hello there"];
 
 const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show desktop shortcuts and slash commands"),
-    ("/clear", "clear the visible desktop transcript"),
+    ("/?", "alias for /help"),
+    ("/commands", "alias for /help"),
+    ("/clear", "clear conversation history"),
     ("/new", "reset to a fresh desktop session"),
+    ("/resume", "open the recent session switcher"),
     ("/sessions", "open the recent session switcher"),
     ("/model [name]", "open model picker or switch to a model"),
+    ("/models", "alias for /model"),
+    ("/refresh-model-list", "refresh provider model catalogs"),
+    ("/effort [level]", "show or change reasoning effort"),
+    ("/fast [on|off|status]", "show or toggle OpenAI fast mode"),
+    ("/transport [mode]", "show or change OpenAI transport"),
+    (
+        "/compact [mode <mode>]",
+        "compact context or set compaction mode",
+    ),
+    ("/rename <title|--clear>", "rename the current session"),
     (
         "/copy [latest|code|transcript]",
         "copy latest response, latest code block, or transcript",
@@ -127,6 +140,7 @@ pub(crate) struct SingleSessionApp {
     pub(crate) session_switcher: SessionSwitcherState,
     pub(crate) stdin_response: Option<StdinResponseState>,
     slash_suggestions: SlashSuggestionState,
+    runtime_settings: SingleSessionRuntimeSettings,
     welcome: SingleSessionWelcomeState,
     composer: SingleSessionComposerState,
     selection: SingleSessionSelectionState,
@@ -197,6 +211,14 @@ impl Default for SingleSessionRuntimeState {
             reload_phase: ReloadPhase::Stable,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SingleSessionRuntimeSettings {
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    transport: Option<String>,
+    compaction_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -990,6 +1012,7 @@ impl SingleSessionApp {
             session_switcher: SessionSwitcherState::default(),
             stdin_response: None,
             slash_suggestions: SlashSuggestionState::default(),
+            runtime_settings: SingleSessionRuntimeSettings::default(),
             welcome,
             composer: SingleSessionComposerState::default(),
             selection: SingleSessionSelectionState::default(),
@@ -1064,6 +1087,7 @@ impl SingleSessionApp {
         self.composer = SingleSessionComposerState::default();
         self.selection = SingleSessionSelectionState::default();
         self.runtime = SingleSessionRuntimeState::default();
+        self.runtime_settings = SingleSessionRuntimeSettings::default();
         self.tool = SingleSessionToolState::default();
         self.view.inline_widget_opened_at = None;
     }
@@ -1234,6 +1258,45 @@ impl SingleSessionApp {
     }
 
     fn set_backend_status(&mut self, status: DesktopSessionStatus) {
+        match &status {
+            DesktopSessionStatus::ReasoningEffort(effort) => {
+                self.runtime_settings.reasoning_effort = Some(effort.clone());
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "reasoning effort set to {effort}"
+                )));
+            }
+            DesktopSessionStatus::ServiceTier(service_tier) => {
+                self.runtime_settings.service_tier = Some(service_tier.clone());
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "fast mode set to {service_tier}"
+                )));
+            }
+            DesktopSessionStatus::Transport(transport) => {
+                self.runtime_settings.transport = Some(transport.clone());
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "transport set to {transport}"
+                )));
+            }
+            DesktopSessionStatus::CompactionMode(mode) => {
+                self.runtime_settings.compaction_mode = Some(mode.clone());
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "compaction mode set to {mode}"
+                )));
+            }
+            DesktopSessionStatus::ReasoningEffortFailed(error)
+            | DesktopSessionStatus::ServiceTierFailed(error)
+            | DesktopSessionStatus::TransportFailed(error)
+            | DesktopSessionStatus::CompactionModeFailed(error) => {
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "slash command failed: {error}"
+                )));
+            }
+            DesktopSessionStatus::CompactResult { message, .. } => {
+                self.messages
+                    .push(SingleSessionMessage::meta(message.clone()));
+            }
+            _ => {}
+        }
         self.set_status(SingleSessionStatus::Backend(status));
     }
 
@@ -2289,6 +2352,25 @@ impl SingleSessionApp {
                 self.live_session_id = Some(session_id);
                 self.set_status(SingleSessionStatus::Connected);
             }
+            DesktopSessionEvent::SessionRenamed {
+                title,
+                display_title,
+            } => {
+                if let Some(session) = &mut self.session {
+                    session.title = display_title.clone();
+                }
+                let message = if title.is_some() {
+                    format!("renamed session to {display_title}")
+                } else {
+                    format!("cleared session name; title is now {display_title}")
+                };
+                self.messages.push(SingleSessionMessage::meta(message));
+                self.set_status(SingleSessionStatus::Info(if title.is_some() {
+                    "session renamed".to_string()
+                } else {
+                    "session name cleared".to_string()
+                }));
+            }
             DesktopSessionEvent::TextDelta(text) => {
                 self.runtime.reload_phase = ReloadPhase::Stable;
                 self.streaming_response.push_str(&text);
@@ -2375,7 +2457,19 @@ impl SingleSessionApp {
                 current_model,
                 provider_name,
                 models,
+                reasoning_effort,
+                service_tier,
+                compaction_mode,
             } => {
+                if let Some(reasoning_effort) = reasoning_effort {
+                    self.runtime_settings.reasoning_effort = Some(reasoning_effort);
+                }
+                if let Some(service_tier) = service_tier {
+                    self.runtime_settings.service_tier = Some(service_tier);
+                }
+                if let Some(compaction_mode) = compaction_mode {
+                    self.runtime_settings.compaction_mode = Some(compaction_mode);
+                }
                 self.model_picker
                     .apply_catalog(current_model, provider_name, models);
                 self.set_status(SingleSessionStatus::ModelsLoaded);
@@ -2740,7 +2834,7 @@ impl SingleSessionApp {
         let args = parts.next().unwrap_or_default().trim();
 
         let outcome = match command {
-            "/help" | "/?" => {
+            "/help" | "/?" | "/commands" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.composer.input_undo_stack.clear();
@@ -2762,11 +2856,13 @@ impl SingleSessionApp {
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.composer.input_undo_stack.clear();
-                self.set_status(SingleSessionStatus::Info(
-                    "cleared visible transcript".to_string(),
-                ));
+                self.set_status(SingleSessionStatus::Info("session cleared".to_string()));
                 self.scroll_body_to_bottom();
-                KeyOutcome::Redraw
+                if self.session.is_some() || self.live_session_id.is_some() {
+                    KeyOutcome::ClearServerSession
+                } else {
+                    KeyOutcome::Redraw
+                }
             }
             "/new" => {
                 self.draft.clear();
@@ -2774,7 +2870,7 @@ impl SingleSessionApp {
                 self.composer.input_undo_stack.clear();
                 KeyOutcome::SpawnSession
             }
-            "/sessions" | "/session" => {
+            "/sessions" | "/session" | "/resume" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.composer.input_undo_stack.clear();
@@ -2788,6 +2884,138 @@ impl SingleSessionApp {
                     return Some(self.open_model_picker());
                 }
                 KeyOutcome::SetModel(args.to_string())
+            }
+            "/refresh-model-list" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.model_picker.open_loading();
+                self.set_status(SingleSessionStatus::Info(
+                    "refreshing model list".to_string(),
+                ));
+                KeyOutcome::RefreshModelCatalog
+            }
+            "/effort" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                if args.is_empty() || args == "status" {
+                    let current = self
+                        .runtime_settings
+                        .reasoning_effort
+                        .as_deref()
+                        .unwrap_or("default");
+                    self.set_status(SingleSessionStatus::Info(format!(
+                        "effort: {current} · use /effort <none|low|medium|high|xhigh>"
+                    )));
+                    KeyOutcome::Redraw
+                } else if matches!(args, "none" | "low" | "medium" | "high" | "xhigh") {
+                    KeyOutcome::SetReasoningEffort(args.to_string())
+                } else {
+                    self.set_status(SingleSessionStatus::Info(
+                        "usage: /effort <none|low|medium|high|xhigh>".to_string(),
+                    ));
+                    KeyOutcome::Redraw
+                }
+            }
+            "/fast" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                match args {
+                    "" | "status" => {
+                        let current = self
+                            .runtime_settings
+                            .service_tier
+                            .as_deref()
+                            .unwrap_or("standard");
+                        self.set_status(SingleSessionStatus::Info(format!(
+                            "fast mode: {current} · use /fast <on|off|status>"
+                        )));
+                        KeyOutcome::Redraw
+                    }
+                    "on" => KeyOutcome::SetServiceTier("priority".to_string()),
+                    "off" => KeyOutcome::SetServiceTier("off".to_string()),
+                    _ => {
+                        self.set_status(SingleSessionStatus::Info(
+                            "usage: /fast [on|off|status]".to_string(),
+                        ));
+                        KeyOutcome::Redraw
+                    }
+                }
+            }
+            "/transport" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                match args {
+                    "" | "status" => {
+                        let current = self
+                            .runtime_settings
+                            .transport
+                            .as_deref()
+                            .unwrap_or("unknown");
+                        self.set_status(SingleSessionStatus::Info(format!(
+                            "transport: {current} · use /transport <auto|https|websocket>"
+                        )));
+                        KeyOutcome::Redraw
+                    }
+                    "auto" | "https" | "websocket" => KeyOutcome::SetTransport(args.to_string()),
+                    _ => {
+                        self.set_status(SingleSessionStatus::Info(
+                            "usage: /transport <auto|https|websocket>".to_string(),
+                        ));
+                        KeyOutcome::Redraw
+                    }
+                }
+            }
+            "/compact" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                if args.is_empty() {
+                    KeyOutcome::CompactSession
+                } else if args == "mode" || args == "mode status" {
+                    let current = self
+                        .runtime_settings
+                        .compaction_mode
+                        .as_deref()
+                        .unwrap_or("reactive");
+                    self.set_status(SingleSessionStatus::Info(format!(
+                        "compaction: {current} · use /compact mode <reactive|proactive|semantic>"
+                    )));
+                    KeyOutcome::Redraw
+                } else if let Some(mode) = args.strip_prefix("mode ") {
+                    let mode = mode.trim();
+                    if matches!(mode, "reactive" | "proactive" | "semantic") {
+                        KeyOutcome::SetCompactionMode(mode.to_string())
+                    } else {
+                        self.set_status(SingleSessionStatus::Info(
+                            "usage: /compact mode <reactive|proactive|semantic>".to_string(),
+                        ));
+                        KeyOutcome::Redraw
+                    }
+                } else {
+                    self.set_status(SingleSessionStatus::Info(
+                        "usage: /compact [mode <reactive|proactive|semantic>]".to_string(),
+                    ));
+                    KeyOutcome::Redraw
+                }
+            }
+            "/rename" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                if args.is_empty() {
+                    self.set_status(SingleSessionStatus::Info(
+                        "usage: /rename <session name> or /rename --clear".to_string(),
+                    ));
+                    KeyOutcome::Redraw
+                } else if args == "--clear" {
+                    KeyOutcome::RenameSession(None)
+                } else {
+                    KeyOutcome::RenameSession(Some(args.to_string()))
+                }
             }
             "/copy" => {
                 self.draft.clear();

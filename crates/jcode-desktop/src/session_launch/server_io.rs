@@ -610,6 +610,67 @@ pub(super) fn read_model_catalog(
 }
 
 #[cfg(unix)]
+pub(super) fn read_control_response(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+    event_tx: Option<&DesktopSessionEventSender>,
+    request_id: u64,
+    expected_event_types: &[&str],
+    action_label: &str,
+) -> Result<()> {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(SERVER_CONNECT_RETRY_DELAY))
+        .context("failed to configure server socket timeout")?;
+    let started = Instant::now();
+    let mut line = String::new();
+    while started.elapsed() < timeout {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => anyhow::bail!("jcode server disconnected while {action_label}"),
+            Ok(_) => {
+                let value = parse_server_event_line(&line, action_label)?;
+                let event_type = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let event_id = value.get("id").and_then(Value::as_u64);
+                let id_matches = event_id == Some(request_id);
+
+                if expected_event_types.contains(&event_type) && (id_matches || event_id.is_none())
+                {
+                    if let Some(event) = desktop_event_from_server_value(&value) {
+                        send_desktop_event_ref(event_tx, event);
+                    }
+                    return Ok(());
+                }
+
+                forward_non_done_server_event(event_tx, &value);
+                if event_type == "error" && id_matches {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown server error");
+                    crate::desktop_log::error(format_args!(
+                        "jcode-desktop: jcode server rejected {action_label} id={request_id}: {}",
+                        crate::desktop_log::truncate_for_log(message, 2048)
+                    ));
+                    anyhow::bail!("jcode server rejected {action_label}: {message}");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("failed to read jcode server event"),
+        }
+    }
+
+    anyhow::bail!("timed out waiting for jcode server while {action_label}")
+}
+
+#[cfg(unix)]
 pub(super) fn write_json_line(writer: &mut UnixStream, value: Value) -> Result<()> {
     serde_json::to_writer(&mut *writer, &value).context("failed to encode server request")?;
     writer

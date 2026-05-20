@@ -93,6 +93,58 @@ fn desktop_event_parser_maps_streaming_server_events() {
     );
     assert_eq!(
         desktop_event_from_server_value(&json!({
+            "type": "service_tier_changed",
+            "service_tier": "priority"
+        })),
+        Some(DesktopSessionEvent::Status(
+            DesktopSessionStatus::ServiceTier("priority".to_string())
+        ))
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "transport_changed",
+            "transport": "websocket"
+        })),
+        Some(DesktopSessionEvent::Status(
+            DesktopSessionStatus::Transport("websocket".to_string())
+        ))
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "compaction_mode_changed",
+            "mode": "semantic"
+        })),
+        Some(DesktopSessionEvent::Status(
+            DesktopSessionStatus::CompactionMode("semantic".to_string())
+        ))
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "compact_result",
+            "message": "Compaction started",
+            "success": true
+        })),
+        Some(DesktopSessionEvent::Status(
+            DesktopSessionStatus::CompactResult {
+                message: "Compaction started".to_string(),
+                success: true,
+            }
+        ))
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "session_renamed",
+            "session_id": "session_test",
+            "title": "Custom title",
+            "display_title": "Custom title"
+        })),
+        Some(DesktopSessionEvent::SessionRenamed {
+            title: Some("Custom title".to_string()),
+            display_title: "Custom title".to_string(),
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
             "type": "reloading",
             "new_socket": "/tmp/jcode-new.sock"
         })),
@@ -120,6 +172,9 @@ fn desktop_event_parser_maps_streaming_server_events() {
             "messages": [],
             "provider_name": "Claude",
             "provider_model": "claude-sonnet-4-5",
+            "reasoning_effort": "high",
+            "service_tier": "priority",
+            "compaction_mode": "semantic",
             "available_model_routes": [
                 {
                     "model": "claude-sonnet-4-5",
@@ -139,7 +194,10 @@ fn desktop_event_parser_maps_streaming_server_events() {
                 api_method: Some("responses".to_string()),
                 detail: Some("active account".to_string()),
                 available: true,
-            }]
+            }],
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            compaction_mode: Some("semantic".to_string()),
         })
     );
     assert_eq!(

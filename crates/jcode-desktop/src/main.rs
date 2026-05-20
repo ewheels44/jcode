@@ -969,6 +969,119 @@ async fn run() -> Result<()> {
                             window.set_title(&app.status_title());
                             window.request_redraw();
                         }
+                        KeyOutcome::RefreshModelCatalog => {
+                            if let Err(error) = session_launch::spawn_refresh_models(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetReasoningEffort(effort) => {
+                            if let Err(error) = session_launch::spawn_set_reasoning_effort(
+                                effort,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::SwitchingReasoningEffort,
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetServiceTier(service_tier) => {
+                            if let Err(error) = session_launch::spawn_set_service_tier(
+                                service_tier,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting fast mode"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetTransport(transport) => {
+                            if let Err(error) = session_launch::spawn_set_transport(
+                                transport,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting transport"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::SetCompactionMode(mode) => {
+                            if let Err(error) = session_launch::spawn_set_compaction_mode(
+                                mode,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("setting compaction mode"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::CompactSession => {
+                            if let Err(error) = session_launch::spawn_compact_session(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("requesting compaction"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::RenameSession(title) => {
+                            if let Err(error) = session_launch::spawn_rename_session(
+                                title,
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("renaming session"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
+                        KeyOutcome::ClearServerSession => {
+                            if let Err(error) = session_launch::spawn_clear_server_session(
+                                app.single_session_live_id(),
+                                session_event_tx.clone(),
+                            ) {
+                                apply_single_session_error(&mut app, error);
+                            } else {
+                                app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+                                    DesktopSessionStatus::external("clearing session"),
+                                ));
+                            }
+                            window.set_title(&app.status_title());
+                            window.request_redraw();
+                        }
                         KeyOutcome::SendStdinResponse { request_id, input } => {
                             if let Err(error) = app.send_single_session_stdin_response(request_id, input)
                             {
@@ -2046,6 +2159,24 @@ fn run_headless_chat_smoke(message: String) -> Result<()> {
                     serde_json::json!({"event": "session", "session_id": id})
                 );
             }
+            session_launch::DesktopSessionEvent::SessionRenamed {
+                title,
+                display_title,
+            } => {
+                last_status = Some(if title.is_some() {
+                    format!("renamed session to {display_title}")
+                } else {
+                    format!("cleared session name; title is now {display_title}")
+                });
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "session_renamed",
+                        "title": title,
+                        "display_title": display_title,
+                    })
+                );
+            }
             session_launch::DesktopSessionEvent::Reloaded { session_id: id } => {
                 session_id = Some(id.clone());
                 last_status = Some("server reconnected".to_string());
@@ -2151,6 +2282,7 @@ fn run_headless_chat_smoke(message: String) -> Result<()> {
                 current_model,
                 provider_name,
                 models,
+                ..
             } => {
                 last_status = Some(format!("models loaded ({})", models.len()));
                 println!(
@@ -4695,6 +4827,7 @@ fn desktop_session_event_refreshes_session_card(
     matches!(
         event,
         session_launch::DesktopSessionEvent::SessionStarted { .. }
+            | session_launch::DesktopSessionEvent::SessionRenamed { .. }
             | session_launch::DesktopSessionEvent::Reloaded { .. }
             | session_launch::DesktopSessionEvent::Done
             | session_launch::DesktopSessionEvent::Error(_)

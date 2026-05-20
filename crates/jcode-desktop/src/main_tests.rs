@@ -867,13 +867,17 @@ fn single_session_slash_suggestions_filter_select_and_submit() {
     assert!(suggestion_text.contains("slash command suggestions"));
     assert!(suggestion_text.contains("/clear"));
     assert!(suggestion_text.contains("/copy [latest|code|transcript]"));
-    assert!(!suggestion_text.contains("/help"));
+    assert!(
+        !suggestions
+            .iter()
+            .any(|line| line.text.trim_start().starts_with("/help "))
+    );
     assert!(suggestions.iter().any(|line| {
-        line.style == SingleSessionLineStyle::OverlaySelection && line.text.contains("/clear")
+        line.style == SingleSessionLineStyle::OverlaySelection && line.text.contains("/commands")
     }));
 
     assert_eq!(
-        app.handle_key(KeyInput::ModelPickerMove(1)),
+        app.handle_key(KeyInput::ModelPickerMove(3)),
         KeyOutcome::Redraw
     );
     let suggestions = app.inline_widget_styled_lines();
@@ -993,6 +997,22 @@ fn single_session_slash_help_opens_help_without_sending_prompt() {
         .join("\n");
     assert!(help.contains("slash commands"));
     assert!(help.contains("/model [name]"));
+    assert!(help.contains("/fast [on|off|status]"));
+}
+
+#[test]
+fn single_session_commands_alias_opens_help_without_sending_prompt() {
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::Character("/commands".to_string()));
+
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert!(app.show_help);
+    assert!(app.draft.is_empty());
+    assert!(app.messages.is_empty());
+    assert_eq!(
+        app.active_inline_widget(),
+        Some(InlineWidgetKind::HotkeyHelp)
+    );
 }
 
 #[test]
@@ -1113,6 +1133,130 @@ fn single_session_slash_model_with_argument_requests_model_switch() {
 }
 
 #[test]
+fn single_session_slash_server_setting_commands_return_control_outcomes() {
+    let submit = |command: &str| {
+        let mut app = SingleSessionApp::new(Some(test_session_card(
+            "server_setting_session",
+            "Settings Session",
+            "ready",
+        )));
+        app.initialize_resumed_session("server_setting_session");
+        app.handle_key(KeyInput::Character(command.to_string()));
+        let outcome = app.handle_key(KeyInput::SubmitDraft);
+        assert!(app.draft.is_empty());
+        outcome
+    };
+
+    assert_eq!(
+        submit("/refresh-model-list"),
+        KeyOutcome::RefreshModelCatalog
+    );
+    assert_eq!(
+        submit("/effort high"),
+        KeyOutcome::SetReasoningEffort("high".to_string())
+    );
+
+    assert_eq!(
+        submit("/fast on"),
+        KeyOutcome::SetServiceTier("priority".to_string())
+    );
+
+    assert_eq!(
+        submit("/fast off"),
+        KeyOutcome::SetServiceTier("off".to_string())
+    );
+
+    assert_eq!(
+        submit("/transport websocket"),
+        KeyOutcome::SetTransport("websocket".to_string())
+    );
+
+    assert_eq!(submit("/compact"), KeyOutcome::CompactSession);
+
+    assert_eq!(
+        submit("/compact mode semantic"),
+        KeyOutcome::SetCompactionMode("semantic".to_string())
+    );
+
+    assert_eq!(
+        submit("/rename Demo Title"),
+        KeyOutcome::RenameSession(Some("Demo Title".to_string()))
+    );
+
+    assert_eq!(submit("/rename --clear"), KeyOutcome::RenameSession(None));
+    assert_eq!(submit("/clear"), KeyOutcome::ClearServerSession);
+}
+
+#[test]
+fn single_session_slash_setting_status_uses_runtime_metadata() {
+    let mut app = SingleSessionApp::new(None);
+    app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
+        current_model: Some("gpt-5.1".to_string()),
+        provider_name: Some("OpenAI".to_string()),
+        models: Vec::new(),
+        reasoning_effort: Some("high".to_string()),
+        service_tier: Some("priority".to_string()),
+        compaction_mode: Some("semantic".to_string()),
+    });
+    app.apply_session_event(session_launch::DesktopSessionEvent::Status(
+        session_launch::DesktopSessionStatus::Transport("websocket".to_string()),
+    ));
+
+    app.handle_key(KeyInput::Character("/effort status".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(
+        app.status.as_deref(),
+        Some("effort: high · use /effort <none|low|medium|high|xhigh>")
+    );
+
+    app.handle_key(KeyInput::Character("/fast status".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(
+        app.status.as_deref(),
+        Some("fast mode: priority · use /fast <on|off|status>")
+    );
+
+    app.handle_key(KeyInput::Character("/transport status".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(
+        app.status.as_deref(),
+        Some("transport: websocket · use /transport <auto|https|websocket>")
+    );
+
+    app.handle_key(KeyInput::Character("/compact mode status".to_string()));
+    assert_eq!(app.handle_key(KeyInput::SubmitDraft), KeyOutcome::Redraw);
+    assert_eq!(
+        app.status.as_deref(),
+        Some("compaction: semantic · use /compact mode <reactive|proactive|semantic>")
+    );
+}
+
+#[test]
+fn single_session_rename_event_updates_title_and_meta_status() {
+    let mut app = SingleSessionApp::new(Some(test_session_card(
+        "rename_event_session",
+        "Old Title",
+        "ready",
+    )));
+
+    app.apply_session_event(session_launch::DesktopSessionEvent::SessionRenamed {
+        title: Some("New Title".to_string()),
+        display_title: "New Title".to_string(),
+    });
+
+    assert_eq!(
+        app.session.as_ref().map(|session| session.title.as_str()),
+        Some("New Title")
+    );
+    assert_eq!(app.status.as_deref(), Some("session renamed"));
+    assert!(
+        app.body_lines()
+            .join("\n")
+            .contains("renamed session to New Title")
+    );
+}
+
+#[test]
 fn single_session_typing_model_slash_opens_preview_picker_without_submitting() {
     let mut app = SingleSessionApp::new(None);
 
@@ -1143,6 +1287,9 @@ fn single_session_typing_model_slash_opens_preview_picker_without_submitting() {
             detail: Some("premium".to_string()),
             available: true,
         }],
+        reasoning_effort: None,
+        service_tier: None,
+        compaction_mode: None,
     });
 
     let body = app.body_lines().join("\n");
@@ -3743,6 +3890,9 @@ fn single_session_model_picker_loads_filters_and_selects_model() {
                 available: true,
             },
         ],
+        reasoning_effort: None,
+        service_tier: None,
+        compaction_mode: None,
     });
 
     let body = app.body_lines().join("\n");

@@ -10,6 +10,17 @@ pub(super) fn desktop_event_from_server_value(value: &Value) -> Option<DesktopSe
             .map(|session_id| DesktopSessionEvent::SessionStarted {
                 session_id: session_id.to_string(),
             }),
+        "session_renamed" => Some(DesktopSessionEvent::SessionRenamed {
+            title: value
+                .get("title")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            display_title: value
+                .get("display_title")
+                .and_then(Value::as_str)
+                .unwrap_or("session")
+                .to_string(),
+        }),
         "text_delta" => value
             .get("text")
             .and_then(Value::as_str)
@@ -86,11 +97,72 @@ pub(super) fn desktop_event_from_server_value(value: &Value) -> Option<DesktopSe
             };
             Some(DesktopSessionEvent::Status(status))
         }
+        "service_tier_changed" => Some(DesktopSessionEvent::Status(
+            if let Some(error) = value.get("error").and_then(Value::as_str) {
+                DesktopSessionStatus::ServiceTierFailed(error.to_string())
+            } else {
+                DesktopSessionStatus::ServiceTier(
+                    value
+                        .get("service_tier")
+                        .and_then(Value::as_str)
+                        .unwrap_or("standard")
+                        .to_string(),
+                )
+            },
+        )),
+        "transport_changed" => Some(DesktopSessionEvent::Status(
+            if let Some(error) = value.get("error").and_then(Value::as_str) {
+                DesktopSessionStatus::TransportFailed(error.to_string())
+            } else {
+                DesktopSessionStatus::Transport(
+                    value
+                        .get("transport")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+            },
+        )),
+        "compaction_mode_changed" => Some(DesktopSessionEvent::Status(
+            if let Some(error) = value.get("error").and_then(Value::as_str) {
+                DesktopSessionStatus::CompactionModeFailed(error.to_string())
+            } else {
+                DesktopSessionStatus::CompactionMode(
+                    value
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+            },
+        )),
+        "compact_result" => Some(DesktopSessionEvent::Status(
+            DesktopSessionStatus::CompactResult {
+                message: value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("compaction request finished")
+                    .to_string(),
+                success: value
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+        )),
         "history" => model_catalog_event_from_server_value(value),
         "available_models_updated" => Some(DesktopSessionEvent::ModelCatalog {
-            current_model: None,
-            provider_name: None,
+            current_model: value
+                .get("provider_model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            provider_name: value
+                .get("provider_name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             models: model_choices_from_server_value(value),
+            reasoning_effort: None,
+            service_tier: None,
+            compaction_mode: None,
         }),
         "stdin_request" => Some(DesktopSessionEvent::StdinRequest {
             request_id: non_empty_server_str(value, "request_id")?.to_string(),
@@ -141,6 +213,21 @@ pub(super) fn model_catalog_event_from_server_value(value: &Value) -> Option<Des
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         models: model_choices_from_server_value(value),
+        reasoning_effort: value
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .filter(|effort| !effort.trim().is_empty())
+            .map(ToOwned::to_owned),
+        service_tier: value
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .filter(|tier| !tier.trim().is_empty())
+            .map(ToOwned::to_owned),
+        compaction_mode: value
+            .get("compaction_mode")
+            .and_then(Value::as_str)
+            .filter(|mode| !mode.trim().is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 

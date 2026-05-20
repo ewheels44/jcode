@@ -159,6 +159,10 @@ fn desktop_session_event_payload_bytes(event: &session_launch::DesktopSessionEve
         }
         session_launch::DesktopSessionEvent::SessionStarted { session_id }
         | session_launch::DesktopSessionEvent::Reloaded { session_id } => session_id.len(),
+        session_launch::DesktopSessionEvent::SessionRenamed {
+            title,
+            display_title,
+        } => title.as_deref().unwrap_or_default().len() + display_title.len(),
         session_launch::DesktopSessionEvent::ModelChanged {
             model,
             provider_name,
@@ -172,6 +176,7 @@ fn desktop_session_event_payload_bytes(event: &session_launch::DesktopSessionEve
             current_model,
             provider_name,
             models,
+            ..
         } => {
             current_model.as_deref().unwrap_or_default().len()
                 + provider_name.as_deref().unwrap_or_default().len()
