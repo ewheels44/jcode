@@ -221,6 +221,88 @@ pub fn strict_provider_model_coverage_checkpoint_ids() -> impl Iterator<Item = &
     STRICT_PROVIDER_MODEL_COVERAGE_CHECKPOINTS.iter().copied()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IssueDrivenLiveProviderTarget {
+    provider_id: &'static str,
+    provider_label: &'static str,
+    model: Option<&'static str>,
+    reason: &'static str,
+    issue_refs: &'static [&'static str],
+}
+
+const ISSUE_DRIVEN_LIVE_PROVIDER_TARGETS: &[IssueDrivenLiveProviderTarget] = &[
+    IssueDrivenLiveProviderTarget {
+        provider_id: "opencode-go",
+        provider_label: "OpenCode Go",
+        model: Some("kimi-k2.5"),
+        reason: "OpenCode Go auth/server bootstrap regression and post-auth model routing",
+        issue_refs: &["#234"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "nvidia-nim",
+        provider_label: "NVIDIA NIM",
+        model: Some("nvidia/llama-3.1-nemotron-ultra-253b-v1"),
+        reason: "NVIDIA NIM provider auth and tool-smoke readiness",
+        issue_refs: &["#164", "#197"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "ollama",
+        provider_label: "Ollama",
+        model: None,
+        reason: "Ollama local/LAN setup, model catalog, and model switching regressions",
+        issue_refs: &["#155", "#157"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "minimax",
+        provider_label: "MiniMax",
+        model: Some("MiniMax-M2.7"),
+        reason: "MiniMax endpoint/key-region selection and live balance/readiness",
+        issue_refs: &["#110", "#131", "#189"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "xiaomi-mimo",
+        provider_label: "Xiaomi MiMo",
+        model: Some("mimo-v2.5"),
+        reason: "Xiaomi MiMo provider configuration and live model/tool support",
+        issue_refs: &["#223"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "zai",
+        provider_label: "Z.AI",
+        model: Some("glm-4.5"),
+        reason: "Z.AI and Zhipu BigModel regional endpoint compatibility",
+        issue_refs: &["#156", "#161", "#177"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "bedrock",
+        provider_label: "AWS Bedrock",
+        model: None,
+        reason: "AWS Bedrock bearer auth plus Application Inference Profile ARN support",
+        issue_refs: &["#107", "#192"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "copilot",
+        provider_label: "GitHub Copilot",
+        model: Some("gpt-5.4"),
+        reason: "Copilot GPT 5.4 model support and parameter compatibility",
+        issue_refs: &["#190"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "gemini",
+        provider_label: "Google Gemini",
+        model: Some("gemini-2.5-pro"),
+        reason: "Gemini catalog/picker regression and tool-call live readiness",
+        issue_refs: &["#111", "#132"],
+    },
+    IssueDrivenLiveProviderTarget {
+        provider_id: "openai-compatible",
+        provider_label: "OpenAI-compatible",
+        model: None,
+        reason: "Generic OpenAI-compatible custom provider setup, default routing, and local endpoint support",
+        issue_refs: &["#82", "#100", "#177", "#204"],
+    },
+];
+
 pub fn checkpoint_catalog_metadata() -> Value {
     json!({
         "version": CHECKPOINT_TAXONOMY_VERSION,
@@ -691,6 +773,23 @@ pub struct LiveProviderCoverageSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct IssueDrivenLiveProviderTargetSummary {
+    pub provider_id: String,
+    pub provider_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub status: String,
+    pub reason: String,
+    pub issue_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covered_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub missing_checkpoints_by_model: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LiveProviderModelCoverageSummary {
     pub schema_version: u32,
     pub generated_at: DateTime<Utc>,
@@ -710,6 +809,8 @@ pub struct LiveProviderModelCoverageSummary {
     pub provider_only_entries: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_provider_ids_without_live_model_coverage: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_driven_targets: Vec<IssueDrivenLiveProviderTargetSummary>,
 }
 
 fn update_coverage(event: &LiveVerificationEvent, path: &Path) -> Result<()> {
@@ -977,6 +1078,7 @@ pub fn strict_live_provider_model_coverage_summary(
 
     let total_provider_model_pairs = covered_pairs.len() + uncovered_pairs.len();
     let covered_provider_model_pairs = covered_pairs.len();
+    let issue_driven_targets = issue_driven_target_summaries(&covered_pairs, &uncovered_pairs);
     LiveProviderModelCoverageSummary {
         schema_version: SCHEMA_VERSION,
         generated_at: Utc::now(),
@@ -993,6 +1095,7 @@ pub fn strict_live_provider_model_coverage_summary(
         covered_pairs,
         provider_only_entries: provider_only_entries.into_iter().collect(),
         known_provider_ids_without_live_model_coverage,
+        issue_driven_targets,
     }
 }
 
@@ -1019,6 +1122,87 @@ fn strict_required_checkpoint_definitions() -> Vec<LiveCoverageCheckpointDefinit
             }
         })
         .collect()
+}
+
+fn issue_driven_target_summaries(
+    covered_pairs: &[LiveProviderModelCoveragePair],
+    uncovered_pairs: &[LiveProviderModelCoveragePair],
+) -> Vec<IssueDrivenLiveProviderTargetSummary> {
+    ISSUE_DRIVEN_LIVE_PROVIDER_TARGETS
+        .iter()
+        .map(|target| issue_driven_target_summary(target, covered_pairs, uncovered_pairs))
+        .collect()
+}
+
+fn issue_driven_target_summary(
+    target: &IssueDrivenLiveProviderTarget,
+    covered_pairs: &[LiveProviderModelCoveragePair],
+    uncovered_pairs: &[LiveProviderModelCoveragePair],
+) -> IssueDrivenLiveProviderTargetSummary {
+    let matches_target = |pair: &LiveProviderModelCoveragePair| {
+        pair.provider_id == target.provider_id
+            && target
+                .model
+                .map(|model| pair.model == model)
+                .unwrap_or(true)
+    };
+
+    let mut observed_models = covered_pairs
+        .iter()
+        .chain(uncovered_pairs.iter())
+        .filter(|pair| matches_target(pair))
+        .map(|pair| pair.model.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    observed_models.sort();
+
+    let mut covered_models = covered_pairs
+        .iter()
+        .filter(|pair| matches_target(pair))
+        .map(|pair| pair.model.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    covered_models.sort();
+
+    let missing_checkpoints_by_model = uncovered_pairs
+        .iter()
+        .filter(|pair| matches_target(pair))
+        .map(|pair| {
+            let mut missing = pair.missing_checkpoints.clone();
+            missing.extend(
+                pair.non_passing_checkpoints
+                    .iter()
+                    .map(|(checkpoint, status)| format!("{checkpoint}:{status:?}")),
+            );
+            (pair.model.clone(), missing)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let status = if !covered_models.is_empty() {
+        "strict_covered"
+    } else if !observed_models.is_empty() {
+        "observed_missing_strict_checkpoints"
+    } else {
+        "no_model_specific_live_evidence"
+    };
+
+    IssueDrivenLiveProviderTargetSummary {
+        provider_id: target.provider_id.to_string(),
+        provider_label: target.provider_label.to_string(),
+        model: target.model.map(ToString::to_string),
+        status: status.to_string(),
+        reason: target.reason.to_string(),
+        issue_refs: target
+            .issue_refs
+            .iter()
+            .map(|issue| (*issue).to_string())
+            .collect(),
+        observed_models,
+        covered_models,
+        missing_checkpoints_by_model,
+    }
 }
 
 fn canonical_live_provider_identity(provider_id: &str, provider_label: &str) -> (String, String) {
@@ -1122,6 +1306,36 @@ pub fn format_strict_live_provider_model_coverage_summary(
                 pair.model,
                 gaps.join(", ")
             ));
+        }
+    }
+
+    if !summary.issue_driven_targets.is_empty() {
+        out.push_str("\nIssue-driven live provider targets:\n");
+        for target in &summary.issue_driven_targets {
+            let model = target.model.as_deref().unwrap_or("any live model");
+            let issues = target.issue_refs.join(", ");
+            let observed = if target.observed_models.is_empty() {
+                "none".to_string()
+            } else {
+                target.observed_models.join(", ")
+            };
+            out.push_str(&format!(
+                "  - {} / {} [{}]: {} (observed: {})\n",
+                target.provider_id, model, issues, target.status, observed
+            ));
+            if let Some((model, missing)) = target.missing_checkpoints_by_model.iter().next() {
+                let shown_missing = missing.iter().take(6).cloned().collect::<Vec<_>>();
+                let suffix = if missing.len() > shown_missing.len() {
+                    format!(", +{} more", missing.len() - shown_missing.len())
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "    missing for {model}: {}{}\n",
+                    shown_missing.join(", "),
+                    suffix
+                ));
+            }
         }
     }
 
@@ -1494,5 +1708,74 @@ mod tests {
         ] {
             assert!(report.contains(checkpoint), "report missing {checkpoint}");
         }
+    }
+
+    #[test]
+    fn issue_driven_live_provider_targets_report_covered_partial_and_missing_evidence() {
+        let mut latest = BTreeMap::new();
+        latest.insert(
+            "xiaomi-mimo::mimo-v2.5::strict".to_string(),
+            coverage_entry(
+                "xiaomi-mimo",
+                "Xiaomi MiMo",
+                Some("mimo-v2.5"),
+                strict_statuses(&[]),
+            ),
+        );
+        latest.insert(
+            "gemini::gemini-2.5-pro::partial".to_string(),
+            coverage_entry(
+                "gemini",
+                "Google Gemini",
+                Some("gemini-2.5-pro"),
+                BTreeMap::from([(
+                    checkpoints::NON_STREAMING_CHAT_COMPLETION.to_string(),
+                    LiveVerificationStageStatus::Passed,
+                )]),
+            ),
+        );
+        let coverage = LiveVerificationCoverage {
+            schema_version: SCHEMA_VERSION,
+            updated_at: Utc::now(),
+            checkpoint_taxonomy_version: CHECKPOINT_TAXONOMY_VERSION,
+            checkpoint_taxonomy: checkpoint_catalog_metadata(),
+            latest,
+        };
+
+        let summary = strict_live_provider_model_coverage_summary(&coverage, "unit");
+        let xiaomi = summary
+            .issue_driven_targets
+            .iter()
+            .find(|target| target.provider_id == "xiaomi-mimo")
+            .expect("xiaomi target should be tracked");
+        assert_eq!(xiaomi.status, "strict_covered");
+        assert_eq!(xiaomi.covered_models, vec!["mimo-v2.5"]);
+        assert_eq!(xiaomi.issue_refs, vec!["#223"]);
+
+        let gemini = summary
+            .issue_driven_targets
+            .iter()
+            .find(|target| target.provider_id == "gemini")
+            .expect("gemini target should be tracked");
+        assert_eq!(gemini.status, "observed_missing_strict_checkpoints");
+        assert_eq!(gemini.observed_models, vec!["gemini-2.5-pro"]);
+        assert!(
+            gemini
+                .missing_checkpoints_by_model
+                .get("gemini-2.5-pro")
+                .is_some_and(|missing| missing
+                    .contains(&checkpoints::MODEL_CATALOG_LIVE_ENDPOINT.to_string()))
+        );
+
+        let nvidia = summary
+            .issue_driven_targets
+            .iter()
+            .find(|target| target.provider_id == "nvidia-nim")
+            .expect("nvidia target should be tracked");
+        assert_eq!(nvidia.status, "no_model_specific_live_evidence");
+
+        let report = format_strict_live_provider_model_coverage_summary(&summary, 10);
+        assert!(report.contains("Issue-driven live provider targets"));
+        assert!(report.contains("xiaomi-mimo / mimo-v2.5 [#223]: strict_covered"));
     }
 }
