@@ -1451,7 +1451,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    if trimmed == "/resume" || trimmed == "/sessions" {
+    if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
         return true;
     }

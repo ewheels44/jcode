@@ -133,6 +133,21 @@ fn slash_sessions_alias_opens_session_picker_overlay_locally() {
 }
 
 #[test]
+fn slash_session_alias_opens_session_picker_overlay_locally() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.input = "/session".to_string();
+    app.submit_input();
+
+    assert!(app.session_picker_overlay.is_some());
+    assert_eq!(app.session_picker_mode, SessionPickerMode::Resume);
+    assert!(app.pending_session_picker_load.is_some());
+    assert!(app.input.is_empty());
+}
+
+#[test]
 fn test_resize_redraw_is_debounced() {
     let mut app = create_test_app();
 
