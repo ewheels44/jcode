@@ -9,6 +9,8 @@ Jcode is open source: <https://github.com/1jehuang/jcode>
 
 Before executing coding tasks, use `mimir(action="enrich_task", params={"task": "description"})` to get project-specific context (conventions, APIs, patterns). This is your project memory — without it you're guessing.
 
+Artifacts: For common architectural questions, Mimir serves **pre-compiled artifacts** (instant, zero token cost) automatically when your task matches keywords like "rag", "indexing", "artifact", "chunking", etc.
+
 | Situation | Mimir action |
 |-----------|-------------|
 | Before any coding task | `enrich_task` |
