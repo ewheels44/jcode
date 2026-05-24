@@ -7,6 +7,8 @@ impl Agent {
     pub(super) const MAX_INCOMPLETE_CONTINUATION_ATTEMPTS: u32 = 3;
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
+        // VERIFY: This code path is being reached
+        crate::logging::info("========== RUN_TURN START ==========");
         self.set_log_context();
         let mut final_text = String::new();
         let trace = trace_enabled();
@@ -41,8 +43,24 @@ impl Agent {
             let memory_pending =
                 self.build_memory_prompt_nonblocking_shared(std::sync::Arc::clone(&messages), None);
             // Use split prompt for better caching - static content cached, dynamic not
-            let split_prompt = self.build_system_prompt_split(None);
-            self.log_prompt_prefix_accounting(&split_prompt, &tools);
+            let (split_prompt, context_info) = self.build_system_prompt_split(None);
+
+            // AUTO-ENRICH: Call Mimir enrich_task at application layer (non-negotiable)
+            // This ensures Mimir context is injected BEFORE the model processes the turn
+            let enrich_context = self.auto_enrich_task().await;
+            let split_prompt = if let Some(context) = enrich_context {
+                // Inject Mimir context as a system reminder in the dynamic part
+                let mut enriched = split_prompt;
+                if !enriched.dynamic_part.is_empty() {
+                    enriched.dynamic_part.push_str("\n\n");
+                }
+                enriched.dynamic_part.push_str("# Mimir Project Context\n\n");
+                enriched.dynamic_part.push_str(&context);
+                enriched
+            } else {
+                split_prompt
+            };
+            self.log_prompt_prefix_accounting(&split_prompt, &tools, Some(&context_info));
 
             // Check for client-side cache violations before memory injection.
             // Memory is an ephemeral suffix that changes each turn; tracking it would cause
