@@ -1169,6 +1169,65 @@ fn surface_transition_reenters_from_current_exit_frame() {
 }
 
 #[test]
+fn workspace_zoom_uses_surface_transition_frames() {
+    let mut workspace = Workspace::from_session_cards(vec![workspace::SessionCard {
+        session_id: "session-alpha".to_string(),
+        title: "alpha".to_string(),
+        subtitle: "active".to_string(),
+        detail: "3 msgs".to_string(),
+        preview_lines: Vec::new(),
+        detail_lines: Vec::new(),
+    }]);
+    let size = PhysicalSize::new(1280, 800);
+    let layout = workspace_render_layout(&workspace, size, Some(size));
+    let focused_id = workspace.focused_id;
+    let unzoomed_target = workspace_surface_transition_targets(&workspace, size, layout)
+        .into_iter()
+        .find(|target| target.id == focused_id)
+        .expect("focused unzoomed target");
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::Character("z".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert!(workspace.zoomed);
+    let zoomed_target = workspace_surface_transition_targets(&workspace, size, layout)
+        .into_iter()
+        .find(|target| target.id == focused_id)
+        .expect("focused zoomed target");
+    assert!(zoomed_target.rect.width > unzoomed_target.rect.width);
+    assert!(zoomed_target.rect.x <= unzoomed_target.rect.x);
+
+    let mut transitions = SurfaceTransitionAnimator::default();
+    let now = Instant::now();
+    transitions.frame([unzoomed_target], now);
+
+    let zoom_start = transitions.frame([zoomed_target], now);
+    let zoom_start = surface_visual_frame(&zoom_start, focused_id);
+    assert_eq!(zoom_start.rect, unzoomed_target.rect);
+    assert!(transitions.is_animating());
+
+    let zoom_mid = transitions.frame([zoomed_target], now + SURFACE_TRANSITION_DURATION / 2);
+    let zoom_mid = surface_visual_frame(&zoom_mid, focused_id);
+    assert!(zoom_mid.rect.width > unzoomed_target.rect.width);
+    assert!(zoom_mid.rect.width < zoomed_target.rect.width);
+
+    let zoomed = transitions.frame([zoomed_target], now + SURFACE_TRANSITION_DURATION * 2);
+    let zoomed = surface_visual_frame(&zoomed, focused_id);
+    assert_eq!(zoomed.rect, zoomed_target.rect);
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::Character("z".to_string())),
+        KeyOutcome::Redraw
+    );
+    assert!(!workspace.zoomed);
+    let back_start = transitions.frame([unzoomed_target], now + SURFACE_TRANSITION_DURATION * 2);
+    let back_start = surface_visual_frame(&back_start, focused_id);
+    assert_eq!(back_start.rect, zoomed_target.rect);
+    assert!(transitions.is_animating());
+}
+
+#[test]
 fn color_transition_interpolates_status_bar_mode_changes() {
     let mut transition = ColorTransition::default();
     let now = Instant::now();
