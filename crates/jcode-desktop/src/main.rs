@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use bytemuck::{Pod, Zeroable};
 use desktop_app_driver::{
-    DESKTOP_UI_SNAPSHOT_VERSION, DesktopAppDriver, DesktopSceneBuildContext,
+    DESKTOP_UI_SNAPSHOT_VERSION, DesktopAppDriver, DesktopAppRuntime, DesktopSceneBuildContext,
     DesktopSingleSessionSnapshot, DesktopSnapshotRestoreError, DesktopSurfaceSnapshot,
     DesktopUiSnapshot, DesktopWorkspaceSnapshot, DesktopWorkspaceSurfaceSnapshot,
 };
@@ -36,9 +36,9 @@ use desktop_ipc::{DesktopHostToWorkerEnvelope, write_desktop_ipc_frame};
 use desktop_protocol::{
     DesktopHostToWorkerMessage, DesktopInputEvent, DesktopKeyEvent, DesktopKeyModifiers,
     DesktopMouseButton, DesktopMouseEvent, DesktopProtocolEnvelope, DesktopSceneUpdate,
-    DesktopSessionEventBatchWire, DesktopSessionEventWire, DesktopWindowEvent, DesktopWindowState,
-    DesktopWorkerInit, DesktopWorkerMode, DesktopWorkerReady, DesktopWorkerShutdownReason,
-    DesktopWorkerToHostMessage,
+    DesktopSessionEventBatchWire, DesktopSessionEventWire, DesktopSnapshotResponse,
+    DesktopWindowEvent, DesktopWindowState, DesktopWorkerInit, DesktopWorkerMode,
+    DesktopWorkerReady, DesktopWorkerShutdownReason, DesktopWorkerToHostMessage,
 };
 use desktop_scene::{
     DesktopColor, DesktopDisplayCommand, DesktopRect as DesktopSceneRect, DesktopRectPaint,
@@ -4495,6 +4495,13 @@ fn fresh_single_session_app() -> DesktopApp {
     DesktopApp::SingleSession(SingleSessionApp::new(None))
 }
 
+fn fresh_desktop_app_for_worker_mode(mode: DesktopWorkerMode) -> DesktopApp {
+    match mode {
+        DesktopWorkerMode::SingleSession => fresh_single_session_app(),
+        DesktopWorkerMode::Workspace => DesktopApp::Workspace(Workspace::loading_sessions()),
+    }
+}
+
 fn initial_single_session_app(resume_session_id: Option<&str>) -> DesktopApp {
     let Some(session_id) = resume_session_id else {
         return fresh_single_session_app();
@@ -4592,6 +4599,13 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
+    let mut runtime: Option<DesktopAppRuntime<DesktopApp>> = None;
+    let mut latest_window = DesktopWindowState {
+        width: DEFAULT_WINDOW_WIDTH as u32,
+        height: DEFAULT_WINDOW_HEIGHT as u32,
+        scale_factor: 1.0,
+        focused: true,
+    };
     let mut next_worker_sequence = 2;
     loop {
         let frame: Option<DesktopHostToWorkerEnvelope> =
@@ -4605,7 +4619,18 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
             .context("host sent incompatible protocol frame")?;
         match frame.payload {
             DesktopHostToWorkerMessage::Initialize(init) => {
-                let scene = desktop_scene_for_worker_init(&init);
+                latest_window = init.window.clone();
+                let mut app = fresh_desktop_app_for_worker_mode(init.mode);
+                if let Some(snapshot) = init.snapshot.clone()
+                    && let Err(error) = app.restore_snapshot(snapshot)
+                {
+                    desktop_log::error(format_args!(
+                        "jcode-desktop: app worker failed to restore host snapshot: {error:#}"
+                    ));
+                }
+                let app_runtime = DesktopAppRuntime::new(app);
+                let scene = desktop_scene_for_worker_runtime(&app_runtime, &latest_window);
+                runtime = Some(app_runtime);
                 let scene_update = DesktopProtocolEnvelope::new(
                     next_worker_sequence,
                     DesktopWorkerToHostMessage::Scene(DesktopSceneUpdate {
@@ -4618,9 +4643,22 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
                     .context("failed to write worker initial scene")?;
             }
             DesktopHostToWorkerMessage::SnapshotRequest { request_id } => {
-                desktop_log::info(format_args!(
-                    "jcode-desktop: app worker received snapshot request {request_id} before full runtime is attached"
-                ));
+                if let Some(runtime) = runtime.as_ref() {
+                    let snapshot = DesktopProtocolEnvelope::new(
+                        next_worker_sequence,
+                        DesktopWorkerToHostMessage::Snapshot(DesktopSnapshotResponse {
+                            request_id,
+                            snapshot: runtime.snapshot(),
+                        }),
+                    );
+                    next_worker_sequence += 1;
+                    write_desktop_ipc_frame(&mut stdout, &snapshot)
+                        .context("failed to write worker snapshot response")?;
+                } else {
+                    desktop_log::info(format_args!(
+                        "jcode-desktop: app worker received snapshot request {request_id} before initialization"
+                    ));
+                }
             }
             DesktopHostToWorkerMessage::Shutdown {
                 reason:
@@ -4628,8 +4666,32 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
                     | DesktopWorkerShutdownReason::Reload
                     | DesktopWorkerShutdownReason::ProtocolMismatch,
             } => break,
-            DesktopHostToWorkerMessage::Input(_)
-            | DesktopHostToWorkerMessage::SessionEvents(_)
+            DesktopHostToWorkerMessage::Input(input) => {
+                if let DesktopInputEvent::Window(DesktopWindowEvent::Resized {
+                    width,
+                    height,
+                    scale_factor,
+                }) = input
+                {
+                    latest_window.width = width;
+                    latest_window.height = height;
+                    latest_window.scale_factor = scale_factor;
+                    if let Some(runtime) = runtime.as_ref() {
+                        let scene = desktop_scene_for_worker_runtime(runtime, &latest_window);
+                        let scene_update = DesktopProtocolEnvelope::new(
+                            next_worker_sequence,
+                            DesktopWorkerToHostMessage::Scene(DesktopSceneUpdate {
+                                animation_active: scene.metadata.animation_active,
+                                scene,
+                            }),
+                        );
+                        next_worker_sequence += 1;
+                        write_desktop_ipc_frame(&mut stdout, &scene_update)
+                            .context("failed to write worker resize scene")?;
+                    }
+                }
+            }
+            DesktopHostToWorkerMessage::SessionEvents(_)
             | DesktopHostToWorkerMessage::MetricsAck { .. } => {}
         }
     }
@@ -4637,6 +4699,7 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn desktop_scene_for_worker_init(init: &DesktopWorkerInit) -> DesktopScene {
     let mut scene = DesktopScene::new(DesktopSceneViewport::new(
         init.window.width as f32,
@@ -4652,6 +4715,21 @@ fn desktop_scene_for_worker_init(init: &DesktopWorkerInit) -> DesktopScene {
         0.02, 0.024, 0.03, 1.0,
     )));
     scene
+}
+
+fn desktop_scene_for_worker_runtime(
+    runtime: &DesktopAppRuntime<DesktopApp>,
+    window: &DesktopWindowState,
+) -> DesktopScene {
+    let mut scene = DesktopScene::new(DesktopSceneViewport::new(
+        window.width as f32,
+        window.height as f32,
+        window.scale_factor,
+    ));
+    scene.push(DesktopDisplayCommand::Clear(DesktopColor::rgba(
+        0.02, 0.024, 0.03, 1.0,
+    )));
+    runtime.build_scene(scene)
 }
 
 fn desktop_mode_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -> DesktopMode {
