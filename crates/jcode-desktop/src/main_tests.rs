@@ -898,6 +898,130 @@ fn workspace_status_text_transition_draws_previous_and_current_labels() {
 }
 
 #[test]
+fn workspace_status_preview_viewport_uses_animated_scroll_offset() {
+    let workspace = Workspace::fake();
+    let size = PhysicalSize::new(900, 600);
+    let status_rect = Rect {
+        x: OUTER_PADDING,
+        y: OUTER_PADDING,
+        width: size.width as f32 - OUTER_PADDING * 2.0,
+        height: STATUS_BAR_HEIGHT,
+    };
+    let visible = VisibleColumnLayout {
+        visible_columns: 1,
+        first_visible_column: 3,
+    };
+    let column_width = 100.0;
+    let column_pitch = column_width + GAP;
+
+    let mut target_vertices = Vec::new();
+    push_status_preview(
+        &mut target_vertices,
+        &workspace,
+        workspace.current_workspace(),
+        WorkspaceRenderLayout {
+            visible,
+            column_width,
+            scroll_offset: visible.first_visible_column as f32 * column_pitch,
+            vertical_scroll_offset: 0.0,
+        },
+        None,
+        &HashMap::new(),
+        status_rect,
+        size,
+    );
+    let target_viewport =
+        pixel_bounds_for_color(&target_vertices, STATUS_PREVIEW_VIEWPORT_COLOR, size)
+            .expect("settled status preview should draw a viewport outline");
+
+    let mut animated_vertices = Vec::new();
+    push_status_preview(
+        &mut animated_vertices,
+        &workspace,
+        workspace.current_workspace(),
+        WorkspaceRenderLayout {
+            visible,
+            column_width,
+            scroll_offset: 1.5 * column_pitch,
+            vertical_scroll_offset: 0.0,
+        },
+        None,
+        &HashMap::new(),
+        status_rect,
+        size,
+    );
+    let animated_viewport =
+        pixel_bounds_for_color(&animated_vertices, STATUS_PREVIEW_VIEWPORT_COLOR, size)
+            .expect("animated status preview should draw a viewport outline");
+
+    assert!(
+        animated_viewport.min_x < target_viewport.min_x - 8.0,
+        "status preview viewport should track the animated scroll offset instead of jumping to the target column: animated={animated_viewport:?}, target={target_viewport:?}"
+    );
+}
+
+#[test]
+fn workspace_status_preview_draws_exiting_surface_with_fade() {
+    let mut workspace = Workspace::fake();
+    let size = PhysicalSize::new(900, 600);
+    let render_layout = workspace_render_layout(&workspace, size, None);
+    let mut transitions = SurfaceTransitionAnimator::default();
+    let now = Instant::now();
+    let initial_targets = workspace_surface_transition_targets(&workspace, size, render_layout);
+    transitions.frame(initial_targets, now);
+
+    let removed = workspace
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == 2)
+        .expect("fake workspace surface")
+        .clone();
+    workspace
+        .surfaces
+        .retain(|surface| surface.id != removed.id);
+    let mut exit_cache = HashMap::new();
+    exit_cache.insert(removed.id, removed.clone());
+    let updated_layout = workspace_render_layout(&workspace, size, None);
+    let updated_targets = workspace_surface_transition_targets(&workspace, size, updated_layout);
+    transitions.frame(updated_targets.clone(), now + Duration::from_millis(8));
+    let frames = transitions.frame(
+        updated_targets,
+        now + Duration::from_millis(8) + SURFACE_TRANSITION_DURATION / 2,
+    );
+    let frames = WorkspaceSurfaceTransitionFrames::new(frames, transitions.is_animating());
+
+    let status_rect = Rect {
+        x: OUTER_PADDING,
+        y: OUTER_PADDING,
+        width: size.width as f32 - OUTER_PADDING * 2.0,
+        height: STATUS_BAR_HEIGHT,
+    };
+    let mut vertices = Vec::new();
+    push_status_preview(
+        &mut vertices,
+        &workspace,
+        workspace.current_workspace(),
+        updated_layout,
+        Some(&frames),
+        &exit_cache,
+        status_rect,
+        size,
+    );
+
+    let removed_accent = STATUS_PREVIEW_ACCENTS[removed.color_index % STATUS_PREVIEW_ACCENTS.len()];
+    let faded_removed_vertices = vertices
+        .iter()
+        .filter(|vertex| vertex.color[..3] == removed_accent)
+        .filter(|vertex| vertex.color[3] > 0.0 && vertex.color[3] < 0.72)
+        .count();
+
+    assert!(
+        faded_removed_vertices > 0,
+        "status preview should keep removed surfaces visible as fading minimap ticks during surface exit animation"
+    );
+}
+
+#[test]
 fn viewport_animation_interpolates_to_new_layout_target() {
     let mut animation = AnimatedViewport::default();
     let now = Instant::now();

@@ -11156,13 +11156,14 @@ fn build_vertices_into(params: WorkspaceVertexBuildParams<'_>, vertices: &mut Ve
     push_rounded_rect(vertices, status_rect, STATUS_RADIUS, status_color, size);
 
     let active_workspace = workspace.current_workspace();
-    let visible_layout = render_layout.visible;
     push_workspace_number(vertices, active_workspace, status_rect, size);
     push_status_preview(
         vertices,
         workspace,
         active_workspace,
-        visible_layout,
+        render_layout,
+        surface_frames,
+        exiting_surfaces,
         status_rect,
         size,
     );
