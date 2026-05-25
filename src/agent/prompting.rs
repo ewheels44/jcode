@@ -6,7 +6,21 @@ use serde_json::json;
 use std::path::Path;
 use dirs;
 
+/// Maximum characters for enrich task context to prevent massive Python bridge payloads
+const MAX_ENRICH_TASK_CHARS: usize = 10_000;
+
 impl Agent {
+    /// Log the user prompt for debugging enrichment issues
+    pub(super) fn log_user_prompt_for_enrich(&self, task: &str) {
+        let preview: String = task.chars().take(200).collect();
+        logging::info(&format!(
+            "User prompt for enrich: {}{} ({} chars total)",
+            preview,
+            if task.len() > 200 { "..." } else { "" },
+            task.len()
+        ));
+    }
+
     pub(super) fn log_prompt_prefix_accounting(
         &self,
         split: &crate::prompt::SplitSystemPrompt,
@@ -154,9 +168,13 @@ impl Agent {
 
         crate::logging::info("Auto-enrich: starting auto_enrich_task()");
 
-        // Extract conversation context: the first user message (original task) paired
-        // with any follow-up messages so Mimir has context across multi-turn sessions.
-        let user_task = self.extract_conversation_context().unwrap_or_default();
+        // Extract conversation context: use the latest user message for enrich_task
+        // so Mimir enriches based on the current request, not the original.
+        let user_task = self.extract_latest_user_message().unwrap_or_default();
+
+        // Log the user prompt for debugging
+        self.log_user_prompt_for_enrich(&user_task);
+
         crate::logging::info(&format!(
             "Auto-enrich: extracted user task ({} chars): {}",
             user_task.len(),
@@ -263,15 +281,16 @@ impl Agent {
         Some(formatted)
     }
 
-    /// Extract conversation context for the enrich_task call.
-    /// Returns the first user message (original task intent) paired with the
-    /// latest follow-up message when they differ, so Mimir has meaningful
-    /// context even on subsequent turns.
-    fn extract_conversation_context(&self) -> Option<String> {
-        let text_blocks: Vec<&str> = self
+    /// Extract the latest user message for enrich_task.
+    /// Returns the most recent user message so Mimir enriches based on the
+    /// current request rather than the original task.
+    /// Skips memory-injected <system-reminder> wrapper messages.
+    fn extract_latest_user_message(&self) -> Option<String> {
+        let latest = self
             .session
             .messages
             .iter()
+            .rev()  // Start from the most recent
             .filter(|msg| matches!(msg.role, crate::message::Role::User))
             .filter_map(|msg| {
                 msg.content.iter().find_map(|block| match block {
@@ -279,28 +298,28 @@ impl Agent {
                     _ => None,
                 })
             })
-            .collect();
+            .find(|text| !text.trim().starts_with("<system-reminder>"))
+            .map(|text| text.to_string());
 
-        let first = *text_blocks.first()?;
-        if first.trim().is_empty() {
+        let text = latest?;
+        if text.trim().is_empty() {
             return None;
         }
 
-        if text_blocks.len() > 1 {
-            let latest = text_blocks.last()?;
-            if latest.trim() == first.trim() {
-                // Same message repeated (e.g., retry) — just use first
-                Some(first.to_string())
-            } else {
-                Some(format!(
-                    "Original request: {}\n\nFollow-up: {}",
-                    first, latest
-                ))
-            }
+        // Cap context size to prevent massive Python bridge payloads
+        if text.len() > MAX_ENRICH_TASK_CHARS {
+            let capped: String = text.chars().take(MAX_ENRICH_TASK_CHARS).collect();
+            logging::warn(&format!(
+                "Enrich task context capped from {} to {} chars",
+                text.len(),
+                capped.len()
+            ));
+            Some(capped)
         } else {
-            Some(first.to_string())
+            Some(text)
         }
     }
+
 }
 
 // --- Helper functions mirroring mimir.rs detection logic ---
