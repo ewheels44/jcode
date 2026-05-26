@@ -34,7 +34,8 @@ use jcode_session_types::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -216,6 +217,12 @@ struct RawFilterOutcome {
 struct SearchWorkerOutcome {
     results: Vec<SearchResult>,
     parse_errors: usize,
+}
+
+#[derive(Default)]
+struct SessionFileCollection {
+    files: Vec<SessionFileCandidate>,
+    truncated: bool,
 }
 
 #[async_trait]
@@ -537,13 +544,11 @@ fn search_sessions_blocking(
     }
 
     if source_matches_filter("jcode", options) {
-        let mut files = collect_session_files(sessions_dir)?;
+        let collection = collect_session_files(sessions_dir, options.max_scan_sessions)?;
+        report.truncated |= collection.truncated;
+        let mut files = collection.files;
         if !files.is_empty() {
             files.sort_unstable_by(|a, b| b.mtime.cmp(&a.mtime));
-            if files.len() > options.max_scan_sessions {
-                files.truncate(options.max_scan_sessions);
-                report.truncated = true;
-            }
             report.scanned_jcode_sessions = files.len();
 
             if !options.include_current {
@@ -605,10 +610,15 @@ fn search_sessions_blocking(
     Ok(report)
 }
 
-fn collect_session_files(sessions_dir: &Path) -> Result<Vec<SessionFileCandidate>> {
-    let mut files = Vec::new();
+fn collect_session_files(
+    sessions_dir: &Path,
+    max_scan_sessions: usize,
+) -> Result<SessionFileCollection> {
+    let mut timestamped: BinaryHeap<Reverse<(u64, PathBuf, String)>> = BinaryHeap::new();
+    let mut untimestamped = Vec::new();
+    let mut truncated = false;
     if !sessions_dir.exists() {
-        return Ok(files);
+        return Ok(SessionFileCollection::default());
     }
     for entry in std::fs::read_dir(sessions_dir)?.flatten() {
         let path = entry.path();
@@ -621,6 +631,32 @@ fn collect_session_files(sessions_dir: &Path) -> Result<Vec<SessionFileCandidate
         else {
             continue;
         };
+        if let Some(timestamp_ms) = session_id_timestamp_ms(&stem) {
+            timestamped.push(Reverse((timestamp_ms, path, stem)));
+            if timestamped.len() > max_scan_sessions {
+                timestamped.pop();
+                truncated = true;
+            }
+        } else {
+            untimestamped.push((path, stem));
+        }
+    }
+
+    let mut files =
+        Vec::with_capacity(timestamped.len() + untimestamped.len().min(max_scan_sessions));
+    for Reverse((timestamp_ms, path, stem)) in timestamped.into_sorted_vec() {
+        let journal_path = session_journal_path_from_snapshot(&path);
+        files.push(SessionFileCandidate {
+            snapshot_path: path,
+            journal_path,
+            session_id_hint: stem,
+            mtime: system_time_from_unix_millis(timestamp_ms),
+        });
+    }
+
+    // Legacy or imported snapshot names may not contain a timestamp. They are
+    // uncommon, so only stat these fallback paths instead of every session file.
+    for (path, stem) in untimestamped {
         let journal_path = session_journal_path_from_snapshot(&path);
         let snapshot_mtime = modified_time_or_epoch(&path);
         let journal_mtime = modified_time_or_epoch(&journal_path);
@@ -631,7 +667,26 @@ fn collect_session_files(sessions_dir: &Path) -> Result<Vec<SessionFileCandidate
             mtime: snapshot_mtime.max(journal_mtime),
         });
     }
-    Ok(files)
+
+    if files.len() > max_scan_sessions {
+        files.sort_unstable_by(|a, b| b.mtime.cmp(&a.mtime));
+        files.truncate(max_scan_sessions);
+        truncated = true;
+    }
+
+    Ok(SessionFileCollection { files, truncated })
+}
+
+fn session_id_timestamp_ms(session_id: &str) -> Option<u64> {
+    session_id.split('_').find_map(|part| {
+        (part.len() == 13)
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn system_time_from_unix_millis(timestamp_ms: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp_ms)
 }
 
 fn modified_time_or_epoch(path: &Path) -> SystemTime {
