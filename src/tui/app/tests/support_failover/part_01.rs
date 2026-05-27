@@ -2,7 +2,7 @@ use super::*;
 use crate::bus::{
     BackgroundTaskCompleted, BackgroundTaskProgress, BackgroundTaskProgressEvent,
     BackgroundTaskProgressKind, BackgroundTaskProgressSource, BackgroundTaskStatus, BusEvent,
-    ClientMaintenanceAction, InputShellCompleted, SessionUpdateStatus,
+    ClientMaintenanceAction, InputShellCompleted, SessionUpdateStatus, UpdateStatus,
 };
 use crate::tui::TuiState;
 use ratatui::backend::Backend;

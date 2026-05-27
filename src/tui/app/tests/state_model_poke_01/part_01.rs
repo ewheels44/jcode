@@ -845,7 +845,7 @@ fn test_mouse_scroll_over_diff_pane_scrolls_side_panel_without_changing_focus() 
         modifiers: KeyModifiers::empty(),
     });
 
-    assert_eq!(app.diff_pane_scroll, 6);
+    assert_eq!(app.diff_pane_scroll, 8);
     assert!(!app.diff_pane_focus);
     assert!(!app.diff_pane_auto_scroll);
 }
@@ -872,15 +872,18 @@ fn test_mouse_scroll_animation_preserves_side_pane_scroll_sensitivity() {
         modifiers: KeyModifiers::empty(),
     });
 
-    assert_eq!(app.diff_pane_scroll, 6, "first frame should move one line");
+    assert_eq!(
+        app.diff_pane_scroll, 8,
+        "one wheel notch should drain the full side-pane scroll amount"
+    );
 
     let _ = crate::tui::app::local::handle_tick(&mut app);
-    assert_eq!(app.diff_pane_scroll, 7);
+    assert_eq!(app.diff_pane_scroll, 8);
 
     crate::tui::app::local::handle_tick(&mut app);
     assert_eq!(
         app.diff_pane_scroll, 8,
-        "one wheel notch should still total three lines"
+        "ticks should not add extra scroll after the wheel notch drained"
     );
 }
 
@@ -923,7 +926,7 @@ fn test_mouse_scroll_over_tool_side_panel_scrolls_shared_right_pane_without_chan
         !scroll_only,
         "side-panel wheel scroll should request an immediate redraw"
     );
-    assert_eq!(app.diff_pane_scroll, 6);
+    assert_eq!(app.diff_pane_scroll, 8);
     assert!(!app.diff_pane_focus);
     assert!(!app.diff_pane_auto_scroll);
 }

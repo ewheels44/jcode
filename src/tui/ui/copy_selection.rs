@@ -59,9 +59,23 @@ pub(super) fn copy_selection_text_from_raw_lines(
         return None;
     }
 
-    let mut out = Vec::new();
+    let selected_lines = end
+        .raw_line
+        .saturating_sub(start.raw_line)
+        .saturating_add(1);
+    let mut out = String::new();
     for raw_line in start.raw_line..=end.raw_line {
+        if raw_line > start.raw_line {
+            out.push('\n');
+        }
         let text = snapshot.raw_plain_line(raw_line)?;
+        if raw_line != start.raw_line && raw_line != end.raw_line {
+            if raw_line == start.raw_line + 1 {
+                out.reserve(text.len().saturating_mul(selected_lines.min(8)));
+            }
+            out.push_str(text);
+            continue;
+        }
         let line_width = line_display_width(&text);
         let start_col = if raw_line == start.raw_line {
             clamp_display_col(&text, start.column)
@@ -75,14 +89,17 @@ pub(super) fn copy_selection_text_from_raw_lines(
         };
 
         if end_col < start_col {
-            out.push(String::new());
             continue;
         }
 
-        out.push(display_col_slice(&text, start_col, end_col).to_string());
+        let slice = display_col_slice(&text, start_col, end_col);
+        if raw_line == start.raw_line {
+            out.reserve(slice.len().saturating_mul(selected_lines.min(8)));
+        }
+        out.push_str(&slice);
     }
 
-    Some(out.join("\n"))
+    Some(out)
 }
 
 pub(super) fn link_target_from_snapshot(

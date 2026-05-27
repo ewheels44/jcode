@@ -1,4 +1,5 @@
 use super::handle_get_history;
+use super::handle_get_model_catalog;
 use super::session_activity_snapshot;
 use crate::agent::Agent;
 use crate::message::{Message, ToolDefinition};
@@ -208,6 +209,84 @@ async fn handle_get_history_falls_back_to_persisted_snapshot_when_agent_is_busy(
     }
 }
 
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "test intentionally keeps the agent busy lock held to exercise model-catalog fallback"
+)]
+async fn handle_get_model_catalog_does_not_wait_for_busy_agent_lock() {
+    let _guard = crate::storage::lock_test_env();
+    let temp_home = tempfile::TempDir::new().expect("create temp home");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+
+    let session_id = "session_busy_model_catalog_fallback";
+    let mut session = crate::session::Session::create_with_id(
+        session_id.to_string(),
+        None,
+        Some("busy model catalog".to_string()),
+    );
+    session.model = Some("persisted-model".to_string());
+    session.save().expect("save session");
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider.clone(),
+        Registry::empty(),
+        session.clone(),
+        None,
+    )));
+    let busy_guard = agent.lock().await;
+
+    let (stream_a, mut stream_b) = crate::transport::stream_pair().expect("stream pair");
+    let (_reader_a, writer_a) = stream_a.into_split();
+    let writer = Arc::new(Mutex::new(writer_a));
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        handle_get_model_catalog(43, session_id, &agent, &provider, &writer),
+    )
+    .await
+    .expect("model catalog must not wait for busy agent mutex")
+    .expect("model catalog fallback should write history event");
+
+    drop(busy_guard);
+    drop(writer);
+
+    let mut bytes = Vec::new();
+    stream_b
+        .read_to_end(&mut bytes)
+        .await
+        .expect("read model catalog event bytes");
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut line = String::new();
+    cursor.read_line(&mut line).expect("read first line");
+    let event: crate::protocol::ServerEvent =
+        serde_json::from_str(line.trim()).expect("decode model catalog event");
+
+    match event {
+        crate::protocol::ServerEvent::History {
+            id,
+            session_id: returned_session_id,
+            provider_name,
+            provider_model,
+            ..
+        } => {
+            assert_eq!(id, 43);
+            assert_eq!(returned_session_id, session_id);
+            assert_eq!(provider_name.as_deref(), Some("mock"));
+            assert_eq!(provider_model.as_deref(), Some("persisted-model"));
+        }
+        other => panic!("expected history event, got {:?}", other),
+    }
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
 struct ReloadHistoryEnvGuard {
     prev_home: Option<std::ffi::OsString>,
     prev_runtime: Option<std::ffi::OsString>,
@@ -304,7 +383,7 @@ fn history_reload_recovery_does_not_infer_pending_user_turn_without_reload_marke
 }
 
 #[test]
-fn history_reload_recovery_prefers_server_owned_intent_and_marks_delivered() -> Result<()> {
+fn history_reload_recovery_does_not_mark_delivered_until_continuation_is_accepted() -> Result<()> {
     let _lock = crate::storage::lock_test_env();
     let home = tempfile::TempDir::new()?;
     let runtime = tempfile::TempDir::new()?;
@@ -325,10 +404,43 @@ fn history_reload_recovery_prefers_server_owned_intent_and_marks_delivered() -> 
         anyhow::bail!("server-owned recovery intent should be used");
     };
     assert_eq!(snapshot.continuation_message, "stored continuation");
+    assert!(
+        super::super::reload_recovery::has_pending_for_session(session_id),
+        "building a History payload must not consume the intent; the client may disconnect before queuing it"
+    );
+
+    let Some(snapshot_again) = super::history_reload_recovery_snapshot(session_id, None) else {
+        anyhow::bail!("pending server-owned recovery intent should be re-emitted until accepted");
+    };
+    assert_eq!(snapshot_again.continuation_message, "stored continuation");
 
     assert!(
+        !super::super::reload_recovery::mark_delivered_if_matching_continuation(
+            session_id,
+            "different continuation",
+            "unit_test_mismatch",
+        )?,
+        "mismatched reminders must not consume a pending reload recovery intent"
+    );
+    assert!(super::super::reload_recovery::has_pending_for_session(
+        session_id
+    ));
+
+    assert!(
+        super::super::reload_recovery::mark_delivered_if_matching_continuation(
+            session_id,
+            "stored continuation",
+            "unit_test_accept",
+        )?,
+        "matching accepted continuation should mark the recovery intent delivered"
+    );
+    assert!(
+        !super::super::reload_recovery::has_pending_for_session(session_id),
+        "accepted continuation should consume the durable pending intent"
+    );
+    assert!(
         super::history_reload_recovery_snapshot(session_id, None).is_none(),
-        "delivered server-owned recovery intent should not be emitted twice"
+        "delivered server-owned recovery intent should no longer be emitted"
     );
     Ok(())
 }

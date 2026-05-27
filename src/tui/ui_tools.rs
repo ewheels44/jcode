@@ -60,14 +60,18 @@ fn infer_selfdev_action_from_display_text(text: Option<&str>) -> Option<&'static
 }
 
 fn log_missing_tool_action_for_display(tool: &ToolCall, display_context: &str) {
+    log_missing_tool_field_for_display(tool, display_context, "action");
+}
+
+fn log_missing_tool_field_for_display(tool: &ToolCall, display_context: &str, field: &str) {
     let keys = tool
         .input
         .as_object()
         .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
         .unwrap_or_else(|| format!("non-object:{}", tool.input));
     crate::logging::warn(&format!(
-        "tool summary missing action: context={} tool={} id={} intent={:?} input_keys={}",
-        display_context, tool.name, tool.id, tool.intent, keys
+        "tool summary missing field: context={} tool={} id={} field={} intent={:?} input_keys={}",
+        display_context, tool.name, tool.id, field, tool.intent, keys
     ));
 }
 
@@ -1197,13 +1201,13 @@ pub(super) fn get_tool_summary_with_budget(
                 _ => action.to_string(),
             }
         }
-        "goal" => {
+        "initiative" => {
             let action = tool
                 .input
                 .get("action")
                 .and_then(|v| v.as_str())
                 .unwrap_or_else(|| {
-                    log_missing_tool_action_for_display(tool, "goal");
+                    log_missing_tool_action_for_display(tool, "initiative");
                     "action missing"
                 });
             let id = tool.input.get("id").and_then(|v| v.as_str());
@@ -1302,7 +1306,10 @@ pub(super) fn get_tool_summary_with_budget(
                 .input
                 .get("operation")
                 .and_then(|v| v.as_str())
-                .unwrap_or("command missing");
+                .unwrap_or_else(|| {
+                    log_missing_tool_field_for_display(tool, "lsp", "operation");
+                    "command missing"
+                });
             let file = tool
                 .input
                 .get("file_path")
@@ -1362,11 +1369,17 @@ pub(super) fn get_tool_summary_with_budget(
             format!("{} ({})", desc, agent_type)
         }
         "debug_socket" => {
+            if !tool.input.is_object() {
+                return String::new();
+            }
             let cmd = tool
                 .input
                 .get("command")
                 .and_then(|v| v.as_str())
-                .unwrap_or("command missing");
+                .unwrap_or_else(|| {
+                    log_missing_tool_field_for_display(tool, "debug_socket", "command");
+                    "command missing"
+                });
             truncate_middle_display(cmd, bounded(40))
         }
         name if name.starts_with("mcp__") => tool

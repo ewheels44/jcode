@@ -157,6 +157,9 @@ impl Tool for SubagentTool {
         for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
             allowed.remove(blocked);
         }
+        crate::config::config()
+            .tools
+            .apply_to_allowed_set(&mut allowed);
 
         let summary_map: Arc<Mutex<HashMap<String, ToolSummary>>> =
             Arc::new(Mutex::new(HashMap::new()));

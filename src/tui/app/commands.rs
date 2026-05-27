@@ -30,6 +30,8 @@ use std::time::Instant;
 const BTW_PAGE_ID: &str = "btw";
 pub(super) const REVIEW_PREFERRED_MODEL: &str = "gpt-5.5";
 const POKE_OFF_UI_HINT: &str = "`/poke off` to stop.";
+const TODO_CONFIDENCE_THRESHOLD: u8 = 90;
+const TODO_CONFIDENCE_SUMMARY_PREFIX: &str = "All todos are done. Todo confidence summary:";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PokeCommand {
@@ -62,9 +64,14 @@ pub(super) fn parse_poke_command(trimmed: &str) -> Option<Result<PokeCommand, St
 }
 
 pub(super) fn is_poke_message(message: &str) -> bool {
-    message.starts_with("You have ")
+    (message.starts_with("You have ")
         && message.contains(" incomplete todo")
-        && message.ends_with("update the todo tool.")
+        && message.ends_with("update the todo tool."))
+        || message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
+}
+
+pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
+    message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
 }
 
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
@@ -72,10 +79,14 @@ pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
 }
 
 pub(super) fn clear_queued_poke_messages(app: &mut App) -> usize {
-    let before = app.queued_messages.len();
+    let before_queued = app.queued_messages.len();
     app.queued_messages
         .retain(|message| !is_poke_message(message));
-    let removed = before.saturating_sub(app.queued_messages.len());
+    let before_hidden = app.hidden_queued_system_messages.len();
+    app.hidden_queued_system_messages
+        .retain(|message| !is_todo_confidence_summary_message(message));
+    let removed = before_queued.saturating_sub(app.queued_messages.len())
+        + before_hidden.saturating_sub(app.hidden_queued_system_messages.len());
     if removed > 0 && !app.has_queued_followups() {
         app.pending_queued_dispatch = false;
     }
@@ -282,6 +293,7 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             app.streaming_output_tokens = 0;
             app.streaming_cache_read_tokens = None;
             app.streaming_cache_creation_tokens = None;
+            app.current_api_usage_recorded = false;
             app.upstream_provider = None;
             app.status_detail = None;
             app.streaming_tps_start = None;
@@ -514,7 +526,11 @@ pub(super) fn poke_status_message(app: &App) -> String {
     let queued_followup = app
         .queued_messages
         .iter()
-        .any(|message| is_poke_message(message));
+        .any(|message| is_poke_message(message))
+        || app
+            .hidden_queued_system_messages
+            .iter()
+            .any(|message| is_todo_confidence_summary_message(message));
     let mut message = format!(
         "Auto-poke: **{}**. {} incomplete todo{}.",
         if app.auto_poke_incomplete_todos {
@@ -808,6 +824,34 @@ pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     false
+}
+
+pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/provider-test-coverage")
+        .or_else(|| slash_command_rest(trimmed, "/model-status"))
+    else {
+        return false;
+    };
+
+    let mut parts = rest.split_whitespace();
+    let provider = parts
+        .next()
+        .map(str::to_string)
+        .unwrap_or_else(|| app.provider_name().to_string());
+    let explicit_model = parts.collect::<Vec<_>>().join(" ");
+    let model = if explicit_model.trim().is_empty() {
+        app.provider_model()
+    } else {
+        explicit_model
+    };
+
+    app.model_status_content = build_model_status_report(&provider, &model);
+    app.model_status_scroll = Some(0);
+    true
+}
+
+fn build_model_status_report(provider_query: &str, model_query: &str) -> String {
+    crate::live_tests::format_provider_test_coverage_report(provider_query, model_query, None)
 }
 
 pub(super) fn handle_ssh_command(app: &mut App, trimmed: &str) -> bool {
@@ -1451,7 +1495,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    if trimmed == "/resume" || trimmed == "/sessions" {
+    if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
         return true;
     }
@@ -1629,6 +1673,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         app.push_display_message(DisplayMessage::error(
             "Usage: `/memory [on|off|status]`".to_string(),
         ));
+        return true;
+    }
+
+    if handle_test_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_disabled_mission_command(app, trimmed) {
         return true;
     }
 
@@ -1960,7 +2012,15 @@ fn handle_selfdev_command(app: &mut App, trimmed: &str) -> bool {
 }
 
 pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
-    if trimmed == "/goals" {
+    let Some(trimmed) = trimmed
+        .strip_prefix("/initiatives")
+        .or_else(|| trimmed.strip_prefix("/goals"))
+    else {
+        return false;
+    };
+    let trimmed = format!("/initiatives{}", trimmed);
+
+    if trimmed == "/initiatives" {
         match crate::goal::open_goals_overview_for_session(
             active_session_id(app).as_str(),
             active_working_dir(app).as_deref(),
@@ -1972,21 +2032,21 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
                     .map(|goals| goals.len())
                     .unwrap_or(0);
                 app.push_display_message(DisplayMessage::system(format!(
-                    "Opened goals overview in the side panel ({} goal{}).",
+                    "Opened initiatives overview in the side panel ({} initiative{}).",
                     count,
                     if count == 1 { "" } else { "s" }
                 )));
-                app.set_status_notice("Goals");
+                app.set_status_notice("Initiatives");
             }
             Err(e) => app.push_display_message(DisplayMessage::error(format!(
-                "Failed to open goals overview: {}",
+                "Failed to open initiatives overview: {}",
                 e
             ))),
         }
         return true;
     }
 
-    if trimmed == "/goals resume" {
+    if trimmed == "/initiatives resume" {
         match crate::goal::resume_goal_for_session(
             active_session_id(app).as_str(),
             active_working_dir(app).as_deref(),
@@ -1994,29 +2054,29 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
         ) {
             Ok(Some(result)) => {
                 app.set_side_panel_snapshot(result.snapshot);
-                let mut msg = format!("Resumed goal **{}**.", result.goal.title);
+                let mut msg = format!("Resumed initiative **{}**.", result.goal.title);
                 if let Some(next_step) = result.goal.next_steps.first() {
                     msg.push_str(&format!(" Next step: {}", next_step));
                 }
                 app.push_display_message(DisplayMessage::system(msg));
-                app.set_status_notice(format!("Goal: {}", result.goal.title));
+                app.set_status_notice(format!("Initiative: {}", result.goal.title));
             }
             Ok(None) => app.push_display_message(DisplayMessage::system(
-                "No resumable goals found for this session.".to_string(),
+                "No resumable initiatives found for this session.".to_string(),
             )),
             Err(e) => app.push_display_message(DisplayMessage::error(format!(
-                "Failed to resume goal: {}",
+                "Failed to resume initiative: {}",
                 e
             ))),
         }
         return true;
     }
 
-    if let Some(id) = trimmed.strip_prefix("/goals show ") {
+    if let Some(id) = trimmed.strip_prefix("/initiatives show ") {
         let id = id.trim();
         if id.is_empty() {
             app.push_display_message(DisplayMessage::error(
-                "Usage: `/goals show <id>`".to_string(),
+                "Usage: `/initiatives show <id>`".to_string(),
             ));
             return true;
         }
@@ -2029,28 +2089,113 @@ pub(super) fn handle_goals_command(app: &mut App, trimmed: &str) -> bool {
             Ok(Some(result)) => {
                 app.set_side_panel_snapshot(result.snapshot);
                 app.push_display_message(DisplayMessage::system(format!(
-                    "Opened goal **{}** in the side panel.",
+                    "Opened initiative **{}** in the side panel.",
                     result.goal.title
                 )));
-                app.set_status_notice(format!("Goal: {}", result.goal.title));
+                app.set_status_notice(format!("Initiative: {}", result.goal.title));
             }
-            Ok(None) => {
-                app.push_display_message(DisplayMessage::error(format!("Goal not found: {}", id)))
-            }
-            Err(e) => app
-                .push_display_message(DisplayMessage::error(format!("Failed to open goal: {}", e))),
+            Ok(None) => app.push_display_message(DisplayMessage::error(format!(
+                "Initiative not found: {}",
+                id
+            ))),
+            Err(e) => app.push_display_message(DisplayMessage::error(format!(
+                "Failed to open initiative: {}",
+                e
+            ))),
         }
         return true;
     }
 
-    if trimmed.starts_with("/goals ") {
+    if trimmed.starts_with("/initiatives ") {
         app.push_display_message(DisplayMessage::error(
-            "Usage: `/goals`, `/goals resume`, or `/goals show <id>`".to_string(),
+            "Usage: `/initiatives`, `/initiatives resume`, or `/initiatives show <id>`".to_string(),
         ));
         return true;
     }
 
-    false
+    true
+}
+
+pub(super) fn handle_disabled_mission_command(app: &mut App, trimmed: &str) -> bool {
+    if slash_command_rest(trimmed, "/mission").is_none()
+        && slash_command_rest(trimmed, "/goal").is_none()
+    {
+        return false;
+    }
+
+    app.push_display_message(DisplayMessage::system(
+        "The /mission and /goal commands are disabled in this build.".to_string(),
+    ));
+    true
+}
+
+pub(super) fn handle_test_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/test") else {
+        return false;
+    };
+    let claim = rest.trim();
+    if matches!(claim, "help" | "--help" | "-h") {
+        app.push_display_message(DisplayMessage::system(test_usage()));
+        return true;
+    }
+
+    let prompt = build_test_verification_prompt(claim);
+    app.queued_messages.push(prompt);
+    if app.is_processing {
+        app.push_display_message(DisplayMessage::system(
+            "Queued `/test`; verification will run after the current turn.".to_string(),
+        ));
+        app.set_status_notice("Queued /test");
+    } else {
+        app.pending_queued_dispatch = true;
+        app.push_display_message(DisplayMessage::system(
+            "Running `/test` verification orchestrator.".to_string(),
+        ));
+        app.set_status_notice("Running /test");
+    }
+    true
+}
+
+fn slash_command_rest<'a>(trimmed: &'a str, command: &str) -> Option<&'a str> {
+    if trimmed == command {
+        Some("")
+    } else {
+        trimmed.strip_prefix(&format!("{} ", command))
+    }
+}
+
+fn test_usage() -> String {
+    "Usage: `/test [claim|feature|current changes]`\n\nRuns a layered verification pass and returns evidence, confidence, and gaps."
+        .to_string()
+}
+
+fn build_test_verification_prompt(claim: &str) -> String {
+    let target = if claim.trim().is_empty() {
+        "the current changes and the likely user-facing behavior they affect"
+    } else {
+        claim.trim()
+    };
+    format!(
+        "Run Jcode's /test verification orchestrator for: {target}\n\n\
+Goal: become as sure as reasonably possible before the user checks manually. Do not stop at compile success. Build and execute a verification plan, update todos as needed, and finish with an evidence-backed proof packet.\n\n\
+Required verification layers to consider and run when applicable:\n\
+1. Reproduction-first: if this is a bug, create or identify the exact failing repro and prove it now passes.\n\
+2. Focused unit tests plus integration tests for real module boundaries.\n\
+3. End-to-end/user-flow smoke tests that mirror what the user would manually try.\n\
+4. Property-based tests, state-machine/model-based tests, fuzzing, and exhaustive enumeration for small state spaces.\n\
+5. Static analysis: formatting, type/check build, clippy/lints, dead code, schema/contract compatibility, secret/security scans, dependency/audit checks when available.\n\
+6. Regression strategy: adjacent feature sweep, old-vs-new differential checks, oracle/golden/snapshot comparisons, and metamorphic tests.\n\
+7. Robustness: fault injection/chaos for timeouts, network errors, corrupt storage, permission errors, restarts/resume, cancellation, and invalid inputs.\n\
+8. Concurrency/race/interrupt/multi-session stress plus soak/flakiness loops where risk exists.\n\
+9. Nonfunctional checks: performance/resource regressions, observability logs/events/telemetry, UX/accessibility, and security/safety boundaries.\n\n\
+Final proof packet required:\n\
+- Claim verified or not verified.\n\
+- Commands/tests/checks actually run and their results.\n\
+- E2E/manual-equivalent flows covered.\n\
+- Adjacent regressions considered.\n\
+- Remaining gaps or untested environments.\n\
+- Confidence level and why the user should or should not expect to hit another obvious error."
+    )
 }
 
 pub(super) fn active_session_id(app: &App) -> String {
@@ -2063,11 +2208,18 @@ pub(super) fn active_session_id(app: &App) -> String {
     }
 }
 
+pub(super) fn poke_todos(app: &App) -> Vec<crate::todo::TodoItem> {
+    crate::todo::load_todos(&active_session_id(app)).unwrap_or_default()
+}
+
+pub(super) fn is_incomplete_poke_todo(todo: &crate::todo::TodoItem) -> bool {
+    todo.status != "completed" && todo.status != "cancelled"
+}
+
 pub(super) fn incomplete_poke_todos(app: &App) -> Vec<crate::todo::TodoItem> {
-    crate::todo::load_todos(&active_session_id(app))
-        .unwrap_or_default()
+    poke_todos(app)
         .into_iter()
-        .filter(|todo| todo.status != "completed" && todo.status != "cancelled")
+        .filter(is_incomplete_poke_todo)
         .collect()
 }
 
@@ -2077,6 +2229,150 @@ pub(super) fn build_poke_message(incomplete: &[crate::todo::TodoItem]) -> String
         incomplete.len(),
         if incomplete.len() == 1 { "" } else { "s" },
     )
+}
+
+fn todo_confidence_weight(priority: &str) -> u32 {
+    match priority {
+        "high" => 3,
+        "medium" => 2,
+        _ => 1,
+    }
+}
+
+fn weighted_confidence_average(scores: impl IntoIterator<Item = (u8, u32)>) -> Option<u8> {
+    let mut weighted_sum = 0u32;
+    let mut total_weight = 0u32;
+    for (score, weight) in scores {
+        weighted_sum += u32::from(score) * weight;
+        total_weight += weight;
+    }
+    if total_weight == 0 {
+        None
+    } else {
+        Some(((weighted_sum + total_weight / 2) / total_weight) as u8)
+    }
+}
+
+pub(super) fn build_todo_confidence_summary_message(todos: &[crate::todo::TodoItem]) -> String {
+    let completed: Vec<&crate::todo::TodoItem> = todos
+        .iter()
+        .filter(|todo| todo.status == "completed")
+        .collect();
+    let cancelled_count = todos
+        .iter()
+        .filter(|todo| todo.status == "cancelled")
+        .count();
+
+    let planning_average = weighted_confidence_average(todos.iter().filter_map(|todo| {
+        todo.confidence
+            .map(|score| (score, todo_confidence_weight(&todo.priority)))
+    }));
+    let completion_scores: Vec<(&crate::todo::TodoItem, u8, u32)> = completed
+        .iter()
+        .filter_map(|todo| {
+            todo.completion_confidence
+                .map(|score| (*todo, score, todo_confidence_weight(&todo.priority)))
+        })
+        .collect();
+    let completion_average = weighted_confidence_average(
+        completion_scores
+            .iter()
+            .map(|(_, score, weight)| (*score, *weight)),
+    );
+    let missing_completion_confidence = completed
+        .iter()
+        .filter(|todo| todo.completion_confidence.is_none())
+        .count();
+    let below_threshold_count = completion_scores
+        .iter()
+        .filter(|(_, score, _)| *score < TODO_CONFIDENCE_THRESHOLD)
+        .count();
+    let lowest_completed = completion_scores
+        .iter()
+        .min_by_key(|(_, score, _)| *score)
+        .map(|(_, score, _)| *score);
+
+    let mut lines = vec![TODO_CONFIDENCE_SUMMARY_PREFIX.to_string()];
+    lines.push(format!(
+        "- Completed todos: {}{}.",
+        completed.len(),
+        if cancelled_count == 0 {
+            String::new()
+        } else {
+            format!(
+                " ({} cancelled todo{} skipped)",
+                cancelled_count,
+                if cancelled_count == 1 { "" } else { "s" }
+            )
+        }
+    ));
+
+    match completion_average {
+        Some(avg) => lines.push(format!("- Weighted completion confidence: {}%.", avg)),
+        None if !completed.is_empty() => lines.push(
+            "- Weighted completion confidence: unknown because no completed todo has completion_confidence."
+                .to_string(),
+        ),
+        None => lines.push("- No completed todos recorded completion confidence.".to_string()),
+    }
+    lines.push(format!(
+        "- Confidence threshold: {}%.",
+        TODO_CONFIDENCE_THRESHOLD
+    ));
+
+    match planning_average {
+        Some(avg) => lines.push(format!("- Weighted planning confidence: {}%.", avg)),
+        None => lines.push("- Weighted planning confidence: unknown.".to_string()),
+    }
+
+    match lowest_completed {
+        Some(score) => lines.push(format!("- Lowest completed todo confidence: {}%.", score)),
+        None => lines.push("- Lowest completed todo confidence: unknown.".to_string()),
+    }
+
+    if missing_completion_confidence > 0 {
+        lines.push(format!(
+            "- Missing completion_confidence on {} completed todo{}.",
+            missing_completion_confidence,
+            if missing_completion_confidence == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+
+    if below_threshold_count > 0 {
+        lines.push(format!(
+            "- {} completed todo{} below the {}% confidence threshold.",
+            below_threshold_count,
+            if below_threshold_count == 1 {
+                " is"
+            } else {
+                "s are"
+            },
+            TODO_CONFIDENCE_THRESHOLD
+        ));
+    }
+
+    let needs_validation = completion_average
+        .map(|avg| avg < TODO_CONFIDENCE_THRESHOLD)
+        .unwrap_or(true)
+        || missing_completion_confidence > 0
+        || below_threshold_count > 0;
+    if needs_validation {
+        lines.push(
+            "- Suggested action: validate or test before finalizing. Inspect the result and update completion_confidence when the evidence changes."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "- Suggested action: use this confidence summary when deciding whether any further validation would materially improve certainty before finalizing."
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 pub(super) fn active_working_dir(app: &App) -> Option<std::path::PathBuf> {

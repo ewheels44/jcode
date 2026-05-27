@@ -62,7 +62,10 @@ use futures::FutureExt;
 use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -70,6 +73,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
+const REQUEST_HANDLER_STALL_THRESHOLDS_MS: [u64; 3] = [2_000, 10_000, 60_000];
 
 struct ProcessingMessage {
     id: u64,
@@ -91,6 +95,130 @@ struct SwarmStatusRefs<'a> {
     event_history: &'a Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>,
     event_counter: &'a Arc<std::sync::atomic::AtomicU64>,
     event_tx: &'a broadcast::Sender<SwarmEvent>,
+}
+
+struct RequestHandlerWatchdog {
+    done: Arc<AtomicBool>,
+}
+
+struct RequestHandlerWatchdogContext {
+    request_id: u64,
+    request_kind: String,
+    client_session_id: String,
+    client_connection_id: String,
+    client_instance_id: Option<String>,
+    client_is_processing: bool,
+    message_id: Option<u64>,
+    processing_session_id: Option<String>,
+    line_bytes: usize,
+    lifecycle_logged: bool,
+}
+
+impl RequestHandlerWatchdog {
+    fn spawn(ctx: RequestHandlerWatchdogContext) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_task = Arc::clone(&done);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut previous_threshold = Duration::ZERO;
+            for threshold_ms in REQUEST_HANDLER_STALL_THRESHOLDS_MS {
+                let threshold = Duration::from_millis(threshold_ms);
+                tokio::time::sleep(threshold.saturating_sub(previous_threshold)).await;
+                previous_threshold = threshold;
+                if done_for_task.load(Ordering::Acquire) {
+                    return;
+                }
+                crate::logging::event_warn(
+                    "SERVER_REQUEST_HANDLER_STALLED",
+                    vec![
+                        ("request_id", ctx.request_id.to_string()),
+                        ("request_kind", ctx.request_kind.clone()),
+                        ("session_id", ctx.client_session_id.clone()),
+                        ("client_connection_id", ctx.client_connection_id.clone()),
+                        (
+                            "client_instance_id",
+                            ctx.client_instance_id
+                                .clone()
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                        ("client_processing", ctx.client_is_processing.to_string()),
+                        (
+                            "message_id",
+                            ctx.message_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                        (
+                            "processing_session_id",
+                            ctx.processing_session_id
+                                .clone()
+                                .unwrap_or_else(|| "none".to_string()),
+                        ),
+                        ("line_bytes", ctx.line_bytes.to_string()),
+                        ("lifecycle_logged", ctx.lifecycle_logged.to_string()),
+                        ("threshold_ms", threshold_ms.to_string()),
+                        ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                    ],
+                );
+            }
+        });
+        Self { done }
+    }
+}
+
+impl Drop for RequestHandlerWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+fn log_request_lifecycle_handled(
+    fields: ServerRequestLifecycleFields<'_>,
+    request_lifecycle_start: Instant,
+    request_decoded_at: Instant,
+) {
+    let mut fields = server_request_lifecycle_fields(fields);
+    fields.push((
+        "handler_total_ms".to_string(),
+        request_lifecycle_start.elapsed().as_millis().to_string(),
+    ));
+    fields.push((
+        "since_decode_ms".to_string(),
+        request_decoded_at.elapsed().as_millis().to_string(),
+    ));
+    crate::logging::event_info("SERVER_REQUEST_LIFECYCLE", fields);
+}
+
+fn reject_if_agent_busy_for_request(
+    request_id: u64,
+    request_kind: &'static str,
+    client_session_id: &str,
+    client_is_processing: bool,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) -> bool {
+    if agent.try_lock().is_ok() {
+        return false;
+    }
+
+    crate::logging::event_warn(
+        "SERVER_REQUEST_BUSY_AGENT_REJECTED",
+        vec![
+            ("request_id", request_id.to_string()),
+            ("request_kind", request_kind.to_string()),
+            ("session_id", client_session_id.to_string()),
+            ("client_processing", client_is_processing.to_string()),
+            ("reason", "agent_busy".to_string()),
+        ],
+    );
+    let _ = client_event_tx.send(ServerEvent::Error {
+        id: request_id,
+        message: format!(
+            "Cannot handle {request_kind} while the session is busy. Try again after the current turn finishes."
+        ),
+        retry_after_secs: Some(1),
+    });
+    true
 }
 
 fn server_reload_starting() -> bool {
@@ -690,6 +818,18 @@ pub(super) async fn handle_client(
         let request_kind = request_type_from_line(&line);
         let request_lifecycle_logged = !request_type_is_read_only(&request_kind);
         let request_lifecycle_start = Instant::now();
+        let _request_watchdog = RequestHandlerWatchdog::spawn(RequestHandlerWatchdogContext {
+            request_id,
+            request_kind: request_kind.clone(),
+            client_session_id: client_session_id.clone(),
+            client_connection_id: client_connection_id.clone(),
+            client_instance_id: current_client_instance_id.clone(),
+            client_is_processing,
+            message_id: processing_message_id,
+            processing_session_id: processing_session_id.clone(),
+            line_bytes: line.len(),
+            lifecycle_logged: request_lifecycle_logged,
+        });
         if request_lifecycle_logged {
             let mut fields = server_request_lifecycle_fields(ServerRequestLifecycleFields {
                 phase: "received",
@@ -766,6 +906,24 @@ pub(super) async fn handle_client(
                     info.is_processing = false;
                     info.current_tool_name = None;
                 }
+            }
+            if request_lifecycle_logged {
+                log_request_lifecycle_handled(
+                    ServerRequestLifecycleFields {
+                        phase: "handled",
+                        request_id,
+                        request_kind: &request_kind,
+                        client_session_id: &client_session_id,
+                        client_connection_id: &client_connection_id,
+                        client_instance_id: current_client_instance_id.as_deref(),
+                        client_is_processing,
+                        message_id: processing_message_id,
+                        processing_session_id: processing_session_id.as_deref(),
+                        line_bytes: line.len(),
+                    },
+                    request_lifecycle_start,
+                    request_decoded_at,
+                );
             }
             continue;
         }
@@ -920,6 +1078,16 @@ pub(super) async fn handle_client(
             }
 
             Request::Clear { id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "clear",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_clear_session(
                     id,
                     client_selfdev,
@@ -1263,7 +1431,7 @@ pub(super) async fn handle_client(
             }
 
             Request::GetModelCatalog { id } => {
-                if handle_get_model_catalog(id, &client_session_id, &agent, &writer)
+                if handle_get_model_catalog(id, &client_session_id, &agent, &provider, &writer)
                     .await
                     .is_err()
                 {
@@ -1301,7 +1469,14 @@ pub(super) async fn handle_client(
             }
 
             Request::Reload { id } => {
-                handle_reload(id, &agent, &swarm_members, &client_event_tx).await;
+                handle_reload(
+                    id,
+                    &client_session_id,
+                    &agent,
+                    &swarm_members,
+                    &client_event_tx,
+                )
+                .await;
             }
 
             Request::ResumeSession {
@@ -1383,6 +1558,16 @@ pub(super) async fn handle_client(
             }
 
             Request::SetSubagentModel { id, model } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_subagent_model",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_set_subagent_model(id, model, &agent, &client_event_tx).await;
             }
 
@@ -1404,8 +1589,26 @@ pub(super) async fn handle_client(
                 );
             }
 
-            Request::SetReasoningEffort { id, effort } => {
-                handle_set_reasoning_effort(id, effort, &agent, &client_event_tx).await;
+            Request::SetReasoningEffort {
+                id,
+                effort,
+                target_session_id,
+            } => {
+                if let Some(target_session_id) = target_session_id {
+                    let target_agent = { sessions.read().await.get(&target_session_id).cloned() };
+                    if let Some(target_agent) = target_agent {
+                        handle_set_reasoning_effort(id, effort, &target_agent, &client_event_tx)
+                            .await;
+                    } else {
+                        let _ = client_event_tx.send(ServerEvent::ReasoningEffortChanged {
+                            id,
+                            effort: None,
+                            error: Some(format!("target session not found: {target_session_id}")),
+                        });
+                    }
+                } else {
+                    handle_set_reasoning_effort(id, effort, &agent, &client_event_tx).await;
+                }
             }
 
             Request::SetServiceTier { id, service_tier } => {
@@ -1421,6 +1624,16 @@ pub(super) async fn handle_client(
             }
 
             Request::RenameSession { id, title } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "rename_session",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_rename_session(
                     id,
                     title,
@@ -1444,6 +1657,7 @@ pub(super) async fn handle_client(
                     &provider,
                     &provider_template,
                     &sessions,
+                    &client_session_id,
                     &agent,
                     &client_event_tx,
                 )
@@ -1463,6 +1677,16 @@ pub(super) async fn handle_client(
                 feature,
                 enabled,
             } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "set_feature",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_set_feature(
                     id,
                     feature,
@@ -1487,6 +1711,16 @@ pub(super) async fn handle_client(
             }
 
             Request::Transfer { id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "transfer",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_transfer(id, &client_session_id, &agent, &client_event_tx).await;
             }
 
@@ -1495,6 +1729,16 @@ pub(super) async fn handle_client(
             }
 
             Request::TriggerMemoryExtraction { id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "trigger_memory_extraction",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
                 handle_trigger_memory_extraction(id, &agent, &client_event_tx).await;
             }
 
@@ -2169,27 +2413,22 @@ pub(super) async fn handle_client(
             }
         }
         if request_lifecycle_logged {
-            let mut fields = server_request_lifecycle_fields(ServerRequestLifecycleFields {
-                phase: "handled",
-                request_id,
-                request_kind: &request_kind,
-                client_session_id: &client_session_id,
-                client_connection_id: &client_connection_id,
-                client_instance_id: current_client_instance_id.as_deref(),
-                client_is_processing,
-                message_id: processing_message_id,
-                processing_session_id: processing_session_id.as_deref(),
-                line_bytes: line.len(),
-            });
-            fields.push((
-                "handler_total_ms".to_string(),
-                request_lifecycle_start.elapsed().as_millis().to_string(),
-            ));
-            fields.push((
-                "since_decode_ms".to_string(),
-                request_decoded_at.elapsed().as_millis().to_string(),
-            ));
-            crate::logging::event_info("SERVER_REQUEST_LIFECYCLE", fields);
+            log_request_lifecycle_handled(
+                ServerRequestLifecycleFields {
+                    phase: "handled",
+                    request_id,
+                    request_kind: &request_kind,
+                    client_session_id: &client_session_id,
+                    client_connection_id: &client_connection_id,
+                    client_instance_id: current_client_instance_id.as_deref(),
+                    client_is_processing,
+                    message_id: processing_message_id,
+                    processing_session_id: processing_session_id.as_deref(),
+                    line_bytes: line.len(),
+                },
+                request_lifecycle_start,
+                request_decoded_at,
+            );
         }
     }
 
@@ -2257,6 +2496,19 @@ async fn start_processing_message(
     *state.client_is_processing = true;
     *state.message_id = Some(id);
     *state.session_id = Some(client_session_id.to_string());
+
+    if let Some(reminder) = system_reminder.as_deref()
+        && let Err(error) = super::reload_recovery::mark_delivered_if_matching_continuation(
+            client_session_id,
+            reminder,
+            "client_message_accepted",
+        )
+    {
+        crate::logging::warn(&format!(
+            "Failed to mark reload recovery intent delivered for accepted message session={} id={}: {}",
+            client_session_id, id, error
+        ));
+    }
 
     update_member_status(
         client_session_id,

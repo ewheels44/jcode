@@ -140,6 +140,10 @@ fn test_resolve_tool_name_oauth_aliases() {
     assert_eq!(Registry::resolve_tool_name("file_edit"), "edit");
     assert_eq!(Registry::resolve_tool_name("file_glob"), "glob");
     assert_eq!(Registry::resolve_tool_name("shell_exec"), "bash");
+    assert_eq!(Registry::resolve_tool_name("shell"), "bash");
+    assert_eq!(Registry::resolve_tool_name("read_file"), "read");
+    assert_eq!(Registry::resolve_tool_name("write_file"), "write");
+    assert_eq!(Registry::resolve_tool_name("edit_file"), "edit");
     assert_eq!(Registry::resolve_tool_name("task_runner"), "subagent");
     assert_eq!(Registry::resolve_tool_name("task"), "subagent");
     assert_eq!(Registry::resolve_tool_name("launch"), "open");
@@ -178,6 +182,42 @@ async fn test_batch_resolves_oauth_names() {
         )
         .await;
     assert!(result.is_ok(), "file_grep should resolve to grep tool");
+}
+
+#[tokio::test]
+async fn registry_execute_enforces_session_tool_policy_after_alias_resolution() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let temp_dir = std::env::temp_dir();
+    let session_id = "test-policy-deny";
+    set_session_tool_policy(session_id, None, HashSet::from(["grep".to_string()]));
+
+    let ctx = ToolContext {
+        session_id: session_id.to_string(),
+        message_id: "test".to_string(),
+        tool_call_id: "test".to_string(),
+        working_dir: Some(temp_dir.clone()),
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: ToolExecutionMode::Direct,
+    };
+
+    let result = registry
+        .execute(
+            "file_grep",
+            serde_json::json!({"pattern": "nonexistent_xyz", "path": temp_dir.to_string_lossy()}),
+            ctx,
+        )
+        .await;
+
+    clear_session_tool_policy(session_id);
+    assert!(result.is_err(), "deny-list should block aliased grep calls");
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Tool 'grep' is disabled")
+    );
 }
 
 #[tokio::test]

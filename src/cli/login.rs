@@ -275,6 +275,9 @@ pub async fn run_login_provider(
             LoginProviderTarget::Claude => login_claude_flow(account_label, options.no_browser)
                 .await
                 .map(|_| LoginFlowOutcome::Completed),
+            LoginProviderTarget::ClaudeApiKey => {
+                login_anthropic_api_key_flow().map(|_| LoginFlowOutcome::Completed)
+            }
             LoginProviderTarget::OpenAi => login_openai_flow(account_label, options.no_browser)
                 .await
                 .map(|_| LoginFlowOutcome::Completed),
@@ -302,9 +305,11 @@ pub async fn run_login_provider(
             LoginProviderTarget::Antigravity => login_antigravity_flow(options.no_browser)
                 .await
                 .map(|_| LoginFlowOutcome::Completed),
-            LoginProviderTarget::Google => login_google_flow(options.no_browser)
-                .await
-                .map(|_| LoginFlowOutcome::Completed),
+            LoginProviderTarget::Google => {
+                login_google_flow(options.no_browser, options.google_access_tier)
+                    .await
+                    .map(|_| LoginFlowOutcome::Completed)
+            }
         }
     };
     let outcome = match login_result {
@@ -560,6 +565,35 @@ async fn login_claude_flow(requested_label: Option<&str>, no_browser: bool) -> R
         eprintln!("Profile email: {}", email);
     }
     crate::telemetry::record_auth_success("claude", "oauth");
+    Ok(())
+}
+
+fn login_anthropic_api_key_flow() -> Result<()> {
+    eprintln!("Setting up Anthropic API...");
+    eprintln!("Get your API key from: https://console.anthropic.com/settings/keys\n");
+    eprint!("Paste your Anthropic API key: ");
+    io::stdout().flush()?;
+
+    let key = read_secret_line()?;
+
+    if key.is_empty() {
+        anyhow::bail!("No API key provided.");
+    }
+
+    if !key.starts_with("sk-ant-") {
+        eprintln!("Warning: Anthropic API keys typically start with 'sk-ant-'. Saving anyway.");
+    }
+
+    save_named_api_key("anthropic.env", "ANTHROPIC_API_KEY", &key)?;
+    eprintln!("\nSuccessfully saved Anthropic API key!");
+    eprintln!(
+        "Stored at {}",
+        crate::storage::app_config_dir()?
+            .join("anthropic.env")
+            .display()
+    );
+    eprintln!("Provider: claude (native Anthropic Messages API)");
+    crate::telemetry::record_auth_success("anthropic-api", "api_key");
     Ok(())
 }
 
@@ -896,6 +930,27 @@ fn login_openai_compatible_flow(
         }
     };
 
+    if !resolved.requires_api_key && resolved.default_model.is_none() {
+        match resolved.id.as_str() {
+            "ollama" => {
+                eprintln!(
+                    "Next step: install a model with `ollama pull llama3.2`, then run `jcode --provider ollama --model llama3.2 run 'hello'`."
+                );
+            }
+            "lmstudio" => {
+                eprintln!(
+                    "Next step: load a chat model in LM Studio's Local Server, then run jcode with that exact model id, for example `jcode --provider lmstudio --model <model-id> run 'hello'`."
+                );
+            }
+            _ => {
+                eprintln!(
+                    "Next step: run jcode with a model available on this endpoint, for example `jcode --provider {} --model <model-id> run 'hello'`.",
+                    resolved.id
+                );
+            }
+        }
+    }
+
     eprintln!(
         "Stored at {}",
         crate::storage::app_config_dir()?
@@ -1139,7 +1194,10 @@ async fn login_gemini_flow(no_browser: bool) -> Result<()> {
     Ok(())
 }
 
-async fn login_google_flow(no_browser: bool) -> Result<()> {
+async fn login_google_flow(
+    no_browser: bool,
+    access_tier: Option<auth::google::GmailAccessTier>,
+) -> Result<()> {
     use auth::google::{GmailAccessTier, GoogleCredentials};
 
     eprintln!("╔══════════════════════════════════════════╗");
@@ -1329,24 +1387,28 @@ async fn login_google_flow(no_browser: bool) -> Result<()> {
         }
     };
 
-    eprintln!("── Gmail Access Level ──\n");
-    eprintln!("  [1] Full Access (recommended)");
-    eprintln!("      Search, read, draft, send, and manage emails.");
-    eprintln!("      Send and delete always require your confirmation.\n");
-    eprintln!("  [2] Read & Draft Only");
-    eprintln!("      Search, read emails, create drafts. Cannot send or delete.");
-    eprintln!("      API-level restriction - impossible even if the AI tries.\n");
-    eprint!("Choose [1/2] (default: 1): ");
-    io::stdout().flush()?;
+    let tier = if let Some(tier) = access_tier {
+        tier
+    } else {
+        eprintln!("── Gmail Access Level ──\n");
+        eprintln!("  [1] Full Access (recommended)");
+        eprintln!("      Search, read, draft, send, and manage emails.");
+        eprintln!("      Send and delete always require your confirmation.\n");
+        eprintln!("  [2] Read & Draft Only");
+        eprintln!("      Search, read emails, create drafts. Cannot send or delete.");
+        eprintln!("      API-level restriction - impossible even if the AI tries.\n");
+        eprint!("Choose [1/2] (default: 1): ");
+        io::stdout().flush()?;
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let tier = match input.trim() {
-        "" | "1" => GmailAccessTier::Full,
-        "2" => GmailAccessTier::ReadOnly,
-        _ => {
-            eprintln!("Invalid choice, defaulting to Full Access.");
-            GmailAccessTier::Full
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        match input.trim() {
+            "" | "1" => GmailAccessTier::Full,
+            "2" => GmailAccessTier::ReadOnly,
+            _ => {
+                eprintln!("Invalid choice, defaulting to Full Access.");
+                GmailAccessTier::Full
+            }
         }
     };
 
@@ -1371,8 +1433,10 @@ async fn login_google_flow(no_browser: bool) -> Result<()> {
         "  Tokens:       {}\n",
         auth::google::tokens_path()?.display()
     );
-    eprintln!("The 'gmail' tool is now available to the AI agent.");
-    eprintln!("Try asking: \"check my recent emails\" or \"search emails from ...\"");
+    eprintln!("The 'gmail' tool is configured, but it is disabled by default for privacy.");
+    eprintln!("To expose it to the AI agent, add this to [tools] in config.toml:");
+    eprintln!("  enabled = [\"*\"]");
+    eprintln!("Then try asking: \"check my recent emails\" or \"search emails from ...\"");
 
     crate::telemetry::record_auth_success("google", "oauth");
     Ok(())

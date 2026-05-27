@@ -4,6 +4,24 @@ fn truncated_stream_payload_context(data: &str) -> String {
     crate::util::truncate_str(&data.trim().replace('\n', "\\n"), 240).to_string()
 }
 
+fn local_endpoint_troubleshooting_hint(api_base: &str, model: &str) -> &'static str {
+    let lower = api_base.to_ascii_lowercase();
+    if lower.contains("localhost:11434") || lower.contains("127.0.0.1:11434") {
+        return "Ollama hint: make sure `ollama serve` is running, the model is installed with `ollama pull <model>`, and run jcode with an installed model, for example `jcode --provider ollama --model llama3.2 run 'hello'`.";
+    }
+
+    if lower.contains("localhost:1234") || lower.contains("127.0.0.1:1234") {
+        return "LM Studio hint: start the Local Server in LM Studio, load a chat model, and run jcode with the exact model id shown by LM Studio's /v1/models endpoint.";
+    }
+
+    if lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("[::1]") {
+        return "Local endpoint hint: make sure the server is running, the base URL includes /v1, the selected model is loaded, and the server supports streaming POST /chat/completions.";
+    }
+
+    let _ = model;
+    "Hint: check network connectivity, DNS/TLS, that the base URL includes the API version (usually /v1), and that the model exists on the provider."
+}
+
 // ============================================================================
 // SSE Stream Parser
 // ============================================================================
@@ -129,11 +147,13 @@ async fn stream_response(
         .send()
         .await
         .with_context(|| {
+            let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
             format!(
-                "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\nHint: check network connectivity, DNS/TLS, and that the base URL includes the API version (usually /v1).",
+                "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
                 url,
                 model,
-                auth.label()
+                auth.label(),
+                hint
             )
         })?;
 
@@ -147,13 +167,15 @@ async fn stream_response(
     if !response.status().is_success() {
         let status = response.status();
         let body = crate::util::http_error_body(response, "HTTP error").await;
+        let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         anyhow::bail!(
-            "OpenAI-compatible chat request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\nHint: verify the selected model exists in `/models`, your key has access, and the endpoint supports POST /chat/completions with streaming.",
+            "OpenAI-compatible chat request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
             url,
             model,
             auth.label(),
             status,
-            body
+            body,
+            hint
         );
     }
 
@@ -181,10 +203,11 @@ async fn stream_response(
             Err(_) => {
                 crate::logging::warn("OpenRouter SSE stream timed out (no data for 180s)");
                 anyhow::bail!(
-                    "OpenAI-compatible stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for 180 seconds\nHint: the provider may not support streaming, the model may be overloaded, or the request may be stuck before emitting tokens.",
+                    "OpenAI-compatible stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for 180 seconds\n{}",
                     url,
                     model,
-                    auth.label()
+                    auth.label(),
+                    local_endpoint_troubleshooting_hint(&api_base, &model)
                 );
             }
         };
@@ -219,6 +242,8 @@ pub(crate) struct OpenRouterStream {
     model: String,
     provider_pin: Arc<Mutex<Option<ProviderPin>>>,
     reasoning_buffer: String,
+    finish_reason: Option<String>,
+    message_end_emitted: bool,
 }
 
 #[derive(Default)]
@@ -243,7 +268,21 @@ impl OpenRouterStream {
             model,
             provider_pin,
             reasoning_buffer: String::new(),
+            finish_reason: None,
+            message_end_emitted: false,
         }
+    }
+
+    fn queue_message_end(&mut self) {
+        if self.message_end_emitted {
+            return;
+        }
+
+        self.flush_tool_call_accumulators();
+        self.message_end_emitted = true;
+        self.pending.push_back(StreamEvent::MessageEnd {
+            stop_reason: self.finish_reason.take(),
+        });
     }
 
     fn observe_provider(&mut self, provider: &str) {
@@ -389,9 +428,7 @@ impl OpenRouterStream {
             };
 
             if data == "[DONE]" {
-                self.flush_tool_call_accumulators();
-                self.pending
-                    .push_back(StreamEvent::MessageEnd { stop_reason: None });
+                self.queue_message_end();
                 return self.pending.pop_front();
             }
 
@@ -436,60 +473,63 @@ impl OpenRouterStream {
             // Parse choices
             if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
                 for choice in choices {
-                    let delta = match choice.get("delta").or_else(|| choice.get("message")) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                    if let Some(reasoning_content) = delta
-                        .get("reasoning_content")
-                        .or_else(|| delta.get("reasoning"))
-                        .and_then(|c| c.as_str())
-                        && !reasoning_content.is_empty()
-                    {
-                        let reasoning_delta =
-                            if reasoning_content.starts_with(&self.reasoning_buffer) {
-                                &reasoning_content[self.reasoning_buffer.len()..]
-                            } else {
-                                reasoning_content
-                            };
-                        self.reasoning_buffer = reasoning_content.to_string();
-                        if !reasoning_delta.is_empty() {
-                            self.pending
-                                .push_back(StreamEvent::ThinkingDelta(reasoning_delta.to_string()));
+                    if let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) {
+                        if let Some(reasoning_content) = delta
+                            .get("reasoning_content")
+                            .or_else(|| delta.get("reasoning"))
+                            .and_then(|c| c.as_str())
+                            && !reasoning_content.is_empty()
+                        {
+                            let reasoning_delta =
+                                if reasoning_content.starts_with(&self.reasoning_buffer) {
+                                    &reasoning_content[self.reasoning_buffer.len()..]
+                                } else {
+                                    reasoning_content
+                                };
+                            self.reasoning_buffer = reasoning_content.to_string();
+                            if !reasoning_delta.is_empty() {
+                                self.pending.push_back(StreamEvent::ThinkingDelta(
+                                    reasoning_delta.to_string(),
+                                ));
+                            }
                         }
-                    }
 
-                    // Text content
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str())
-                        && !content.is_empty()
-                    {
-                        self.pending
-                            .push_back(StreamEvent::TextDelta(content.to_string()));
-                    }
+                        // Text content
+                        if let Some(content) = delta.get("content").and_then(|c| c.as_str())
+                            && !content.is_empty()
+                        {
+                            self.pending
+                                .push_back(StreamEvent::TextDelta(content.to_string()));
+                        }
 
-                    // Tool calls
-                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                        for tc in tool_calls {
-                            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                            let function = tc.get("function");
-                            self.apply_tool_call_delta(
-                                index,
-                                tc.get("id").and_then(|i| i.as_str()),
-                                function
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|n| n.as_str()),
-                                function
-                                    .and_then(|f| f.get("arguments"))
-                                    .and_then(|a| a.as_str()),
-                            );
+                        // Tool calls
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array())
+                        {
+                            for tc in tool_calls {
+                                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                let function = tc.get("function");
+                                self.apply_tool_call_delta(
+                                    index,
+                                    tc.get("id").and_then(|i| i.as_str()),
+                                    function
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|n| n.as_str()),
+                                    function
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|a| a.as_str()),
+                                );
+                            }
                         }
                     }
 
                     // Check for finish reason
-                    if let Some(_finish_reason) =
+                    if let Some(finish_reason) =
                         choice.get("finish_reason").and_then(|f| f.as_str())
                     {
+                        let finish_reason = finish_reason.trim();
+                        if !finish_reason.is_empty() {
+                            self.finish_reason = Some(finish_reason.to_string());
+                        }
                         // Emit any pending tool calls.
                         self.flush_tool_call_accumulators();
 
@@ -580,6 +620,12 @@ impl Stream for OpenRouterStream {
                     if let Some(event) = self.pending.pop_front() {
                         return Poll::Ready(Some(Ok(event)));
                     }
+                    if !self.message_end_emitted {
+                        self.message_end_emitted = true;
+                        return Poll::Ready(Some(Ok(StreamEvent::MessageEnd {
+                            stop_reason: self.finish_reason.take(),
+                        })));
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -628,6 +674,46 @@ mod tests {
         let event = stream.parse_next_event();
 
         assert!(matches!(event, Some(StreamEvent::ThinkingDelta(text)) if text == "thinking"));
+    }
+
+    #[test]
+    fn parse_next_event_propagates_finish_reason_to_message_end() {
+        let provider_pin = Arc::new(std::sync::Mutex::new(None));
+        let mut stream = OpenRouterStream::new(
+            futures::stream::empty(),
+            "test-model".to_string(),
+            provider_pin,
+        );
+        stream.buffer =
+            "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n".to_string();
+
+        let event = stream.parse_next_event();
+
+        assert!(matches!(
+            event,
+            Some(StreamEvent::MessageEnd { stop_reason: Some(reason) }) if reason == "length"
+        ));
+    }
+
+    #[test]
+    fn stream_eof_emits_message_end_with_finish_reason_without_done() {
+        let provider_pin = Arc::new(std::sync::Mutex::new(None));
+        let bytes = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"max_tokens\"}]}\n\n",
+        );
+        let mut stream = OpenRouterStream::new(
+            futures::stream::once(async move { Ok(bytes) }),
+            "test-model".to_string(),
+            provider_pin,
+        );
+
+        let event = futures::executor::block_on(stream.next());
+
+        assert!(matches!(
+            event,
+            Some(Ok(StreamEvent::MessageEnd { stop_reason: Some(reason) })) if reason == "max_tokens"
+        ));
+        assert!(futures::executor::block_on(stream.next()).is_none());
     }
 
     #[test]
@@ -693,7 +779,26 @@ mod tests {
             StreamEvent::ToolInputDelta(args) if args == "{\"command\":\"echo ok\"}"
         ));
         assert!(matches!(events[2], StreamEvent::ToolUseEnd));
-        assert!(matches!(events[3], StreamEvent::MessageEnd { .. }));
+        assert!(matches!(
+            &events[3],
+            StreamEvent::MessageEnd { stop_reason } if stop_reason.as_deref() == Some("tool_calls")
+        ));
         assert!(stream.tool_call_accumulators.is_empty());
+    }
+
+    #[test]
+    fn local_endpoint_hint_mentions_ollama_actions() {
+        let hint = local_endpoint_troubleshooting_hint("http://localhost:11434/v1", "llama3.2");
+        assert!(hint.contains("ollama serve"));
+        assert!(hint.contains("ollama pull"));
+        assert!(hint.contains("--provider ollama"));
+    }
+
+    #[test]
+    fn local_endpoint_hint_mentions_lm_studio_server() {
+        let hint = local_endpoint_troubleshooting_hint("http://127.0.0.1:1234/v1", "local-model");
+        assert!(hint.contains("LM Studio"));
+        assert!(hint.contains("Local Server"));
+        assert!(hint.contains("/v1/models"));
     }
 }

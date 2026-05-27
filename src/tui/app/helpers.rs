@@ -270,6 +270,7 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 
 pub(super) fn effort_display_label(effort: &str) -> &str {
     match effort {
+        "max" => "Max",
         "xhigh" => "Max",
         "high" => "High",
         "medium" => "Medium",
@@ -277,6 +278,56 @@ pub(super) fn effort_display_label(effort: &str) -> &str {
         "none" => "None",
         other => other,
     }
+}
+
+pub(super) fn inferred_reasoning_efforts(
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+) -> Vec<&'static str> {
+    let provider = provider_name.unwrap_or_default().to_ascii_lowercase();
+    let model = model_name.unwrap_or_default().to_ascii_lowercase();
+
+    if provider.contains("openrouter") {
+        return vec!["none", "low", "medium", "high", "xhigh"];
+    }
+
+    let is_anthropic = provider.contains("anthropic")
+        || provider.contains("claude")
+        || model.starts_with("claude-");
+    if is_anthropic {
+        let supports_effort = model.contains("claude-mythos")
+            || model.contains("claude-opus-4-7")
+            || model.contains("claude-opus-4-6")
+            || model.contains("claude-sonnet-4-6")
+            || model.contains("claude-opus-4-5")
+            || model.contains("claude-3-7-sonnet")
+            || model.contains("claude-sonnet-3-7");
+        if !supports_effort {
+            return Vec::new();
+        }
+        if model.contains("claude-opus-4-7") {
+            return vec!["none", "low", "medium", "high", "xhigh"];
+        }
+        return vec!["none", "low", "medium", "high"];
+    }
+
+    let is_deepseek = provider.contains("deepseek") || model.contains("deepseek");
+    if is_deepseek {
+        return vec!["none", "low", "medium", "high", "max"];
+    }
+
+    let is_openai = provider.contains("openai")
+        || provider.contains("codex")
+        || model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+        || model.starts_with("o5");
+    if is_openai {
+        return vec!["none", "low", "medium", "high", "xhigh"];
+    }
+
+    Vec::new()
 }
 
 pub(super) fn effort_bar(index: usize, total: usize) -> String {

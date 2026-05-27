@@ -119,6 +119,7 @@ pub(crate) fn set_client_remote_display_title(
 pub(crate) fn initial_title(args: &Args) -> String {
     match &args.command {
         Some(Command::Serve { .. }) => "jcode:server".to_string(),
+        Some(Command::Acp) => "jcode acp".to_string(),
         Some(Command::Connect) => "jcode:client".to_string(),
         Some(Command::Run { .. }) => "jcode run".to_string(),
         Some(Command::Login { .. }) => "jcode login".to_string(),
@@ -152,6 +153,7 @@ pub(crate) fn initial_title(args: &Args) -> String {
         Some(Command::Browser { .. }) => "jcode browser".to_string(),
         Some(Command::Replay { .. }) => "jcode replay".to_string(),
         Some(Command::Model(_)) => "jcode model".to_string(),
+        Some(Command::ProviderTestCoverage { .. }) => "jcode provider-test-coverage".to_string(),
         Some(Command::AuthTest { .. }) => "jcode auth-test".to_string(),
         Some(Command::Restart { .. }) => "jcode restart".to_string(),
         Some(Command::SetupLauncher) => "jcode setup-launcher".to_string(),

@@ -353,7 +353,7 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
             ),
         ])));
 
-        handle_reload(7, &agent, &swarm_members, &tx).await;
+        handle_reload(7, "session_test_reload", &agent, &swarm_members, &tx).await;
 
         let reloading = events
             .recv()
@@ -389,6 +389,65 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })?;
 
+    crate::server::clear_reload_marker();
+    if let Some(prev_runtime) = prev_runtime {
+        crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);
+    } else {
+        crate::env::remove_var("JCODE_RUNTIME_DIR");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_reload_does_not_wait_for_busy_agent_lock() -> Result<()> {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
+    let prev_runtime = std::env::var_os("JCODE_RUNTIME_DIR");
+    crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+    let mut rx = crate::server::subscribe_reload_signal_for_tests();
+
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let agent = build_test_agent(provider, registry, Vec::new());
+    let agent = Arc::new(Mutex::new(agent));
+    let busy_agent_lock = agent.lock().await;
+
+    let (tx, mut events) = mpsc::unbounded_channel::<ServerEvent>();
+    let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        handle_reload(11, "session_fallback_reload", &agent, &swarm_members, &tx),
+    )
+    .await
+    .map_err(|_| anyhow!("handle_reload waited for a busy agent lock"))?;
+
+    let reloading = events
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("reloading event"))?;
+    assert!(matches!(reloading, ServerEvent::Reloading { .. }));
+    let done = events.recv().await.ok_or_else(|| anyhow!("done event"))?;
+    assert!(matches!(done, ServerEvent::Done { id: 11 }));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), rx.changed())
+        .await
+        .map_err(|_| anyhow!("reload signal timeout"))?
+        .map_err(|e| anyhow!("reload signal should be delivered: {e}"))?;
+    let signal = rx
+        .borrow_and_update()
+        .clone()
+        .ok_or_else(|| anyhow!("reload signal payload should exist"))?;
+    assert_eq!(
+        signal.triggering_session.as_deref(),
+        Some("session_fallback_reload")
+    );
+    assert!(
+        !signal.prefer_selfdev_binary,
+        "busy fallback must not wait for canary state"
+    );
+
+    drop(busy_agent_lock);
     crate::server::clear_reload_marker();
     if let Some(prev_runtime) = prev_runtime {
         crate::env::set_var("JCODE_RUNTIME_DIR", prev_runtime);

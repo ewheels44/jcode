@@ -266,6 +266,7 @@ pub enum UpdateStatus {
     Checking,
     Available { current: String, latest: String },
     Downloading { version: String },
+    Installing { version: String },
     Installed { version: String },
     UpToDate,
     Error(String),
@@ -386,6 +387,11 @@ pub struct Bus {
 
 const MODELS_UPDATED_DEBOUNCE: Duration = Duration::from_millis(750);
 
+fn latest_update_status() -> &'static Mutex<Option<UpdateStatus>> {
+    static STATE: OnceLock<Mutex<Option<UpdateStatus>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
 #[derive(Default)]
 struct ModelsUpdatedPublishState {
     last_published_at: Option<Instant>,
@@ -419,7 +425,20 @@ impl Bus {
     }
 
     pub fn publish(&self, event: BusEvent) {
+        if let BusEvent::UpdateStatus(status) = &event {
+            let mut latest = latest_update_status()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *latest = Some(status.clone());
+        }
         let _ = self.sender.send(event);
+    }
+
+    pub fn latest_update_status(&self) -> Option<UpdateStatus> {
+        latest_update_status()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn publish_models_updated(&self) {

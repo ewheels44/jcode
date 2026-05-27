@@ -178,6 +178,83 @@ fn insert_mode_autocompletes_workspace_slash_command() {
 }
 
 #[test]
+fn insert_mode_autocompletes_workspace_fuzzy_slash_abbreviation() {
+    let mut workspace = Workspace::fake();
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    workspace.handle_key(KeyInput::Character("/hp".to_string()));
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::Autocomplete),
+        KeyOutcome::Redraw
+    );
+    assert_eq!(workspace.draft, "/help");
+    assert_eq!(workspace.draft_cursor, "/help".len());
+}
+
+#[test]
+fn insert_mode_slash_resume_loads_sessions_instead_of_sending_prompt() {
+    let mut workspace = Workspace::fake();
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    workspace.handle_key(KeyInput::Character("/resume".to_string()));
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::LoadSessionSwitcher
+    );
+    assert_eq!(workspace.draft, "");
+    assert_eq!(workspace.draft_cursor, 0);
+    assert_eq!(workspace.mode, InputMode::Navigation);
+}
+
+#[test]
+fn insert_mode_slash_reload_requests_force_reload() {
+    let mut workspace = Workspace::fake();
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    workspace.handle_key(KeyInput::Character("/reload".to_string()));
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::ForceReload
+    );
+    assert_eq!(workspace.draft, "");
+    assert_eq!(workspace.draft_cursor, 0);
+    assert_eq!(workspace.mode, InputMode::Navigation);
+}
+
+#[test]
+fn insert_mode_slash_force_reload_alias_requests_force_reload() {
+    let mut workspace = Workspace::fake();
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    workspace.handle_key(KeyInput::Character("/force-reload".to_string()));
+
+    assert_eq!(
+        workspace.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::ForceReload
+    );
+}
+
+#[test]
+fn insert_mode_slash_resume_with_image_remains_normal_prompt() {
+    let mut workspace = Workspace::from_session_cards(vec![SessionCard {
+        session_id: "session_alpha".to_string(),
+        title: "alpha".to_string(),
+        subtitle: "active".to_string(),
+        detail: "recent".to_string(),
+        preview_lines: Vec::new(),
+        detail_lines: Vec::new(),
+        transcript_messages: Vec::new(),
+    }]);
+    workspace.handle_key(KeyInput::Character("i".to_string()));
+    assert!(workspace.attach_image("image/png".to_string(), "abc".to_string()));
+    workspace.handle_key(KeyInput::Character("/resume".to_string()));
+
+    assert!(matches!(
+        workspace.handle_key(KeyInput::SubmitDraft),
+        KeyOutcome::SendDraft { message, .. } if message == "/resume"
+    ));
+}
+
+#[test]
 fn insert_mode_cuts_input_line_to_clipboard_and_undo_restores() {
     let mut workspace = Workspace::fake();
     workspace.handle_key(KeyInput::Character("i".to_string()));
@@ -727,5 +804,6 @@ fn session_card(id: &str, title: &str) -> SessionCard {
         detail: "1 msgs · workspace".to_string(),
         preview_lines: vec!["user hello".to_string()],
         detail_lines: vec!["user expanded hello".to_string()],
+        transcript_messages: Vec::new(),
     }
 }

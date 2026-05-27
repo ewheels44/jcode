@@ -253,6 +253,24 @@ fn named_openai_compatible_provider_exposes_static_models_as_routes() {
 }
 
 #[test]
+fn direct_openai_compatible_provider_advertises_image_input_support() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+
+    let profile = crate::config::NamedProviderConfig {
+        base_url: "http://localhost:1234/v1".to_string(),
+        auth: crate::config::NamedProviderAuth::None,
+        default_model: Some("local-vision-model".to_string()),
+        ..Default::default()
+    };
+
+    let provider = OpenRouterProvider::new_named_openai_compatible("local-compat", &profile)
+        .expect("local named profile should initialize without auth");
+
+    assert!(provider.supports_image_input());
+}
+
+#[test]
 fn minimax_profile_exposes_static_models_before_catalog_refresh() {
     let models = crate::provider_catalog::openai_compatible_profile_static_models(
         jcode_provider_metadata::MINIMAX_PROFILE,
@@ -696,6 +714,20 @@ fn direct_deepseek_profile_exposes_max_reasoning_effort() {
 }
 
 #[test]
+fn openrouter_profile_exposes_unified_reasoning_effort() {
+    let provider = make_provider();
+
+    assert_eq!(
+        provider.available_efforts(),
+        vec!["none", "low", "medium", "high", "xhigh"]
+    );
+    provider
+        .set_reasoning_effort("max")
+        .expect("OpenRouter max alias should be accepted");
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+}
+
+#[test]
 fn non_deepseek_compatible_profile_does_not_expose_reasoning_effort() {
     let provider = make_custom_compatible_provider();
 
@@ -704,9 +736,167 @@ fn non_deepseek_compatible_profile_does_not_expose_reasoning_effort() {
         .set_reasoning_effort("max")
         .expect_err("generic compatible profile should not expose DeepSeek effort UX");
     assert!(
-        error.to_string().contains("DeepSeek direct profiles"),
+        error.to_string().contains("OpenRouter and DeepSeek"),
         "unexpected error: {error:?}"
     );
+}
+
+#[test]
+fn openrouter_chat_request_sends_unified_reasoning_effort() {
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("anthropic/claude-sonnet-4.6".to_string())),
+        supports_model_catalog: false,
+        ..make_provider()
+    };
+    provider
+        .set_reasoning_effort("high")
+        .expect("OpenRouter unified reasoning should accept high effort");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &[], "", None)
+            .await
+            .expect("fake chat request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    assert!(
+        request.contains(r#""reasoning":{"effort":"high"}"#),
+        "OpenRouter request should include unified reasoning effort: {request}"
+    );
+    assert!(
+        !request.contains(r#""thinking":{"type":"enabled"}"#),
+        "unified reasoning should supersede legacy thinking override: {request}"
+    );
+}
+
+fn live_openrouter_models() -> Vec<String> {
+    std::env::var("JCODE_LIVE_OPENROUTER_MODELS")
+        .or_else(|_| std::env::var("JCODE_OPENROUTER_MODEL"))
+        .unwrap_or_else(|_| "anthropic/claude-sonnet-4.6".to_string())
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+async fn collect_openrouter_live_smoke_stream(
+    mut stream: EventStream,
+    timeout: Duration,
+) -> Result<(usize, usize, bool)> {
+    tokio::time::timeout(timeout, async move {
+        let mut text_bytes = 0usize;
+        let mut thinking_bytes = 0usize;
+        let mut saw_message_end = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta(text) => {
+                    text_bytes += text.len();
+                }
+                StreamEvent::ThinkingDelta(text) => {
+                    thinking_bytes += text.len();
+                }
+                StreamEvent::MessageEnd { .. } => {
+                    saw_message_end = true;
+                    break;
+                }
+                StreamEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => {}
+            }
+        }
+        Ok((text_bytes, thinking_bytes, saw_message_end))
+    })
+    .await
+    .context("live OpenRouter smoke timed out")?
+}
+
+#[tokio::test]
+#[ignore = "live smoke: requires OPENROUTER_API_KEY or configured OpenRouter credentials"]
+async fn live_openrouter_unified_reasoning_smoke() -> Result<()> {
+    let _env_lock = ENV_LOCK.lock().unwrap();
+    let Some(token) = OpenRouterProvider::get_api_key() else {
+        eprintln!(
+            "skipping live OpenRouter smoke: OPENROUTER_API_KEY or configured OpenRouter credentials not found"
+        );
+        return Ok(());
+    };
+
+    let models = live_openrouter_models();
+    let effort = std::env::var("JCODE_LIVE_OPENROUTER_REASONING_EFFORT")
+        .unwrap_or_else(|_| "low".to_string());
+    let max_tokens = std::env::var("JCODE_LIVE_OPENROUTER_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(1024);
+
+    for model in models {
+        let provider = OpenRouterProvider {
+            auth: ProviderAuth::AuthorizationBearer {
+                token: token.clone(),
+                label: configured_api_key_name(),
+            },
+            model: Arc::new(RwLock::new(model.clone())),
+            max_tokens: Some(max_tokens),
+            ..make_provider()
+        };
+        provider.set_reasoning_effort(&effort)?;
+
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Live smoke test: answer exactly OK.".to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+
+        let stream = provider
+            .complete(
+                &messages,
+                &[],
+                "You are a live provider smoke test. Keep the answer tiny.",
+                None,
+            )
+            .await
+            .with_context(|| format!("starting live OpenRouter stream for {model}"))?;
+        let (text_bytes, thinking_bytes, saw_message_end) =
+            collect_openrouter_live_smoke_stream(stream, Duration::from_secs(90))
+                .await
+                .with_context(|| format!("collecting live OpenRouter stream for {model}"))?;
+
+        eprintln!(
+            "live OpenRouter reasoning smoke passed: model={model}, effort={effort}, text_bytes={text_bytes}, thinking_bytes={thinking_bytes}, message_end={saw_message_end}"
+        );
+        assert!(
+            text_bytes > 0 || thinking_bytes > 0,
+            "live OpenRouter response for {model} contained neither text nor thinking deltas"
+        );
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -780,12 +970,13 @@ fn openai_compatible_model_catalog_refresh_calls_models_endpoint_and_updates_dis
         r#"{
             "object": "list",
             "data": [
-                {"id": "live-login-flow-model", "object": "model"}
+                {"id": "live-login-flow-model", "object": "model", "context_length": 131072}
             ]
         }"#,
     );
     let provider = OpenRouterProvider {
         api_base,
+        model: Arc::new(RwLock::new("live-login-flow-model".to_string())),
         auth: ProviderAuth::AuthorizationBearer {
             token: "sk-live-catalog".to_string(),
             label: "OPENAI_COMPAT_API_KEY".to_string(),
@@ -806,6 +997,7 @@ fn openai_compatible_model_catalog_refresh_calls_models_endpoint_and_updates_dis
         .block_on(provider.refresh_models())
         .expect("refresh fake model catalog");
     assert_eq!(fetched[0].id, "live-login-flow-model");
+    assert_eq!(provider.context_window(), 131_072);
 
     let request = request_rx
         .recv_timeout(Duration::from_secs(2))
@@ -833,6 +1025,18 @@ fn openai_compatible_model_catalog_refresh_calls_models_endpoint_and_updates_dis
             .any(|model| model == "static-login-flow-fallback"),
         "static fallback/default models should remain visible alongside live catalog models: {display:?}"
     );
+
+    let fresh_provider = OpenRouterProvider {
+        api_base: provider.api_base.clone(),
+        model: Arc::new(RwLock::new("live-login-flow-model".to_string())),
+        auth: provider.auth.clone(),
+        supports_provider_features: false,
+        supports_model_catalog: true,
+        profile_id: None,
+        send_openrouter_headers: false,
+        ..make_custom_compatible_provider()
+    };
+    assert_eq!(fresh_provider.context_window(), 131_072);
 }
 
 #[test]

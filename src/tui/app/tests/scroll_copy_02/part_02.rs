@@ -82,6 +82,287 @@ fn test_expand_badge_shortcut_toggles_inline_diff_and_pulses_key() {
 }
 
 #[test]
+fn test_expand_badge_shortcut_does_not_collapse_full_inline_diff() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, _terminal) = create_copy_test_app();
+    crate::tui::ui::clear_test_render_state_for_tests();
+    app.diff_mode = crate::config::DiffDisplayMode::FullInline;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key_event(KeyEvent::new(
+        KeyCode::Char('E'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    assert!(
+        app.status_notice().is_none(),
+        "full-inline E shortcut should not run expand/collapse action"
+    );
+}
+
+fn make_edit_badge_test_app(
+    old_line_count: usize,
+) -> (App, ratatui::Terminal<ratatui::backend::TestBackend>) {
+    let mut app = create_test_app();
+    let old_string = (0..old_line_count)
+        .map(|idx| format!("old line {idx}\n"))
+        .collect::<String>();
+    let new_string = (0..old_line_count)
+        .map(|idx| format!("new line {idx}\n"))
+        .collect::<String>();
+    app.display_messages = vec![
+        DisplayMessage::user("please edit demo.txt"),
+        DisplayMessage::tool(
+            "Edited demo.txt".to_string(),
+            crate::message::ToolCall {
+                id: "edit_1".to_string(),
+                name: "edit".to_string(),
+                input: serde_json::json!({
+                    "file_path": "demo.txt",
+                    "old_string": old_string,
+                    "new_string": new_string,
+                }),
+                intent: None,
+            },
+        ),
+    ];
+    app.bump_display_messages_version();
+    app.diff_mode = crate::config::DiffDisplayMode::Inline;
+    app.scroll_offset = 0;
+    app.auto_scroll_paused = false;
+    app.is_processing = false;
+    app.status = ProcessingStatus::Idle;
+    app.session.short_name = Some("test".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let terminal = ratatui::Terminal::new(backend).expect("failed to create test terminal");
+    (app, terminal)
+}
+
+fn assert_rendered_expand_badge_shortcut_expands_to_full_diff(
+    key_code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("more changes"),
+        "expected collapsed diff:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[E] expand"),
+        "expected visible expand badge for collapsed edit diff:\n{rendered}"
+    );
+
+    app.handle_key_event(crossterm::event::KeyEvent::new(key_code, modifiers));
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        !rendered.contains("more changes"),
+        "expanded full inline diff should not be collapsed:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("[E] expand"),
+        "expanded full inline diff should not keep expand badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("new line 19"),
+        "expanded diff should include the previously hidden tail:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_expand_badge_rendered_shortcut_expands_with_explicit_shift_event() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Matches the debug key injector and terminals that report Alt+Shift+E as a
+    // lowercase char plus an explicit SHIFT modifier.
+    assert_rendered_expand_badge_shortcut_expands_to_full_diff(
+        KeyCode::Char('e'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    );
+}
+
+#[test]
+fn test_expand_badge_rendered_shortcut_expands_with_alt_uppercase_event() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Matches terminals that encode Alt+Shift+E like the copy badge path:
+    // Alt plus an uppercase character and no explicit SHIFT modifier.
+    assert_rendered_expand_badge_shortcut_expands_to_full_diff(
+        KeyCode::Char('E'),
+        KeyModifiers::ALT,
+    );
+}
+
+#[test]
+fn test_expand_badge_rendered_shortcut_expands_with_alt_lowercase_event() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    // Matches terminals that lose the Shift bit and lowercase the character for
+    // Alt+Shift+E. The fallback is intentionally scoped to the expand badge.
+    assert_rendered_expand_badge_shortcut_expands_to_full_diff(
+        KeyCode::Char('e'),
+        KeyModifiers::ALT,
+    );
+}
+
+#[test]
+fn test_expand_badge_shortcut_works_while_diff_pane_focused() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+    app.diff_pane_focus = true;
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("[E] expand"),
+        "expected visible expand badge before shortcut:\n{rendered}"
+    );
+
+    app.handle_key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('E'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(
+        app.diff_mode,
+        crate::config::DiffDisplayMode::FullInline,
+        "diff pane focus should not swallow the visible expand badge shortcut"
+    );
+}
+
+#[test]
+fn test_remote_expand_badge_rendered_shortcut_expands_with_alt_uppercase_event() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("[E] expand"),
+        "expected visible expand badge before remote key injection:\n{rendered}"
+    );
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    rt.block_on(app.handle_remote_key(KeyCode::Char('E'), KeyModifiers::ALT, &mut remote))
+        .unwrap();
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("new line 19"),
+        "remote expand shortcut should reveal the full inline diff:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_remote_expand_badge_rendered_shortcut_expands_with_alt_lowercase_event() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, mut terminal) = make_edit_badge_test_app(20);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("[E] expand"),
+        "expected visible expand badge before remote key injection:\n{rendered}"
+    );
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    rt.block_on(app.handle_remote_key(KeyCode::Char('e'), KeyModifiers::ALT, &mut remote))
+        .unwrap();
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        rendered.contains("new line 19"),
+        "remote expand shortcut should reveal the full inline diff:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_expand_badge_does_not_render_for_short_untruncated_edit_diff() {
+    let _render_lock = scroll_render_test_lock();
+    let (app, mut terminal) = make_edit_badge_test_app(2);
+
+    let rendered = render_and_snap(&app, &mut terminal);
+    assert!(
+        !rendered.contains("[E] expand"),
+        "short full-visible edit diff should not show expand badge:\n{rendered}"
+    );
+}
+
+#[test]
+fn test_expand_badge_shortcut_opens_full_inline_from_non_inline_mode() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, _terminal) = create_copy_test_app();
+    app.display_messages.push(DisplayMessage::tool(
+        "Edited demo.txt".to_string(),
+        crate::message::ToolCall {
+            id: "edit_1".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": "demo.txt",
+                "old_string": "old line\n",
+                "new_string": "new line\n",
+            }),
+            intent: None,
+        },
+    ));
+    app.bump_display_messages_version();
+    app.diff_mode = crate::config::DiffDisplayMode::Off;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key_event(KeyEvent::new(
+        KeyCode::Char('E'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    assert!(app.copy_badge_ui().key_active.is_some());
+}
+
+#[test]
+fn test_expand_badge_shortcut_uses_display_messages_when_edit_count_is_stale() {
+    let _render_lock = scroll_render_test_lock();
+    let (mut app, _terminal) = create_copy_test_app();
+    app.display_messages.push(DisplayMessage::tool(
+        "Edited demo.txt".to_string(),
+        crate::message::ToolCall {
+            id: "edit_1".to_string(),
+            name: "edit".to_string(),
+            input: serde_json::json!({
+                "file_path": "demo.txt",
+                "old_string": "old line\n",
+                "new_string": "new line\n",
+            }),
+            intent: None,
+        },
+    ));
+    app.bump_display_messages_version();
+    app.diff_mode = crate::config::DiffDisplayMode::Off;
+    app.display_edit_tool_message_count = 0;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key_event(KeyEvent::new(
+        KeyCode::Char('e'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+
+    assert_eq!(app.diff_mode, crate::config::DiffDisplayMode::FullInline);
+    assert!(app.input.is_empty(), "shortcut should not insert text");
+}
+
+#[test]
 fn test_try_open_link_at_opens_clicked_url_and_sets_notice() {
     let _render_lock = scroll_render_test_lock();
     let mut app = create_test_app();

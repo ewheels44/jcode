@@ -665,6 +665,19 @@ fn test_common_tool_summaries_keep_full_text_when_row_budget_fits() {
 }
 
 #[test]
+fn test_debug_socket_summary_hides_transient_missing_input() {
+    let tool = ToolCall {
+        id: "debug-start".to_string(),
+        name: "debug_socket".to_string(),
+        input: serde_json::Value::Null,
+        intent: None,
+    };
+
+    let summary = tools_ui::get_tool_summary_with_budget(&tool, 50, Some(200));
+    assert_eq!(summary, "");
+}
+
+#[test]
 fn test_tool_summary_browser_open_shows_url() {
     let tool = ToolCall {
         id: "browser-open".to_string(),

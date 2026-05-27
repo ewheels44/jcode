@@ -12,6 +12,7 @@ const TEMPORARY_DESKTOP_GALLERY_STATES: &[&str] = &[
     "tool-running",
     "tool-success",
     "tool-failed",
+    "tool-stack",
     "stdin-request",
     "streaming",
     "error",
@@ -49,6 +50,7 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
         detail: "fixture".to_string(),
         preview_lines: Vec::new(),
         detail_lines: Vec::new(),
+        transcript_messages: Vec::new(),
     }));
     app.messages.push(SingleSessionMessage::meta(format!(
         "TEMP GALLERY STATE: {state}"
@@ -66,28 +68,37 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
             app.messages
                 .push(SingleSessionMessage::user("Show a currently running tool."));
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+                id: Some("gallery-running".to_string()),
                 name: "bash".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
+                id: Some("gallery-running".to_string()),
                 name: "bash".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolInput {
-                delta: "cargo check -p jcode-desktop\nCompiling...".to_string(),
+                id: Some("gallery-running".to_string()),
+                delta: r#"{"command":"cargo check -p jcode-desktop","run_in_background":true}"#
+                    .to_string(),
             });
         }
         "tool-success" => {
             app.messages
                 .push(SingleSessionMessage::user("Show a successful tool."));
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+                id: Some("gallery-success".to_string()),
                 name: "agentgrep".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
+                id: Some("gallery-success".to_string()),
                 name: "agentgrep".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolInput {
-                delta: "query: DesktopSessionEvent".to_string(),
+                id: Some("gallery-success".to_string()),
+                delta: r#"{"query":"DesktopSessionEvent","path":"crates/jcode-desktop/src"}"#
+                    .to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolFinished {
+                id: Some("gallery-success".to_string()),
                 name: "agentgrep".to_string(),
                 summary: "matched 42 regions".to_string(),
                 is_error: false,
@@ -97,21 +108,44 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
             app.messages
                 .push(SingleSessionMessage::user("Show a failed tool."));
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+                id: Some("gallery-failed".to_string()),
                 name: "bash".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
+                id: Some("gallery-failed".to_string()),
                 name: "bash".to_string(),
             });
             app.apply_session_event(session_launch::DesktopSessionEvent::ToolFinished {
+                id: Some("gallery-failed".to_string()),
                 name: "bash".to_string(),
                 summary: "exit code 101: compile error".to_string(),
                 is_error: true,
             });
         }
+        "tool-stack" => {
+            app.messages.push(SingleSessionMessage::user(
+                "Show a compact stack of completed tool calls.",
+            ));
+            app.messages
+                .push(SingleSessionMessage::tool("▸ read done: loaded 100 lines"));
+            app.messages
+                .push(SingleSessionMessage::tool("▸ agentgrep done: 12 matches"));
+            app.messages
+                .push(SingleSessionMessage::tool("▸ edit done: updated renderer"));
+            app.set_status_label("grouped tool stack fixture");
+        }
         "stdin-request" => {
             app.messages.push(SingleSessionMessage::user(
                 "Show interactive password input.",
             ));
+            app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+                id: Some("bash-call".to_string()),
+                name: "bash".to_string(),
+            });
+            app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
+                id: Some("bash-call".to_string()),
+                name: "bash".to_string(),
+            });
             app.apply_session_event(session_launch::DesktopSessionEvent::StdinRequest {
                 request_id: "fixture-stdin".to_string(),
                 prompt: "Enter sudo password".to_string(),

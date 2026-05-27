@@ -142,6 +142,8 @@ fn desktop_session_event_can_wait_for_frame_tick(
             | session_launch::DesktopSessionEvent::ToolInput { .. }
             | session_launch::DesktopSessionEvent::ToolExecuting { .. }
             | session_launch::DesktopSessionEvent::Status(_)
+            | session_launch::DesktopSessionEvent::TokenUsage { .. }
+            | session_launch::DesktopSessionEvent::RuntimeMetadata { .. }
     )
 }
 
@@ -151,12 +153,16 @@ fn desktop_session_event_payload_bytes(event: &session_launch::DesktopSessionEve
         session_launch::DesktopSessionEvent::TextDelta(text)
         | session_launch::DesktopSessionEvent::TextReplace(text)
         | session_launch::DesktopSessionEvent::Error(text) => text.len(),
-        session_launch::DesktopSessionEvent::ToolInput { delta } => delta.len(),
-        session_launch::DesktopSessionEvent::ToolStarted { name }
-        | session_launch::DesktopSessionEvent::ToolExecuting { name } => name.len(),
-        session_launch::DesktopSessionEvent::ToolFinished { name, summary, .. } => {
-            name.len() + summary.len()
+        session_launch::DesktopSessionEvent::ToolInput { id, delta } => {
+            id.as_deref().unwrap_or_default().len() + delta.len()
         }
+        session_launch::DesktopSessionEvent::ToolStarted { id, name }
+        | session_launch::DesktopSessionEvent::ToolExecuting { id, name } => {
+            id.as_deref().unwrap_or_default().len() + name.len()
+        }
+        session_launch::DesktopSessionEvent::ToolFinished {
+            id, name, summary, ..
+        } => id.as_deref().unwrap_or_default().len() + name.len() + summary.len(),
         session_launch::DesktopSessionEvent::SessionStarted { session_id }
         | session_launch::DesktopSessionEvent::Reloaded { session_id } => session_id.len(),
         session_launch::DesktopSessionEvent::SessionRenamed {
@@ -199,6 +205,26 @@ fn desktop_session_event_payload_bytes(event: &session_launch::DesktopSessionEve
         session_launch::DesktopSessionEvent::Reloading { new_socket } => {
             new_socket.as_deref().unwrap_or_default().len()
         }
+        session_launch::DesktopSessionEvent::ReloadProgress {
+            step,
+            message,
+            output,
+            ..
+        } => step.len() + message.len() + output.as_deref().unwrap_or_default().len(),
+        session_launch::DesktopSessionEvent::RuntimeMetadata {
+            connection_type,
+            status_detail,
+            upstream_provider,
+        } => {
+            connection_type.as_deref().unwrap_or_default().len()
+                + status_detail.as_deref().unwrap_or_default().len()
+                + upstream_provider.as_deref().unwrap_or_default().len()
+        }
+        session_launch::DesktopSessionEvent::TokenUsage { .. } => 32,
+        session_launch::DesktopSessionEvent::SystemNotice { title, message } => {
+            title.len() + message.as_deref().unwrap_or_default().len()
+        }
+        session_launch::DesktopSessionEvent::SessionCloseRequested { reason } => reason.len(),
         session_launch::DesktopSessionEvent::Done => 0,
     }
 }
@@ -218,13 +244,16 @@ pub(crate) fn coalesce_desktop_session_events(
                     coalesced.push(session_launch::DesktopSessionEvent::TextDelta(delta));
                 }
             }
-            session_launch::DesktopSessionEvent::ToolInput { delta } if !delta.is_empty() => {
-                if let Some(session_launch::DesktopSessionEvent::ToolInput { delta: existing }) =
-                    coalesced.last_mut()
+            session_launch::DesktopSessionEvent::ToolInput { id, delta } if !delta.is_empty() => {
+                if let Some(session_launch::DesktopSessionEvent::ToolInput {
+                    id: existing_id,
+                    delta: existing,
+                }) = coalesced.last_mut()
+                    && existing_id == &id
                 {
                     existing.push_str(&delta);
                 } else {
-                    coalesced.push(session_launch::DesktopSessionEvent::ToolInput { delta });
+                    coalesced.push(session_launch::DesktopSessionEvent::ToolInput { id, delta });
                 }
             }
             session_launch::DesktopSessionEvent::Status(status) => {
@@ -234,6 +263,60 @@ pub(crate) fn coalesce_desktop_session_events(
                     *existing = status;
                 } else {
                     coalesced.push(session_launch::DesktopSessionEvent::Status(status));
+                }
+            }
+            session_launch::DesktopSessionEvent::RuntimeMetadata {
+                connection_type,
+                status_detail,
+                upstream_provider,
+            } => {
+                if let Some(session_launch::DesktopSessionEvent::RuntimeMetadata {
+                    connection_type: existing_connection_type,
+                    status_detail: existing_status_detail,
+                    upstream_provider: existing_upstream_provider,
+                }) = coalesced.last_mut()
+                {
+                    if connection_type.is_some() {
+                        *existing_connection_type = connection_type;
+                    }
+                    if status_detail.is_some() {
+                        *existing_status_detail = status_detail;
+                    }
+                    if upstream_provider.is_some() {
+                        *existing_upstream_provider = upstream_provider;
+                    }
+                } else {
+                    coalesced.push(session_launch::DesktopSessionEvent::RuntimeMetadata {
+                        connection_type,
+                        status_detail,
+                        upstream_provider,
+                    });
+                }
+            }
+            session_launch::DesktopSessionEvent::TokenUsage {
+                input,
+                output,
+                cache_read_input,
+                cache_creation_input,
+            } => {
+                if let Some(session_launch::DesktopSessionEvent::TokenUsage {
+                    input: existing_input,
+                    output: existing_output,
+                    cache_read_input: existing_cache_read_input,
+                    cache_creation_input: existing_cache_creation_input,
+                }) = coalesced.last_mut()
+                {
+                    *existing_input = input;
+                    *existing_output = output;
+                    *existing_cache_read_input = cache_read_input;
+                    *existing_cache_creation_input = cache_creation_input;
+                } else {
+                    coalesced.push(session_launch::DesktopSessionEvent::TokenUsage {
+                        input,
+                        output,
+                        cache_read_input,
+                        cache_creation_input,
+                    });
                 }
             }
             event => coalesced.push(event),
@@ -293,5 +376,41 @@ mod tests {
             DesktopSessionEvent::TextDelta("hello".to_string())
         );
         assert_eq!(events[2], DesktopSessionEvent::Done);
+    }
+
+    #[test]
+    fn tool_input_coalescing_respects_tool_call_ids() {
+        let events = coalesce_desktop_session_events(vec![
+            DesktopSessionEvent::ToolInput {
+                id: Some("tool-a".to_string()),
+                delta: "hel".to_string(),
+            },
+            DesktopSessionEvent::ToolInput {
+                id: Some("tool-a".to_string()),
+                delta: "lo".to_string(),
+            },
+            DesktopSessionEvent::ToolInput {
+                id: Some("tool-b".to_string()),
+                delta: "wor".to_string(),
+            },
+            DesktopSessionEvent::ToolInput {
+                id: Some("tool-b".to_string()),
+                delta: "ld".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            events,
+            vec![
+                DesktopSessionEvent::ToolInput {
+                    id: Some("tool-a".to_string()),
+                    delta: "hello".to_string(),
+                },
+                DesktopSessionEvent::ToolInput {
+                    id: Some("tool-b".to_string()),
+                    delta: "world".to_string(),
+                },
+            ]
+        );
     }
 }

@@ -1,5 +1,61 @@
 use super::*;
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_if_missing(key: &'static str, value: &str) -> Option<Self> {
+        if std::env::var_os(key).is_some() {
+            return None;
+        }
+        let previous = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Some(Self { key, previous })
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            crate::env::set_var(self.key, previous);
+        } else {
+            crate::env::remove_var(self.key);
+        }
+    }
+}
+
+async fn collect_live_smoke_stream(
+    mut stream: EventStream,
+    timeout: std::time::Duration,
+) -> Result<(usize, usize, bool)> {
+    tokio::time::timeout(timeout, async move {
+        let mut text_bytes = 0usize;
+        let mut thinking_bytes = 0usize;
+        let mut saw_message_end = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta(text) => {
+                    text_bytes += text.len();
+                }
+                StreamEvent::ThinkingDelta(text) => {
+                    thinking_bytes += text.len();
+                }
+                StreamEvent::MessageEnd { .. } => {
+                    saw_message_end = true;
+                    break;
+                }
+                StreamEvent::Error { message, .. } => anyhow::bail!(message),
+                _ => {}
+            }
+        }
+        Ok((text_bytes, thinking_bytes, saw_message_end))
+    })
+    .await
+    .context("live provider smoke timed out")?
+}
+
 #[test]
 fn test_parse_sse_event() {
     let mut buffer = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_string();
@@ -34,6 +90,247 @@ fn test_oauth_beta_headers_require_explicit_1m_suffix() {
         oauth_beta_headers("claude-opus-4-6[1m]"),
         OAUTH_BETA_HEADERS_1M
     );
+}
+
+#[test]
+fn test_anthropic_reasoning_effort_request_parts() {
+    let provider = AnthropicProvider::new();
+    provider.set_model("claude-sonnet-4-6").unwrap();
+    provider.set_reasoning_effort("none").unwrap();
+
+    assert_eq!(
+        provider.available_efforts(),
+        vec!["none", "low", "medium", "high"]
+    );
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("none"));
+
+    provider.set_reasoning_effort("max").unwrap();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("high"));
+
+    provider.set_reasoning_effort("medium").unwrap();
+    let (thinking, output_config, temperature) =
+        provider.build_reasoning_request_parts("claude-sonnet-4-6", true);
+
+    match thinking.expect("adaptive thinking should be enabled") {
+        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Enabled { .. } => panic!("Claude 4.6 should use adaptive thinking"),
+    }
+    assert_eq!(
+        output_config.expect("output_config should be set").effort,
+        "medium"
+    );
+    assert_eq!(
+        temperature, None,
+        "thinking requests must omit OAuth temperature"
+    );
+}
+
+#[test]
+fn test_anthropic_max_alias_uses_strongest_real_effort() {
+    assert_eq!(
+        AnthropicProvider::actual_effort_for_model("claude-sonnet-4-6", "max"),
+        "high"
+    );
+    assert_eq!(
+        AnthropicProvider::actual_effort_for_model("claude-opus-4-7", "max"),
+        "xhigh"
+    );
+}
+
+#[test]
+fn test_anthropic_manual_thinking_budget_for_opus_45() {
+    let provider = AnthropicProvider::new();
+    provider.set_model("claude-opus-4-5").unwrap();
+    provider.set_reasoning_effort("high").unwrap();
+
+    let (thinking, output_config, temperature) =
+        provider.build_reasoning_request_parts("claude-opus-4-5", false);
+
+    match thinking.expect("manual thinking should be enabled") {
+        ApiThinking::Enabled { budget_tokens } => assert_eq!(budget_tokens, 8_192),
+        ApiThinking::Adaptive { .. } => panic!("Claude Opus 4.5 should use manual thinking"),
+    }
+    assert_eq!(output_config.unwrap().effort, "high");
+    assert_eq!(temperature, None);
+}
+
+#[test]
+fn test_anthropic_thinking_sse_events() {
+    let mut current_tool_use = None;
+    let mut current_thinking_block = false;
+    let mut input_tokens = None;
+    let mut output_tokens = None;
+    let mut cache_read_input_tokens = None;
+    let mut cache_creation_input_tokens = None;
+
+    let start = SseEvent {
+        event_type: "content_block_start".to_string(),
+        data: serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": "sig"}
+        })
+        .to_string(),
+    };
+    let events = process_sse_event(
+        &start,
+        &mut current_tool_use,
+        &mut current_thinking_block,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut cache_read_input_tokens,
+        &mut cache_creation_input_tokens,
+        false,
+    );
+    assert!(matches!(events.as_slice(), [StreamEvent::ThinkingStart]));
+    assert!(current_thinking_block);
+
+    let delta = SseEvent {
+        event_type: "content_block_delta".to_string(),
+        data: serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reasoning text"}
+        })
+        .to_string(),
+    };
+    let events = process_sse_event(
+        &delta,
+        &mut current_tool_use,
+        &mut current_thinking_block,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut cache_read_input_tokens,
+        &mut cache_creation_input_tokens,
+        false,
+    );
+    assert!(
+        matches!(events.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "reasoning text")
+    );
+
+    let signature = SseEvent {
+        event_type: "content_block_delta".to_string(),
+        data: serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "signed"}
+        })
+        .to_string(),
+    };
+    let events = process_sse_event(
+        &signature,
+        &mut current_tool_use,
+        &mut current_thinking_block,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut cache_read_input_tokens,
+        &mut cache_creation_input_tokens,
+        false,
+    );
+    assert!(
+        matches!(events.as_slice(), [StreamEvent::ThinkingSignatureDelta(sig)] if sig == "signed")
+    );
+
+    let stop = SseEvent {
+        event_type: "content_block_stop".to_string(),
+        data: serde_json::json!({"type": "content_block_stop", "index": 0}).to_string(),
+    };
+    let events = process_sse_event(
+        &stop,
+        &mut current_tool_use,
+        &mut current_thinking_block,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut cache_read_input_tokens,
+        &mut cache_creation_input_tokens,
+        false,
+    );
+    assert!(matches!(events.as_slice(), [StreamEvent::ThinkingEnd]));
+    assert!(!current_thinking_block);
+}
+
+#[test]
+fn test_anthropic_signed_thinking_replayed_in_request_blocks() {
+    let provider = AnthropicProvider::new();
+    let blocks = provider.format_content_blocks(
+        &[ContentBlock::AnthropicThinking {
+            thinking: "reasoning text".to_string(),
+            signature: "signed".to_string(),
+        }],
+        false,
+    );
+
+    let value = serde_json::to_value(&blocks).expect("serialize content blocks");
+    assert_eq!(
+        value,
+        serde_json::json!([
+            {
+                "type": "thinking",
+                "thinking": "reasoning text",
+                "signature": "signed"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+#[ignore = "live smoke: requires ANTHROPIC_API_KEY, or set JCODE_LIVE_ANTHROPIC_ALLOW_OAUTH=1 to use Claude OAuth credentials"]
+async fn live_anthropic_reasoning_smoke() -> Result<()> {
+    let _env_lock = crate::storage::lock_test_env();
+    let using_api_key = std::env::var_os("ANTHROPIC_API_KEY").is_some();
+    let allow_oauth = std::env::var_os("JCODE_LIVE_ANTHROPIC_ALLOW_OAUTH").is_some();
+    if !using_api_key && !allow_oauth {
+        eprintln!(
+            "skipping live Anthropic smoke: set ANTHROPIC_API_KEY or JCODE_LIVE_ANTHROPIC_ALLOW_OAUTH=1"
+        );
+        return Ok(());
+    }
+
+    let _max_tokens = EnvVarGuard::set_if_missing("JCODE_ANTHROPIC_MAX_TOKENS", "2048");
+    let model = std::env::var("JCODE_LIVE_ANTHROPIC_MODEL")
+        .or_else(|_| std::env::var("JCODE_ANTHROPIC_MODEL"))
+        .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let effort = std::env::var("JCODE_LIVE_ANTHROPIC_REASONING_EFFORT")
+        .unwrap_or_else(|_| "low".to_string());
+    let prompt = std::env::var("JCODE_LIVE_ANTHROPIC_PROMPT")
+        .unwrap_or_else(|_| "Live smoke test: answer exactly OK.".to_string());
+    let system = std::env::var("JCODE_LIVE_ANTHROPIC_SYSTEM").unwrap_or_else(|_| {
+        "You are a live provider smoke test. Keep the answer tiny.".to_string()
+    });
+    let require_thinking = std::env::var_os("JCODE_LIVE_ANTHROPIC_REQUIRE_THINKING").is_some();
+
+    let provider = AnthropicProvider::new();
+    provider.set_model(&model)?;
+    provider.set_reasoning_effort(&effort)?;
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: prompt,
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let stream = provider.complete(&messages, &[], &system, None).await?;
+    let (text_bytes, thinking_bytes, saw_message_end) =
+        collect_live_smoke_stream(stream, std::time::Duration::from_secs(90)).await?;
+
+    eprintln!(
+        "live Anthropic reasoning smoke passed: model={model}, effort={effort}, text_bytes={text_bytes}, thinking_bytes={thinking_bytes}, message_end={saw_message_end}"
+    );
+    assert!(
+        text_bytes > 0 || thinking_bytes > 0,
+        "live Anthropic response contained neither text nor thinking deltas"
+    );
+    if require_thinking {
+        assert!(
+            thinking_bytes > 0,
+            "live Anthropic response did not include thinking deltas despite JCODE_LIVE_ANTHROPIC_REQUIRE_THINKING"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

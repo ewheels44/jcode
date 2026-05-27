@@ -1012,6 +1012,14 @@ impl Session {
                     ContentBlock::Text { text, .. } | ContentBlock::Reasoning { text } => {
                         *text = crate::message::redact_secrets(text);
                     }
+                    ContentBlock::AnthropicThinking { thinking, .. } => {
+                        *thinking = crate::message::redact_secrets(thinking);
+                    }
+                    ContentBlock::OpenAIReasoning { summary, .. } => {
+                        for item in summary {
+                            *item = crate::message::redact_secrets(item);
+                        }
+                    }
                     ContentBlock::ToolResult { content, .. } => {
                         *content = crate::message::redact_secrets(content);
                     }
@@ -1047,6 +1055,32 @@ impl Session {
             }
         }
         redacted
+    }
+
+    pub fn token_usage_totals(&self) -> crate::protocol::TokenUsageTotals {
+        let mut totals = crate::protocol::TokenUsageTotals::default();
+        for message in &self.messages {
+            let Some(usage) = message.token_usage.as_ref() else {
+                continue;
+            };
+            totals.messages_with_token_usage = totals.messages_with_token_usage.saturating_add(1);
+            totals.input_tokens = totals.input_tokens.saturating_add(usage.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(usage.output_tokens);
+            if usage.cache_read_input_tokens.is_some()
+                || usage.cache_creation_input_tokens.is_some()
+            {
+                totals.cache_reported_input_tokens = totals
+                    .cache_reported_input_tokens
+                    .saturating_add(usage.input_tokens);
+            }
+            totals.cache_read_input_tokens = totals
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens.unwrap_or(0));
+            totals.cache_creation_input_tokens = totals
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+        }
+        totals
     }
 
     pub fn add_message(&mut self, role: Role, content: Vec<ContentBlock>) -> String {

@@ -169,6 +169,51 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
 }
 
 #[test]
+fn token_usage_totals_counts_cache_reported_inputs_only_when_cache_fields_exist() {
+    let mut session = Session::create_with_id(
+        "session_token_usage_totals_test".to_string(),
+        None,
+        Some("Token totals".to_string()),
+    );
+    session.add_message_ext(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+        None,
+        Some(StoredTokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }),
+    );
+    session.add_message_ext(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "second".to_string(),
+            cache_control: None,
+        }],
+        None,
+        Some(StoredTokenUsage {
+            input_tokens: 200,
+            output_tokens: 20,
+            cache_read_input_tokens: Some(150),
+            cache_creation_input_tokens: Some(25),
+        }),
+    );
+
+    let totals = session.token_usage_totals();
+    assert_eq!(totals.messages_with_token_usage, 2);
+    assert_eq!(totals.input_tokens, 300);
+    assert_eq!(totals.output_tokens, 30);
+    assert_eq!(totals.cache_reported_input_tokens, 200);
+    assert_eq!(totals.cache_read_input_tokens, 150);
+    assert_eq!(totals.cache_creation_input_tokens, 25);
+}
+
+#[test]
 fn initial_session_context_is_persisted_once_and_not_overwritten() {
     let mut session = Session::create_with_id(
         "session_context_test".to_string(),
@@ -1166,6 +1211,75 @@ fn test_render_messages_can_expand_compacted_history_window() {
     assert_eq!(rendered_all[1].content, "old prompt");
     assert_eq!(rendered_all[2].content, "old response");
     assert_eq!(rendered_all[3].content, "current prompt");
+}
+
+#[test]
+fn test_compacted_history_window_counts_renderable_messages_not_hidden_reminders() {
+    let mut session = Session::create_with_id(
+        "session_render_compacted_history_hidden_budget_test".to_string(),
+        None,
+        Some("render compacted history hidden budget test".to_string()),
+    );
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "older visible prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>hidden reminder one</system-reminder>".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "previous visible assistant response".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>hidden reminder two</system-reminder>".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "current prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.compaction = Some(StoredCompactionState {
+        summary_text: "older compacted context".to_string(),
+        openai_encrypted_content: None,
+        covers_up_to_turn: 4,
+        original_turn_count: 4,
+        compacted_count: 4,
+    });
+
+    let (rendered, _images, info) = render_messages_and_images_with_compacted_history(&session, 1);
+    let info = info.expect("compacted info");
+
+    assert_eq!(info.total_messages, 2);
+    assert_eq!(info.visible_messages, 1);
+    assert_eq!(info.remaining_messages, 1);
+    assert_eq!(rendered.len(), 3);
+    assert!(rendered[0].content.contains("Showing 1 of 2"));
+    assert_eq!(rendered[1].role, "assistant");
+    assert_eq!(rendered[1].content, "previous visible assistant response");
+    assert_eq!(rendered[2].content, "current prompt");
+    assert!(
+        rendered
+            .iter()
+            .all(|msg| !msg.content.contains("hidden reminder"))
+    );
 }
 
 #[test]

@@ -4,15 +4,53 @@ use crossterm::cursor::{RestorePosition, SavePosition};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use std::io::Write;
 
+const STATUS_SPINNER_FPS: f32 = 12.5;
 pub(super) const STATUS_SPINNER_ONLY_INTERVAL: Duration = Duration::from_millis(80);
 
 pub(super) fn status_spinner_interval() -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(STATUS_SPINNER_ONLY_INTERVAL);
+    status_spinner_interval_after(STATUS_SPINNER_ONLY_INTERVAL)
+}
+
+pub(super) fn reset_status_spinner_interval(interval: &mut tokio::time::Interval, app: &App) {
+    *interval = status_spinner_interval_after(status_spinner_delay_until_next_frame(
+        status_spinner_elapsed(app),
+    ));
+}
+
+fn status_spinner_interval_after(delay: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + delay,
+        STATUS_SPINNER_ONLY_INTERVAL,
+    );
     // The spinner is visual liveness, not simulated time. If terminal/input work delays a tick,
-    // skip the missed frames instead of bursting them later. Bursts are especially visible while
-    // typing because normal full-frame input renders and spinner-only cell renders interleave.
+    // skip the missed frames instead of bursting them later.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
+}
+
+fn status_spinner_elapsed(app: &App) -> f32 {
+    status_spinner_elapsed_for_sources(app.elapsed().map(|duration| duration.as_secs_f32()))
+}
+
+fn status_spinner_elapsed_for_sources(turn_elapsed: Option<f32>) -> f32 {
+    turn_elapsed.unwrap_or(0.0).max(0.0)
+}
+
+fn status_spinner_delay_until_next_frame(elapsed: f32) -> Duration {
+    if !elapsed.is_finite() {
+        return STATUS_SPINNER_ONLY_INTERVAL;
+    }
+
+    let frame_secs = STATUS_SPINNER_ONLY_INTERVAL.as_secs_f64();
+    let elapsed_secs = f64::from(elapsed.max(0.0));
+    let into_frame = elapsed_secs % frame_secs;
+    let remaining = if into_frame <= f64::EPSILON {
+        frame_secs
+    } else {
+        frame_secs - into_frame
+    };
+
+    Duration::from_secs_f64(remaining.max(0.001))
 }
 
 pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
@@ -27,19 +65,31 @@ pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
         return None;
     }
 
-    match app.status {
-        ProcessingStatus::Sending
-        | ProcessingStatus::Connecting(_)
-        | ProcessingStatus::Thinking(_)
-        | ProcessingStatus::Streaming => Some(jcode_tui_style::theme::activity_indicator(
-            app.animation_elapsed(),
-            12.5,
+    if status_uses_primary_spinner(&app.status) {
+        Some(jcode_tui_style::theme::activity_indicator(
+            status_spinner_elapsed(app),
+            STATUS_SPINNER_FPS,
             true,
-        )),
-        ProcessingStatus::Idle
-        | ProcessingStatus::WaitingForNetwork { .. }
-        | ProcessingStatus::RunningTool(_) => None,
+        ))
+    } else {
+        None
     }
+}
+
+/// Statuses whose full status line starts with the primary green circular spinner.
+///
+/// Keep this in sync with `ui_input::draw_status`: these statuses can be safely
+/// refreshed by the one-cell spinner fast path when the status line is left aligned.
+/// Tool execution uses its own full-line activity indicator, and network waits use
+/// a static amber retry marker, so neither belongs here.
+pub(crate) fn status_uses_primary_spinner(status: &ProcessingStatus) -> bool {
+    matches!(
+        status,
+        ProcessingStatus::Sending
+            | ProcessingStatus::Connecting(_)
+            | ProcessingStatus::Thinking(_)
+            | ProcessingStatus::Streaming
+    )
 }
 
 #[derive(Default)]
@@ -137,6 +187,9 @@ impl App {
             super::handterm_native_scroll::HandtermNativeScrollClient::connect_from_env();
         // Subscribe to bus for background task completion notifications
         let mut bus_receiver = Bus::global().subscribe();
+        if let Some(status) = Bus::global().latest_update_status() {
+            self.handle_update_status(status);
+        }
 
         loop {
             let desired_redraw = crate::tui::redraw_interval(&self);
@@ -147,7 +200,7 @@ impl App {
 
             if needs_redraw {
                 status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
-                status_spinner_interval.reset();
+                reset_status_spinner_interval(&mut status_spinner_interval, &self);
                 if let Some(native) = handterm_native_scroll.as_mut() {
                     native.sync_from_app(&self);
                 }
@@ -245,7 +298,7 @@ impl App {
             }
             if needs_redraw {
                 status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
-                status_spinner_interval.reset();
+                reset_status_spinner_interval(&mut status_spinner_interval, &self);
                 needs_redraw = false;
             }
 
@@ -282,6 +335,10 @@ impl App {
             needs_redraw = true;
 
             let mut bus_receiver_remote = Bus::global().subscribe();
+            if let Some(status) = Bus::global().latest_update_status() {
+                self.handle_update_status(status);
+                needs_redraw = true;
+            }
 
             // Main event loop
             loop {
@@ -293,7 +350,7 @@ impl App {
 
                 if needs_redraw {
                     status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
-                    status_spinner_interval.reset();
+                    reset_status_spinner_interval(&mut status_spinner_interval, &self);
                     if let Some(native) = handterm_native_scroll.as_mut() {
                         native.sync_from_app(&self);
                     }
@@ -486,6 +543,78 @@ impl App {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    fn assert_duration_close(actual: Duration, expected: Duration) {
+        let actual_ms = actual.as_millis() as i128;
+        let expected_ms = expected.as_millis() as i128;
+        assert!(
+            (actual_ms - expected_ms).abs() <= 1,
+            "expected {actual:?} to be within 1ms of {expected:?}"
+        );
+    }
+
+    #[test]
+    fn status_spinner_fast_path_uses_status_elapsed_clock() {
+        let full_status_elapsed = 0.0;
+        let app_lifetime_elapsed = 0.24;
+
+        let full_status_symbol = jcode_tui_style::theme::activity_indicator(
+            full_status_elapsed,
+            STATUS_SPINNER_FPS,
+            true,
+        );
+        let old_app_lifetime_symbol = jcode_tui_style::theme::activity_indicator(
+            app_lifetime_elapsed,
+            STATUS_SPINNER_FPS,
+            true,
+        );
+        let fast_path_symbol = jcode_tui_style::theme::activity_indicator(
+            status_spinner_elapsed_for_sources(Some(full_status_elapsed)),
+            STATUS_SPINNER_FPS,
+            true,
+        );
+
+        assert_ne!(
+            old_app_lifetime_symbol, full_status_symbol,
+            "the app lifetime clock can be on a different spinner frame than the status clock"
+        );
+        assert_eq!(fast_path_symbol, full_status_symbol);
+    }
+
+    #[test]
+    fn primary_spinner_statuses_are_explicit() {
+        assert!(status_uses_primary_spinner(&ProcessingStatus::Sending));
+        assert!(status_uses_primary_spinner(&ProcessingStatus::Streaming));
+        assert!(!status_uses_primary_spinner(
+            &ProcessingStatus::RunningTool("bash".to_string())
+        ));
+        assert!(!status_uses_primary_spinner(&ProcessingStatus::Idle));
+        assert!(!status_uses_primary_spinner(
+            &ProcessingStatus::WaitingForNetwork {
+                listener: "network".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn status_spinner_reset_targets_next_frame_boundary() {
+        assert_duration_close(
+            status_spinner_delay_until_next_frame(0.0),
+            STATUS_SPINNER_ONLY_INTERVAL,
+        );
+        assert_duration_close(
+            status_spinner_delay_until_next_frame(0.040),
+            Duration::from_millis(40),
+        );
+        assert_duration_close(
+            status_spinner_delay_until_next_frame(1.0),
+            Duration::from_millis(40),
+        );
+        assert_duration_close(
+            status_spinner_delay_until_next_frame(f32::NAN),
+            STATUS_SPINNER_ONLY_INTERVAL,
+        );
+    }
 
     #[test]
     fn status_spinner_partial_mutates_only_status_cell() {

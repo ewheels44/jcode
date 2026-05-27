@@ -42,11 +42,54 @@ use jcode_message_types::ToolDefinition;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::{LazyLock, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
 pub use jcode_tool_types::{ToolImage, ToolOutput};
+pub(crate) use session_search::spawn_recent_index_warmup;
+
+#[derive(Clone, Debug, Default)]
+struct SessionToolPolicy {
+    allowed_tools: Option<HashSet<String>>,
+    disabled_tools: HashSet<String>,
+}
+
+static SESSION_TOOL_POLICIES: LazyLock<StdRwLock<HashMap<String, SessionToolPolicy>>> =
+    LazyLock::new(|| StdRwLock::new(HashMap::new()));
+
+pub(crate) fn set_session_tool_policy(
+    session_id: &str,
+    allowed_tools: Option<HashSet<String>>,
+    disabled_tools: HashSet<String>,
+) {
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    policies.insert(
+        session_id.to_string(),
+        SessionToolPolicy {
+            allowed_tools,
+            disabled_tools,
+        },
+    );
+}
+
+pub(crate) fn clear_session_tool_policy(session_id: &str) {
+    let mut policies = SESSION_TOOL_POLICIES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    policies.remove(session_id);
+}
+
+fn session_tool_policy(session_id: &str) -> Option<SessionToolPolicy> {
+    SESSION_TOOL_POLICIES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .cloned()
+}
 
 /// Registry of available tools (Arc-wrapped for sharing)
 ///
@@ -183,7 +226,12 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "goal", goal::GoalTool::new);
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "initiative",
+                goal::InitiativeTool::new,
+            );
             Self::insert_tool_timed(&mut m, &mut timings, "gmail", gmail::GmailTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "mimir", mimir::MimirTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "schedule", ambient::ScheduleTool::new);
@@ -318,14 +366,18 @@ impl Registry {
     /// sub-tool calls (e.g. inside `batch`), but our registry uses internal
     /// names (`grep`, `bash`). This mapping ensures both forms resolve
     /// correctly.
-    fn resolve_tool_name(name: &str) -> &str {
+    pub(crate) fn resolve_tool_name(name: &str) -> &str {
         match name {
             "communicate" => "swarm",
             "task" | "task_runner" => "subagent",
             "launch" => "open",
+            "shell" => "bash",
             "shell_exec" => "bash",
+            "read_file" => "read",
             "file_read" => "read",
+            "write_file" => "write",
             "file_write" => "write",
+            "edit_file" => "edit",
             "file_edit" => "edit",
             "file_glob" => "glob",
             "file_grep" => "grep",
@@ -432,6 +484,16 @@ impl Registry {
     pub async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let tools = self.tools.read().await;
         let resolved_name = Self::resolve_tool_name(name);
+        if let Some(policy) = session_tool_policy(&ctx.session_id) {
+            if let Some(allowed) = policy.allowed_tools.as_ref()
+                && !allowed.contains(resolved_name)
+            {
+                return Err(anyhow::anyhow!("Tool '{}' is not allowed", resolved_name));
+            }
+            if policy.disabled_tools.contains(resolved_name) {
+                return Err(anyhow::anyhow!("Tool '{}' is disabled", resolved_name));
+            }
+        }
         let tool = tools
             .get(resolved_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?

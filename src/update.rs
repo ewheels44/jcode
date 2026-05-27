@@ -956,12 +956,17 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             }
         }
         Ok(None) => {
+            Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
             let mut metadata = UpdateMetadata::load().unwrap_or_default();
             metadata.last_check = SystemTime::now();
             let _ = metadata.save();
             UpdateCheckResult::NoUpdate
         }
-        Err(e) => UpdateCheckResult::Error(format!("Check failed: {}", e)),
+        Err(e) => {
+            let msg = format!("Check failed: {}", e);
+            Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(msg.clone())));
+            UpdateCheckResult::Error(msg)
+        }
     }
 }
 

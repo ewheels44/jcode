@@ -133,6 +133,21 @@ fn slash_sessions_alias_opens_session_picker_overlay_locally() {
 }
 
 #[test]
+fn slash_session_alias_opens_session_picker_overlay_locally() {
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = runtime.enter();
+    let mut app = create_test_app();
+
+    app.input = "/session".to_string();
+    app.submit_input();
+
+    assert!(app.session_picker_overlay.is_some());
+    assert_eq!(app.session_picker_mode, SessionPickerMode::Resume);
+    assert!(app.pending_session_picker_load.is_some());
+    assert!(app.input.is_empty());
+}
+
+#[test]
 fn test_resize_redraw_is_debounced() {
     let mut app = create_test_app();
 
@@ -157,6 +172,22 @@ fn test_help_topic_shows_command_details() {
     assert!(msg.content.contains("`/compact`"));
     assert!(msg.content.contains("background"));
     assert!(msg.content.contains("`/compact mode`"));
+}
+
+#[test]
+fn test_help_topic_shows_provider_test_coverage_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help provider-test-coverage".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("`/provider-test-coverage`"));
+    assert!(msg.content.contains("live verification evidence"));
+    assert!(msg.content.contains("readiness gaps"));
 }
 
 #[test]
@@ -495,6 +526,87 @@ fn test_goals_command_opens_overview_in_side_panel() {
 }
 
 #[test]
+fn test_mission_and_goal_commands_are_disabled() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mut app = create_test_app();
+    app.input = "/mission make browser control reliable".to_string();
+    app.submit_input();
+    assert!(!app.is_processing, "/mission must not start a turn");
+    assert!(!app.pending_queued_dispatch, "/mission must not queue dispatch");
+    assert!(app.queued_messages.is_empty(), "/mission must not queue prompts");
+    assert!(
+        crate::mission::load(&app.session.id)
+            .expect("load mission")
+            .is_none(),
+        "/mission must not create a mission"
+    );
+
+    app.input = "/goal status".to_string();
+    app.submit_input();
+    assert!(!app.is_processing, "/goal must not start a turn");
+    assert!(!app.pending_queued_dispatch, "/goal must not queue dispatch");
+    assert!(app.queued_messages.is_empty(), "/goal must not queue prompts");
+    assert!(
+        crate::mission::load(&app.session.id)
+            .expect("load mission")
+            .is_none(),
+        "/goal must not create a mission"
+    );
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_goals_legacy_alias_is_not_captured_by_goal_mission_alias() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("repo");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    crate::env::set_var("JCODE_HOME", temp.path());
+
+    let mut app = create_test_app();
+    app.session.working_dir = Some(project.display().to_string());
+    app.input = "/goals".to_string();
+    app.submit_input();
+
+    assert_eq!(app.side_panel.focused_page_id.as_deref(), Some("goals"));
+    let mission = crate::mission::load(&app.session.id).expect("load mission");
+    assert!(mission.is_none(), "/goals should not create a mission named `s`");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[test]
+fn test_test_command_queues_layered_verification_prompt() {
+    let mut app = create_test_app();
+    app.input = "/test browser control is reliable".to_string();
+    app.submit_input();
+
+    assert!(app.pending_queued_dispatch);
+    let queued = app.queued_messages.last().expect("missing /test prompt");
+    assert!(queued.contains("browser control is reliable"));
+    assert!(queued.contains("Reproduction-first"));
+    assert!(queued.contains("End-to-end/user-flow smoke tests"));
+    assert!(queued.contains("Property-based tests"));
+    assert!(queued.contains("Static analysis"));
+    assert!(queued.contains("fault injection/chaos"));
+    assert!(queued.contains("Final proof packet"));
+}
+
+#[test]
 fn test_btw_command_requires_question() {
     let mut app = create_test_app();
     app.input = "/btw".to_string();
@@ -579,8 +691,7 @@ fn test_git_command_shows_repo_status_for_working_directory() {
 
     let mut app = create_test_app();
     app.session.working_dir = Some(repo.path().display().to_string());
-    app.input = "/git".to_string();
-    app.submit_input();
+    submit_git_command_and_wait_for_response(&mut app);
 
     let msg = app.display_messages().last().expect("missing git response");
     assert_eq!(msg.role, "system");
@@ -599,8 +710,7 @@ fn test_git_command_works_in_remote_mode_with_accessible_working_directory() {
     app.is_remote = true;
     app.remote_session_id = Some("ses_remote_git".to_string());
     app.session.working_dir = Some(repo.path().display().to_string());
-    app.input = "/git".to_string();
-    app.submit_input();
+    submit_git_command_and_wait_for_response(&mut app);
 
     let msg = app.display_messages().last().expect("missing git response");
     assert_eq!(msg.role, "system");
@@ -612,6 +722,41 @@ fn test_git_command_works_in_remote_mode_with_accessible_working_directory() {
         !msg.content
             .contains("currently only available in a local jcode TUI session")
     );
+}
+
+fn submit_git_command_and_wait_for_response(app: &mut App) {
+    let expected_session_id = if app.is_remote {
+        app.remote_session_id
+            .clone()
+            .unwrap_or_else(|| app.session.id.clone())
+    } else {
+        app.session.id.clone()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut bus_rx = crate::bus::Bus::global().subscribe();
+    while bus_rx.try_recv().is_ok() {}
+
+    app.input = "/git".to_string();
+    app.submit_input();
+
+    rt.block_on(async {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv())
+                .await
+                .expect("timed out waiting for git status bus event")
+                .expect("bus should stay open");
+            let saw_completion_for_app = matches!(
+                &event,
+                crate::bus::BusEvent::GitStatusCompleted(completed)
+                    if completed.session_id == expected_session_id
+            );
+            super::local::handle_bus_event(app, Ok(event));
+            if saw_completion_for_app {
+                break;
+            }
+        }
+    });
 }
 
 #[test]

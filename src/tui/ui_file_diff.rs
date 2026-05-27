@@ -491,6 +491,7 @@ pub(super) fn active_file_diff_context(
         file_path: range.file_path.clone(),
         start_line: range.start_line,
         end_line: range.end_line,
+        expandable: range.expandable,
     })
 }
 

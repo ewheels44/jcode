@@ -44,7 +44,7 @@ impl App {
 
             self.status = ProcessingStatus::Sending;
             status_spinner_renderer.draw_full(self, terminal)?;
-            status_spinner_interval.reset();
+            super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
             self.flush_pending_session_save();
 
             let repaired = self.repair_missing_tool_outputs();
@@ -143,26 +143,26 @@ impl App {
                                     }
                                     if !scroll_only {
                                         status_spinner_renderer.draw_full(self, terminal)?;
-                                        status_spinner_interval.reset();
+                                        super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                     }
                                 }
                             }
                             Some(Ok(Event::Paste(text))) => {
                                 self.handle_paste(text);
                                 status_spinner_renderer.draw_full(self, terminal)?;
-                                status_spinner_interval.reset();
+                                super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                             }
                             Some(Ok(Event::Mouse(mouse))) => {
                                 let scroll_only = self.handle_mouse_event(mouse);
                                 if !scroll_only {
                                     status_spinner_renderer.draw_full(self, terminal)?;
-                                    status_spinner_interval.reset();
+                                    super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => {
                                 if self.should_redraw_after_resize() {
                                     status_spinner_renderer.draw_full(self, terminal)?;
-                                    status_spinner_interval.reset();
+                                    super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                 }
                             }
                             _ => {}
@@ -172,12 +172,12 @@ impl App {
                     _ = status_spinner_interval.tick(), if super::run_shell::status_spinner_only_symbol(self).is_some() => {
                         if !status_spinner_renderer.draw_status_spinner_only(self, terminal)? {
                             status_spinner_renderer.draw_full(self, terminal)?;
-                            status_spinner_interval.reset();
+                            super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                         }
                     }
                     _ = redraw_interval.tick() => {
                         status_spinner_renderer.draw_full(self, terminal)?;
-                        status_spinner_interval.reset();
+                        super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                     }
                     bus_event = async {
                         match bus_receiver.as_mut() {
@@ -187,7 +187,7 @@ impl App {
                     } => {
                         if super::local::handle_bus_event(self, bus_event) {
                             status_spinner_renderer.draw_full(self, terminal)?;
-                            status_spinner_interval.reset();
+                            super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                         }
                     }
                     // Poll API call
@@ -205,7 +205,7 @@ impl App {
                                         listener: plan.listener_summary.clone(),
                                     };
                                     status_spinner_renderer.draw_full(self, terminal)?;
-                                    status_spinner_interval.reset();
+                                    super::run_shell::reset_status_spinner_interval(&mut status_spinner_interval, self);
                                     crate::network_retry::wait_until_probably_online().await;
                                     self.push_display_message(DisplayMessage::system(
                                         "Network connectivity looks restored; retrying request.".to_string(),
@@ -236,8 +236,12 @@ impl App {
             // Track tool results from provider (already executed by Claude Code CLI)
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
-            let store_reasoning_content = self.provider.name() == "openrouter";
+            let provider_name = self.provider.name().to_string();
+            let store_reasoning_content =
+                crate::provider::stores_reasoning_content_for_context(&provider_name);
             let mut reasoning_content = String::new();
+            let mut reasoning_signature = String::new();
+            let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
 
             // Stream with input handling
@@ -288,10 +292,14 @@ impl App {
                                                     cache_control: None,
                                                 });
                                             }
-                                            if store_reasoning_content && !reasoning_content.is_empty() {
-                                                content_blocks.push(ContentBlock::Reasoning {
-                                                    text: reasoning_content.clone(),
-                                                });
+                                            if store_reasoning_content {
+                                                crate::message::push_reasoning_content_block(
+                                                    &mut content_blocks,
+                                                    &provider_name,
+                                                    &reasoning_content,
+                                                    Some(&reasoning_signature),
+                                                );
+                                                content_blocks.extend(openai_reasoning_items.iter().cloned());
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
@@ -350,10 +358,14 @@ impl App {
                                                     cache_control: None,
                                                 });
                                             }
-                                            if store_reasoning_content && !reasoning_content.is_empty() {
-                                                content_blocks.push(ContentBlock::Reasoning {
-                                                    text: reasoning_content.clone(),
-                                                });
+                                            if store_reasoning_content {
+                                                crate::message::push_reasoning_content_block(
+                                                    &mut content_blocks,
+                                                    &provider_name,
+                                                    &reasoning_content,
+                                                    Some(&reasoning_signature),
+                                                );
+                                                content_blocks.extend(openai_reasoning_items.iter().cloned());
                                             }
                                             for tc in &tool_calls {
                                                 content_blocks.push(ContentBlock::ToolUse {
@@ -644,6 +656,11 @@ impl App {
                                             status_spinner_renderer.draw_full(self, terminal)?;
                                         }
                                     }
+                                    StreamEvent::ThinkingSignatureDelta(signature) => {
+                                        if store_reasoning_content {
+                                            reasoning_signature.push_str(&signature);
+                                        }
+                                    }
                                     StreamEvent::ThinkingDelta(thinking_text) => {
                                         // Buffer thinking content and emit with prefix only once
                                         self.thinking_buffer.push_str(&thinking_text);
@@ -681,6 +698,21 @@ impl App {
                                         self.insert_thought_line(thinking_msg);
                                         self.thinking_prefix_emitted = false;
                                         self.thinking_buffer.clear();
+                                    }
+                                    StreamEvent::OpenAIReasoning {
+                                        id,
+                                        summary,
+                                        encrypted_content,
+                                        status,
+                                    } => {
+                                        if store_reasoning_content {
+                                            openai_reasoning_items.push(ContentBlock::OpenAIReasoning {
+                                                id,
+                                                summary,
+                                                encrypted_content,
+                                                status,
+                                            });
+                                        }
                                     }
                                     StreamEvent::Compaction {
                                         trigger,
@@ -918,10 +950,14 @@ impl App {
                     cache_control: None,
                 });
             }
-            if store_reasoning_content && !reasoning_content.is_empty() {
-                content_blocks.push(ContentBlock::Reasoning {
-                    text: reasoning_content.clone(),
-                });
+            if store_reasoning_content {
+                crate::message::push_reasoning_content_block(
+                    &mut content_blocks,
+                    &provider_name,
+                    &reasoning_content,
+                    Some(&reasoning_signature),
+                );
+                content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {

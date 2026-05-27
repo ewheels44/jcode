@@ -1,5 +1,6 @@
 use super::*;
 use crate::tool::selfdev::ReloadContext;
+use crate::tui::TuiState;
 use crate::tui::app as app_mod;
 use crate::tui::app::remote::swarm_plan_core::RemoteSwarmPlanSnapshot;
 
@@ -12,6 +13,8 @@ pub(in crate::tui::app) fn handle_server_event(
     if app.is_processing {
         app.last_stream_activity = Some(Instant::now());
     }
+
+    let had_remote_resume_activity = app.remote_resume_activity.is_some();
 
     if matches!(
         &event,
@@ -146,6 +149,11 @@ pub(in crate::tui::app) fn handle_server_event(
             cache_read_input,
             cache_creation_input,
         } => {
+            let previous_input = app.streaming_input_tokens;
+            let previous_output = app.streaming_output_tokens;
+            let previous_cache_read = app.streaming_cache_read_tokens;
+            let previous_cache_creation = app.streaming_cache_creation_tokens;
+            let was_recorded = app.current_api_usage_recorded;
             app.accumulate_streaming_output_tokens(output, call_output_tokens_seen);
             app.streaming_input_tokens = input;
             app.streaming_output_tokens = output;
@@ -154,6 +162,59 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             if cache_creation_input.is_some() {
                 app.streaming_cache_creation_tokens = cache_creation_input;
+            }
+            if app.record_completed_stream_cache_usage() {
+                app.total_input_tokens = app.total_input_tokens.saturating_add(input);
+                app.total_output_tokens = app.total_output_tokens.saturating_add(output);
+                app.last_api_completed = Some(Instant::now());
+                app.last_api_completed_provider = Some(<App as TuiState>::provider_name(app));
+                app.last_api_completed_model = Some(<App as TuiState>::provider_model(app));
+                app.last_turn_input_tokens = (input > 0).then_some(input);
+            } else if was_recorded && app.current_api_usage_recorded {
+                app.total_input_tokens = app
+                    .total_input_tokens
+                    .saturating_add(input.saturating_sub(previous_input));
+                app.total_output_tokens = app
+                    .total_output_tokens
+                    .saturating_add(output.saturating_sub(previous_output));
+
+                let had_cache_telemetry =
+                    previous_cache_read.is_some() || previous_cache_creation.is_some();
+                let has_cache_telemetry = app.streaming_cache_read_tokens.is_some()
+                    || app.streaming_cache_creation_tokens.is_some();
+                if has_cache_telemetry {
+                    let reported_delta = if had_cache_telemetry {
+                        input.saturating_sub(previous_input)
+                    } else {
+                        input
+                    };
+                    app.total_cache_reported_input_tokens = app
+                        .total_cache_reported_input_tokens
+                        .saturating_add(reported_delta);
+                    app.total_cache_read_tokens = app.total_cache_read_tokens.saturating_add(
+                        app.streaming_cache_read_tokens
+                            .unwrap_or(0)
+                            .saturating_sub(previous_cache_read.unwrap_or(0)),
+                    );
+                    app.total_cache_creation_tokens =
+                        app.total_cache_creation_tokens.saturating_add(
+                            app.streaming_cache_creation_tokens
+                                .unwrap_or(0)
+                                .saturating_sub(previous_cache_creation.unwrap_or(0)),
+                        );
+                    app.last_cache_reported_input_tokens = Some(input);
+                    app.last_cache_read_tokens = Some(app.streaming_cache_read_tokens.unwrap_or(0));
+                }
+
+                if let Some(baseline) = app.kv_cache_baseline.as_mut() {
+                    baseline.input_tokens = input;
+                    baseline.completed_at = Instant::now();
+                }
+                app.cache_next_optimal_input_tokens = Some(input);
+                app.last_api_completed = Some(Instant::now());
+                app.last_api_completed_provider = Some(<App as TuiState>::provider_name(app));
+                app.last_api_completed_model = Some(<App as TuiState>::provider_model(app));
+                app.last_turn_input_tokens = (input > 0).then_some(input);
             }
             eager_stream_redraw && matches!(app.status, ProcessingStatus::Streaming)
         }
@@ -302,7 +363,24 @@ pub(in crate::tui::app) fn handle_server_event(
                 "Client received Done id={}, current_message_id={:?}",
                 id, app.current_message_id
             ));
-            if app.current_message_id == Some(id) {
+            let has_resumed_turn_evidence = had_remote_resume_activity
+                || app.stream_message_ended
+                || app.has_streaming_footer_stats()
+                || !app.streaming_text.is_empty()
+                || !app.streaming_tool_calls.is_empty()
+                || matches!(
+                    app.status,
+                    ProcessingStatus::Streaming | ProcessingStatus::RunningTool(_)
+                );
+            let completes_resumed_turn =
+                app.current_message_id.is_none() && app.is_processing && has_resumed_turn_evidence;
+            if app.current_message_id == Some(id) || completes_resumed_turn {
+                if completes_resumed_turn {
+                    crate::logging::info(&format!(
+                        "Treating Done id={} as completion for resumed remote activity",
+                        id
+                    ));
+                }
                 completed_current_message = true;
                 app.clear_pending_remote_retry();
                 if let Some(chunk) = app.stream_buffer.flush() {
@@ -332,6 +410,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.processing_started = None;
                 app.replay_processing_started_ms = None;
                 app.replay_elapsed_override = None;
+                app.remote_resume_activity = None;
                 app.batch_progress = None;
                 app.streaming_tool_calls.clear();
                 app.current_message_id = None;
@@ -558,6 +637,7 @@ pub(in crate::tui::app) fn handle_server_event(
             available_model_routes,
             mcp_servers,
             skills,
+            total_tokens,
             all_sessions,
             client_count,
             is_canary,
@@ -574,6 +654,7 @@ pub(in crate::tui::app) fn handle_server_event(
             service_tier,
             compaction_mode,
             activity,
+            token_usage_totals,
             side_panel,
             ..
         } => {
@@ -602,6 +683,7 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.streaming_output_tokens = 0;
                 app.streaming_cache_read_tokens = None;
                 app.streaming_cache_creation_tokens = None;
+                app.current_api_usage_recorded = false;
                 app.total_cache_reported_input_tokens = 0;
                 app.total_cache_read_tokens = 0;
                 app.total_cache_creation_tokens = 0;
@@ -632,6 +714,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     app.clear_pending_soft_interrupt_tracking();
                 }
                 app.remote_total_tokens = None;
+                app.remote_token_usage_totals = None;
                 app.remote_side_pane_images.clear();
                 app.remote_swarm_members.clear();
                 app.swarm_plan_items.clear();
@@ -670,6 +753,7 @@ pub(in crate::tui::app) fn handle_server_event(
             app.remote_side_pane_images = images;
             app.remote_available_entries = available_models;
             app.remote_model_options = available_model_routes;
+            app.persist_remote_model_catalog_cache();
             app.invalidate_model_picker_cache();
             app.remote_skills = skills;
             app.invalidate_command_candidates_cache();
@@ -678,6 +762,35 @@ pub(in crate::tui::app) fn handle_server_event(
             app.remote_is_canary = is_canary;
             app.remote_server_version = server_version;
             app.remote_server_has_update = server_has_update;
+            let history_total_tokens = total_tokens.or_else(|| {
+                token_usage_totals.map(|totals| (totals.input_tokens, totals.output_tokens))
+            });
+            if session_changed || history_total_tokens.is_some() {
+                app.remote_total_tokens = history_total_tokens;
+            }
+            if session_changed || token_usage_totals.is_some() {
+                app.remote_token_usage_totals = token_usage_totals;
+            }
+            if token_usage_totals.is_some() {
+                app.total_input_tokens = 0;
+                app.total_output_tokens = 0;
+                app.total_cache_reported_input_tokens = 0;
+                app.total_cache_read_tokens = 0;
+                app.total_cache_creation_tokens = 0;
+                app.total_cache_optimal_input_tokens = 0;
+            }
+            if let Some(totals) = token_usage_totals {
+                crate::logging::info(&format!(
+                    "Remote history token totals: session={} messages_with_usage={} input={} output={} cache_reported={} cache_read={} cache_write={}",
+                    session_id,
+                    totals.messages_with_token_usage,
+                    totals.input_tokens,
+                    totals.output_tokens,
+                    totals.cache_reported_input_tokens,
+                    totals.cache_read_input_tokens,
+                    totals.cache_creation_input_tokens
+                ));
+            }
             crate::tui::workspace_client::sync_after_history(&session_id, &app.remote_sessions);
 
             if server_has_update == Some(true) && !app.pending_server_reload {
@@ -815,19 +928,37 @@ pub(in crate::tui::app) fn handle_server_event(
             if let Some(reload_recovery) = reload_recovery
                 && !app.display_messages.is_empty()
             {
+                let continuation_message = reload_recovery.continuation_message;
                 crate::logging::info(&format!(
                     "History payload requested reload recovery continuation: session={} was_interrupted={:?}",
                     session_id, was_interrupted
                 ));
-                if let Some(notice) = reload_recovery.reconnect_notice {
+                if let Some(notice) = reload_recovery.reconnect_notice
+                    && !app.reload_info.iter().any(|existing| existing == &notice)
+                {
                     app.reload_info.push(notice);
                 }
-                app.push_display_message(DisplayMessage::system(
-                    "Reload complete — continuing because a recovery directive was pending."
-                        .to_string(),
-                ));
-                app.hidden_queued_system_messages
-                    .push(reload_recovery.continuation_message);
+                let already_queued = app
+                    .hidden_queued_system_messages
+                    .iter()
+                    .any(|queued| queued == &continuation_message)
+                    || app
+                        .rate_limit_pending_message
+                        .as_ref()
+                        .and_then(|pending| pending.system_reminder.as_ref())
+                        .is_some_and(|queued| queued == &continuation_message);
+                if already_queued {
+                    crate::logging::info(&format!(
+                        "History payload reload recovery continuation already queued/in-flight: session={}",
+                        session_id
+                    ));
+                } else {
+                    app.push_display_message(DisplayMessage::system(
+                        "Reload complete — continuing because a recovery directive was pending."
+                            .to_string(),
+                    ));
+                    app.hidden_queued_system_messages.push(continuation_message);
+                }
             } else if pending_reload_reconnect_status.is_some() {
                 let message = match was_interrupted {
                     Some(false) => {
@@ -1029,6 +1160,7 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             app.remote_available_entries = available_models;
             app.remote_model_options = available_model_routes;
+            app.persist_remote_model_catalog_cache();
             app.invalidate_model_picker_cache();
             if provider_meta_changed {
                 app.update_terminal_title();
@@ -1247,7 +1379,18 @@ pub(in crate::tui::app) fn handle_server_event(
             }
 
             if let Some(scope) = runtime_activity_scope {
-                if scope == "background_activity" {
+                if scope == "catalog_activity"
+                    && let Some(progress) =
+                        crate::message::parse_background_task_progress_notification_markdown(
+                            &message,
+                        )
+                {
+                    let status_notice = progress.summary.clone();
+                    app.upsert_background_task_progress_message(message.clone());
+                    persist_replay_display_message(app, "background_task", None, &message);
+                    app.set_status_notice(status_notice);
+                    return false;
+                } else if scope == "background_activity" {
                     app.push_display_message(DisplayMessage::background_task(message.clone()));
                     persist_replay_display_message(app, "background_task", None, &message);
                 } else {

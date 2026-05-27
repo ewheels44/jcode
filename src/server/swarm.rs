@@ -946,6 +946,9 @@ pub(super) async fn run_swarm_task(
     for blocked in ["subagent", "task", "todo", "todowrite", "todoread"] {
         allowed.remove(blocked);
     }
+    crate::config::config()
+        .tools
+        .apply_to_allowed_set(&mut allowed);
 
     let mut worker = Agent::new_with_session(provider, registry, session, Some(allowed));
     match worker.run_once_capture(prompt).await {

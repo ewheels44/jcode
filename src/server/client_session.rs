@@ -660,6 +660,7 @@ async fn subscribe_should_mark_ready(
 
 pub(super) async fn handle_reload(
     id: u64,
+    client_session_id: &str,
     agent: &Arc<Mutex<Agent>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
@@ -667,12 +668,18 @@ pub(super) async fn handle_reload(
     let request_id = crate::id::new_id("reload");
     mark_remote_reload_started(&request_id);
 
-    let (triggering_session, prefer_selfdev_binary) = {
-        let agent_guard = agent.lock().await;
-        (
+    let (triggering_session, prefer_selfdev_binary) = match agent.try_lock() {
+        Ok(agent_guard) => (
             Some(agent_guard.session_id().to_string()),
             agent_guard.is_canary(),
-        )
+        ),
+        Err(_) => {
+            crate::logging::warn(&format!(
+                "SERVER_RELOAD_AGENT_BUSY request_id={} client_session_id={} fallback_triggering_session={} prefer_selfdev_binary=false",
+                request_id, client_session_id, client_session_id
+            ));
+            (Some(client_session_id.to_string()), false)
+        }
     };
 
     let live_sessions = {

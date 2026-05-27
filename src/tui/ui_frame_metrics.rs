@@ -11,6 +11,14 @@ pub(crate) struct FramePerfStats {
     pub full_prep_hits: usize,
     pub full_prep_oversized_hits: usize,
     pub full_prep_misses: usize,
+    pub full_prep_cache_lookup_ms: f64,
+    pub full_prep_build_ms: f64,
+    pub full_prep_header_ms: f64,
+    pub full_prep_body_ms: f64,
+    pub full_prep_batch_ms: f64,
+    pub full_prep_streaming_ms: f64,
+    pub full_prep_compose_ms: f64,
+    pub full_prep_last_path: String,
     pub full_prep_last_prepared_bytes: usize,
     pub full_prep_last_total_wrapped_lines: usize,
     pub full_prep_last_section_count: usize,
@@ -19,6 +27,10 @@ pub(crate) struct FramePerfStats {
     pub body_oversized_hits: usize,
     pub body_misses: usize,
     pub body_incremental_reuses: usize,
+    pub body_cache_lookup_ms: f64,
+    pub body_build_ms: f64,
+    pub body_incremental_build_ms: f64,
+    pub body_last_path: String,
     pub body_last_incremental_base_messages: Option<usize>,
     pub body_last_prepared_bytes: usize,
     pub body_last_wrapped_lines: usize,
@@ -48,6 +60,20 @@ pub(crate) struct FramePerfStats {
     pub has_file_diff_edits: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct FrameResourceAttribution {
+    pub wall_ms: f64,
+    pub process_cpu_ms: Option<f64>,
+    pub process_cpu_ratio: Option<f64>,
+    pub process_rss_mb: Option<u64>,
+    pub host_load_1m: Option<f64>,
+    pub host_load_per_cpu: Option<f64>,
+    pub host_cpu_count: Option<usize>,
+    pub host_mem_available_mb: Option<u64>,
+    pub host_mem_total_mb: Option<u64>,
+    pub host_pressure: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SlowFrameSample {
     pub timestamp_ms: u64,
@@ -68,7 +94,23 @@ pub(crate) struct SlowFrameSample {
     pub draw_ms: f64,
     pub total_ms: f64,
     pub messages_ms: Option<f64>,
+    pub resources: FrameResourceAttribution,
     pub perf: FramePerfStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameResourceStart {
+    process_cpu_ticks: Option<u64>,
+    ticks_per_second: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FullPrepPhaseMetrics {
+    pub header_ms: f64,
+    pub body_ms: f64,
+    pub batch_ms: f64,
+    pub streaming_ms: f64,
+    pub compose_ms: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -141,6 +183,7 @@ const FLICKER_UI_NOTICE_MAX_AGE_MS: u64 = 30_000;
 static FRAME_PERF_STATS: OnceLock<Mutex<FramePerfStats>> = OnceLock::new();
 static SLOW_FRAME_HISTORY: OnceLock<Mutex<SlowFrameHistory>> = OnceLock::new();
 static FLICKER_FRAME_HISTORY: OnceLock<Mutex<FlickerFrameHistory>> = OnceLock::new();
+static FRAME_RESOURCE_START: OnceLock<Mutex<Option<FrameResourceStart>>> = OnceLock::new();
 
 fn frame_perf_stats() -> &'static Mutex<FramePerfStats> {
     FRAME_PERF_STATS.get_or_init(|| Mutex::new(FramePerfStats::default()))
@@ -152,6 +195,10 @@ fn slow_frame_history() -> &'static Mutex<SlowFrameHistory> {
 
 fn flicker_frame_history() -> &'static Mutex<FlickerFrameHistory> {
     FLICKER_FRAME_HISTORY.get_or_init(|| Mutex::new(FlickerFrameHistory::default()))
+}
+
+fn frame_resource_start() -> &'static Mutex<Option<FrameResourceStart>> {
+    FRAME_RESOURCE_START.get_or_init(|| Mutex::new(None))
 }
 
 fn wall_clock_ms() -> u64 {
@@ -206,6 +253,16 @@ pub(super) fn reset_frame_perf_stats() {
     with_frame_perf_stats_mut(|stats| *stats = FramePerfStats::default());
 }
 
+pub(super) fn begin_frame_resource_sample() {
+    let mut start = frame_resource_start()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *start = Some(FrameResourceStart {
+        process_cpu_ticks: process_cpu_ticks(),
+        ticks_per_second: clock_ticks_per_second(),
+    });
+}
+
 fn frame_perf_stats_snapshot() -> FramePerfStats {
     frame_perf_stats()
         .lock()
@@ -217,12 +274,17 @@ pub(super) fn note_full_prep_request() {
     with_frame_perf_stats_mut(|stats| stats.full_prep_requests += 1);
 }
 
+pub(super) fn note_full_prep_cache_lookup(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| stats.full_prep_cache_lookup_ms += duration_ms(elapsed));
+}
+
 pub(super) fn note_full_prep_cache_hit(kind: CacheEntryKind, prepared: &PreparedChatFrame) {
     with_frame_perf_stats_mut(|stats| {
         stats.full_prep_hits += 1;
         if matches!(kind, CacheEntryKind::Oversized) {
             stats.full_prep_oversized_hits += 1;
         }
+        stats.full_prep_last_path = format!("cache_hit_{}", cache_kind_label(kind));
         stats.full_prep_last_prepared_bytes = estimate_prepared_chat_frame_bytes(prepared);
         stats.full_prep_last_total_wrapped_lines = prepared.total_wrapped_lines();
         stats.full_prep_last_section_count = prepared.sections.len();
@@ -230,19 +292,38 @@ pub(super) fn note_full_prep_cache_hit(kind: CacheEntryKind, prepared: &Prepared
 }
 
 pub(super) fn note_full_prep_cache_miss() {
-    with_frame_perf_stats_mut(|stats| stats.full_prep_misses += 1);
+    with_frame_perf_stats_mut(|stats| {
+        stats.full_prep_misses += 1;
+        stats.full_prep_last_path = "cache_miss".to_string();
+    });
 }
 
-pub(super) fn note_full_prep_built(prepared: &PreparedChatFrame) {
+pub(super) fn note_full_prep_built(prepared: &PreparedChatFrame, elapsed: Duration) {
     with_frame_perf_stats_mut(|stats| {
+        stats.full_prep_build_ms += duration_ms(elapsed);
+        stats.full_prep_last_path = "built".to_string();
         stats.full_prep_last_prepared_bytes = estimate_prepared_chat_frame_bytes(prepared);
         stats.full_prep_last_total_wrapped_lines = prepared.total_wrapped_lines();
         stats.full_prep_last_section_count = prepared.sections.len();
     });
 }
 
+pub(super) fn note_full_prep_phase_metrics(metrics: FullPrepPhaseMetrics) {
+    with_frame_perf_stats_mut(|stats| {
+        stats.full_prep_header_ms += metrics.header_ms;
+        stats.full_prep_body_ms += metrics.body_ms;
+        stats.full_prep_batch_ms += metrics.batch_ms;
+        stats.full_prep_streaming_ms += metrics.streaming_ms;
+        stats.full_prep_compose_ms += metrics.compose_ms;
+    });
+}
+
 pub(super) fn note_body_request() {
     with_frame_perf_stats_mut(|stats| stats.body_requests += 1);
+}
+
+pub(super) fn note_body_cache_lookup(elapsed: Duration) {
+    with_frame_perf_stats_mut(|stats| stats.body_cache_lookup_ms += duration_ms(elapsed));
 }
 
 pub(super) fn note_body_cache_hit(kind: CacheEntryKind, prepared: &PreparedMessages) {
@@ -251,6 +332,7 @@ pub(super) fn note_body_cache_hit(kind: CacheEntryKind, prepared: &PreparedMessa
         if matches!(kind, CacheEntryKind::Oversized) {
             stats.body_oversized_hits += 1;
         }
+        stats.body_last_path = format!("cache_hit_{}", cache_kind_label(kind));
         stats.body_last_prepared_bytes = estimate_prepared_messages_bytes(prepared);
         stats.body_last_wrapped_lines = prepared.wrapped_lines.len();
         stats.body_last_copy_targets = prepared.copy_targets.len();
@@ -259,7 +341,10 @@ pub(super) fn note_body_cache_hit(kind: CacheEntryKind, prepared: &PreparedMessa
 }
 
 pub(super) fn note_body_cache_miss() {
-    with_frame_perf_stats_mut(|stats| stats.body_misses += 1);
+    with_frame_perf_stats_mut(|stats| {
+        stats.body_misses += 1;
+        stats.body_last_path = "cache_miss".to_string();
+    });
 }
 
 pub(super) fn note_body_incremental_reuse(base_messages: usize) {
@@ -269,8 +354,18 @@ pub(super) fn note_body_incremental_reuse(base_messages: usize) {
     });
 }
 
-pub(super) fn note_body_built(prepared: &PreparedMessages) {
+pub(super) fn note_body_built(
+    prepared: &PreparedMessages,
+    elapsed: Duration,
+    build_path: &'static str,
+) {
     with_frame_perf_stats_mut(|stats| {
+        let elapsed_ms = duration_ms(elapsed);
+        stats.body_build_ms += elapsed_ms;
+        if build_path == "incremental" {
+            stats.body_incremental_build_ms += elapsed_ms;
+        }
+        stats.body_last_path = build_path.to_string();
         stats.body_last_prepared_bytes = estimate_prepared_messages_bytes(prepared);
         stats.body_last_wrapped_lines = prepared.wrapped_lines.len();
         stats.body_last_copy_targets = prepared.copy_targets.len();
@@ -434,6 +529,191 @@ fn push_flicker_event(history: &mut FlickerFrameHistory, event: FlickerEvent) {
             ));
         }
     }
+}
+
+fn duration_ms(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1000.0
+}
+
+fn cache_kind_label(kind: CacheEntryKind) -> &'static str {
+    match kind {
+        CacheEntryKind::Regular => "regular",
+        CacheEntryKind::Oversized => "oversized",
+    }
+}
+
+fn frame_resource_attribution(total_elapsed: Duration) -> FrameResourceAttribution {
+    let start = frame_resource_start()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let end_ticks = process_cpu_ticks();
+    let tick_hz = start
+        .and_then(|start| start.ticks_per_second)
+        .or_else(clock_ticks_per_second);
+    let process_cpu_ms = match (
+        start.and_then(|start| start.process_cpu_ticks),
+        end_ticks,
+        tick_hz,
+    ) {
+        (Some(start_ticks), Some(end_ticks), Some(tick_hz)) if tick_hz > 0.0 => {
+            let diff = end_ticks.saturating_sub(start_ticks) as f64;
+            Some((diff / tick_hz) * 1000.0)
+        }
+        _ => None,
+    };
+    let wall_ms = duration_ms(total_elapsed);
+    let process_cpu_ratio = process_cpu_ms.and_then(|cpu_ms| {
+        if wall_ms > 0.0 {
+            Some(cpu_ms / wall_ms)
+        } else {
+            None
+        }
+    });
+    let (host_load_1m, host_cpu_count) = host_load_and_cpu_count();
+    let host_load_per_cpu = match (host_load_1m, host_cpu_count) {
+        (Some(load), Some(cpus)) if cpus > 0 => Some(load / cpus as f64),
+        _ => None,
+    };
+    let (host_mem_available_mb, host_mem_total_mb) = host_memory_mb();
+    let host_pressure =
+        classify_host_pressure(host_load_per_cpu, host_mem_available_mb, host_mem_total_mb);
+
+    FrameResourceAttribution {
+        wall_ms,
+        process_cpu_ms,
+        process_cpu_ratio,
+        process_rss_mb: process_rss_mb(),
+        host_load_1m,
+        host_load_per_cpu,
+        host_cpu_count,
+        host_mem_available_mb,
+        host_mem_total_mb,
+        host_pressure,
+    }
+}
+
+fn classify_host_pressure(
+    load_per_cpu: Option<f64>,
+    mem_available_mb: Option<u64>,
+    mem_total_mb: Option<u64>,
+) -> String {
+    let cpu_pressure = load_per_cpu.is_some_and(|load| load >= 1.25);
+    let memory_pressure = match (mem_available_mb, mem_total_mb) {
+        (Some(available), Some(total)) if total > 0 => {
+            available < 1024 || (available as f64 / total as f64) < 0.08
+        }
+        (Some(available), None) => available < 1024,
+        _ => false,
+    };
+
+    match (cpu_pressure, memory_pressure) {
+        (true, true) => "cpu+memory".to_string(),
+        (true, false) => "cpu".to_string(),
+        (false, true) => "memory".to_string(),
+        (false, false) => {
+            if load_per_cpu.is_none() && mem_available_mb.is_none() {
+                "unknown".to_string()
+            } else {
+                "none".to_string()
+            }
+        }
+    }
+}
+
+fn host_load_and_cpu_count() -> (Option<f64>, Option<usize>) {
+    let load = read_loadavg_1m();
+    let cpus = std::thread::available_parallelism().ok().map(|n| n.get());
+    (load, cpus)
+}
+
+#[cfg(target_os = "linux")]
+fn read_loadavg_1m() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_loadavg_1m() -> Option<f64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn host_memory_mb() -> (Option<u64>, Option<u64>) {
+    let Ok(contents) = std::fs::read_to_string("/proc/meminfo") else {
+        return (None, None);
+    };
+    let mut available_kb = None;
+    let mut total_kb = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            available_kb = parse_meminfo_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = parse_meminfo_kb(rest);
+        }
+        if available_kb.is_some() && total_kb.is_some() {
+            break;
+        }
+    }
+    (
+        available_kb.map(|kb| kb / 1024),
+        total_kb.map(|kb| kb / 1024),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_memory_mb() -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_kb(rest: &str) -> Option<u64> {
+    rest.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_rss_mb() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/self/status").ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")
+            .and_then(parse_meminfo_kb)
+            .map(|kb| kb / 1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_mb() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_ticks() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = contents.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let user_ticks: u64 = fields.get(11)?.parse().ok()?;
+    let system_ticks: u64 = fields.get(12)?.parse().ok()?;
+    Some(user_ticks.saturating_add(system_ticks))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cpu_ticks() -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn clock_ticks_per_second() -> Option<f64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks > 0 { Some(ticks as f64) } else { None }
+}
+
+#[cfg(not(unix))]
+fn clock_ticks_per_second() -> Option<f64> {
+    None
 }
 
 fn maybe_record_flicker_event(history: &mut FlickerFrameHistory, current: &FlickerFrameSample) {
@@ -606,6 +886,7 @@ pub(super) fn finalize_frame_metrics(
             draw_ms: draw_elapsed.as_secs_f64() * 1000.0,
             total_ms,
             messages_ms,
+            resources: frame_resource_attribution(total_elapsed),
             perf,
         });
     }

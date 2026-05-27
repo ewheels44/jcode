@@ -229,6 +229,7 @@ impl Agent {
             "last_connection_type": self.last_connection_type,
             "active_skill": self.active_skill,
             "allowed_tools": self.allowed_tools,
+            "disabled_tools": self.disabled_tools,
             "session": {
                 "id": self.session.id,
                 "is_canary": self.session.is_canary,
@@ -281,6 +282,7 @@ impl Agent {
             "agent": {
                 "memory_enabled": self.memory_enabled,
                 "allowed_tools_count": self.allowed_tools.as_ref().map(|tools| tools.len()),
+                "disabled_tools_count": self.disabled_tools.len(),
                 "tool_call_ids": self.tool_call_ids.len(),
                 "tool_result_ids": self.tool_result_ids.len(),
                 "last_usage": {

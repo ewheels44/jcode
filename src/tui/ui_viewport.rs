@@ -1,6 +1,33 @@
 use super::*;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(target_os = "macos")]
+pub(crate) const COPY_BADGE_ALT_LABEL: &str = "⌥";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const COPY_BADGE_ALT_LABEL: &str = "Alt";
+
+pub(crate) fn copy_badge_alt_label() -> String {
+    let config = crate::config::config();
+    copy_badge_alt_label_from_config(&config.display.copy_badge_alt_label)
+}
+
+fn copy_badge_alt_label_from_config(configured: &str) -> String {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        COPY_BADGE_ALT_LABEL.to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
+pub(crate) fn copy_badge_alt_badge() -> String {
+    format!("[{}]", copy_badge_alt_label())
+}
+
+fn copy_badge_shortcut_width(key_label: &str) -> usize {
+    UnicodeWidthStr::width(format!("{} [⇧] [{key_label}]", copy_badge_alt_badge()).as_str())
+}
+
 fn lower_bound(values: &[usize], target: usize) -> usize {
     values.partition_point(|&v| v < target)
 }
@@ -39,6 +66,10 @@ fn highlight_line_selection(
     };
 
     for span in &line.spans {
+        let mut selected_style = span.style.bg(selection_bg_for(span.style.bg));
+        if let Some(fg) = selection_fg_for(span.style.fg) {
+            selected_style = selected_style.fg(fg);
+        }
         for ch in span.content.chars() {
             let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             let selected = if width == 0 {
@@ -47,13 +78,7 @@ fn highlight_line_selection(
                 col < end_col && col.saturating_add(width) > start_col
             };
 
-            let mut style = span.style;
-            if selected {
-                style = style.bg(selection_bg_for(style.bg));
-                if let Some(fg) = selection_fg_for(style.fg) {
-                    style = style.fg(fg);
-                }
-            }
+            let style = if selected { selected_style } else { span.style };
 
             if current_style == Some(style) {
                 current_text.push(ch);
@@ -116,7 +141,7 @@ pub(crate) fn copy_badge_reserved_width(
     copy_badge_ui: &crate::tui::app::CopyBadgeUiState,
     now: std::time::Instant,
 ) -> usize {
-    let mut reserved = UnicodeWidthStr::width("[Alt] [⇧] [A]");
+    let mut reserved = copy_badge_shortcut_width("A");
     if copy_badge_ui.feedback_for_key(key, now).is_some() {
         // Includes the trailing spacer inserted between feedback and the shortcut badges.
         reserved = reserved.saturating_add(UnicodeWidthStr::width(" ✓ Copied! "));
@@ -348,10 +373,12 @@ pub(super) fn draw_messages(
 
     let mut visible_copy_targets: Vec<VisibleCopyTarget> = Vec::new();
     let mut badge_assignments: Vec<(usize, char)> = Vec::new();
-    for (slot, target) in prepared
+    let first_visible_copy_target = prepared
         .copy_targets
+        .partition_point(|target| target.end_line <= scroll);
+    for (slot, target) in prepared.copy_targets[first_visible_copy_target..]
         .iter()
-        .filter(|target| target.end_line > scroll && target.start_line < visible_end)
+        .take_while(|target| target.start_line < visible_end)
         .take(COPY_BADGE_KEYS.len())
         .enumerate()
     {
@@ -478,17 +505,26 @@ pub(super) fn draw_messages(
         }
     }
 
-    if let Some(active) = &active_inline_edit_context {
+    let expand_edit_badge_visible = active_inline_edit_context.as_ref().is_some_and(|active| {
+        active.expandable
+            && !app.diff_mode().is_full_inline()
+            && active.start_line >= scroll
+            && active.start_line < visible_end
+    });
+    super::set_visible_expand_edit_badge(expand_edit_badge_visible);
+
+    if let Some(active) = &active_inline_edit_context
+        && active.expandable
+        && !app.diff_mode().is_full_inline()
+    {
         let badge_line = active.start_line;
         if badge_line >= scroll && badge_line < visible_end {
             let rel_idx = badge_line - scroll;
             if let Some(line) = visible_lines.get_mut(rel_idx) {
-                let badge_text = if app.diff_mode().is_full_inline() {
-                    " collapse"
-                } else {
-                    " expand"
-                };
-                let reserved = UnicodeWidthStr::width(" [Alt] [⇧] [E] collapse");
+                let badge_text = " expand";
+                let reserved = UnicodeWidthStr::width(
+                    format!(" {} [⇧] [E] expand", copy_badge_alt_badge()).as_str(),
+                );
                 let max_content_width = (content_area.width as usize).saturating_sub(reserved);
                 truncate_line_in_place_to_width(line, max_content_width);
 
@@ -509,7 +545,8 @@ pub(super) fn draw_messages(
                 };
 
                 line.spans.push(Span::raw(" "));
-                line.spans.push(Span::styled("[Alt]", alt_style));
+                line.spans
+                    .push(Span::styled(copy_badge_alt_badge(), alt_style));
                 line.spans.push(Span::raw(" "));
                 line.spans.push(Span::styled("[⇧]", shift_style));
                 line.spans.push(Span::raw(" "));
@@ -561,7 +598,8 @@ pub(super) fn draw_messages(
                 line.spans.push(Span::raw(" "));
             }
 
-            line.spans.push(Span::styled("[Alt]", alt_style));
+            line.spans
+                .push(Span::styled(copy_badge_alt_badge(), alt_style));
             line.spans.push(Span::raw(" "));
             line.spans.push(Span::styled("[⇧]", shift_style));
             line.spans.push(Span::raw(" "));
@@ -873,4 +911,25 @@ fn compute_max_scroll_with_prompt_preview(
     }
 
     max_scroll
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_copy_badge_alt_label_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::copy_badge_alt_label_from_config(""), "⌥");
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(super::copy_badge_alt_label_from_config(""), "Alt");
+    }
+
+    #[test]
+    fn copy_badge_alt_label_uses_trimmed_config_override() {
+        assert_eq!(
+            super::copy_badge_alt_label_from_config(" Option "),
+            "Option"
+        );
+        assert_eq!(super::copy_badge_alt_label_from_config("⌥"), "⌥");
+    }
 }

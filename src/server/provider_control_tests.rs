@@ -199,6 +199,7 @@ async fn notify_auth_changed_emits_available_models_updated_after_provider_updat
         &provider,
         &provider,
         &sessions,
+        session_id.as_str(),
         &agent,
         &client_event_tx,
     )
@@ -290,6 +291,7 @@ async fn notify_auth_changed_defers_busy_session_refresh_until_idle() {
         Arc::clone(&current_provider),
         registry.clone(),
     )));
+    let current_session_id = { current_agent.lock().await.session_id().to_string() };
     let busy_agent = Arc::new(Mutex::new(Agent::new(busy_provider, registry)));
     let busy_guard = busy_agent.lock().await;
     let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::from([(
@@ -305,6 +307,7 @@ async fn notify_auth_changed_defers_busy_session_refresh_until_idle() {
         &current_provider,
         &current_provider,
         &sessions,
+        current_session_id.as_str(),
         &current_agent,
         &client_event_tx,
     )
@@ -366,6 +369,7 @@ async fn notify_auth_changed_with_azure_hint_applies_runtime_model_without_compl
     let provider: Arc<dyn Provider> = provider;
     let registry = Registry::empty();
     let agent = Arc::new(Mutex::new(Agent::new(provider.clone(), registry)));
+    let session_id = { agent.lock().await.session_id().to_string() };
     let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::from([(
         "test-session".to_string(),
         Arc::clone(&agent),
@@ -379,6 +383,7 @@ async fn notify_auth_changed_with_azure_hint_applies_runtime_model_without_compl
         &provider,
         &provider,
         &sessions,
+        session_id.as_str(),
         &agent,
         &client_event_tx,
     )
@@ -532,6 +537,7 @@ async fn notify_auth_changed_typed_cerebras_event_controls_user_visible_catalog_
         &provider,
         &provider,
         &sessions,
+        session_id.as_str(),
         &agent,
         &client_event_tx,
     )
@@ -642,6 +648,7 @@ async fn notify_auth_changed_switches_from_stale_model_to_matching_provider_rout
         &provider,
         &provider,
         &sessions,
+        session_id.as_str(),
         &agent,
         &client_event_tx,
     )
@@ -746,6 +753,7 @@ async fn notify_auth_changed_does_not_override_manual_model_selected_during_refr
         &provider,
         &provider,
         &sessions,
+        session_id.as_str(),
         &agent,
         &client_event_tx,
     )
@@ -888,6 +896,7 @@ async fn auth_model_first_prompt_e2e_state_space_is_bounded_by_selection_source(
             &provider,
             &provider,
             &sessions,
+            session_id.as_str(),
             &agent,
             &client_event_tx,
         )
@@ -1051,6 +1060,7 @@ async fn notify_auth_changed_switches_only_current_session_model() {
         Arc::clone(&current_provider),
         registry.clone(),
     )));
+    let current_session_id = { current_agent.lock().await.session_id().to_string() };
     let peer_agent = Arc::new(Mutex::new(Agent::new(peer_provider, registry)));
     let sessions: SessionAgents = Arc::new(RwLock::new(HashMap::from([
         ("current-session".to_string(), Arc::clone(&current_agent)),
@@ -1073,6 +1083,7 @@ async fn notify_auth_changed_switches_only_current_session_model() {
         &current_provider,
         &current_provider,
         &sessions,
+        current_session_id.as_str(),
         &current_agent,
         &client_event_tx,
     )

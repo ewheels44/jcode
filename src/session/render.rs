@@ -22,6 +22,61 @@ fn is_internal_system_reminder(msg: &super::StoredMessage) -> bool {
         .is_some_and(|text| text.starts_with("<system-reminder>"))
 }
 
+fn stored_message_renders_visible_message(msg: &super::StoredMessage) -> bool {
+    if is_internal_system_reminder(msg) {
+        return false;
+    }
+
+    msg.content.iter().any(|block| match block {
+        ContentBlock::Text { text, .. } => !text.is_empty(),
+        ContentBlock::ToolResult { .. } => true,
+        _ => false,
+    })
+}
+
+fn compacted_history_render_window(
+    messages: &[super::StoredMessage],
+    compacted_count: usize,
+    requested_visible: usize,
+) -> (usize, RenderedCompactedHistoryInfo) {
+    let compacted_count = compacted_count.min(messages.len());
+    let compacted_prefix = &messages[..compacted_count];
+    let total_renderable = compacted_prefix
+        .iter()
+        .filter(|msg| stored_message_renders_visible_message(msg))
+        .count();
+    let visible_renderable = requested_visible.min(total_renderable);
+    let remaining_renderable = total_renderable.saturating_sub(visible_renderable);
+
+    let render_start_idx = if visible_renderable == 0 {
+        compacted_count
+    } else if remaining_renderable == 0 {
+        0
+    } else {
+        let mut seen = 0usize;
+        let mut start_idx = compacted_count;
+        for (idx, msg) in compacted_prefix.iter().enumerate().rev() {
+            if stored_message_renders_visible_message(msg) {
+                seen += 1;
+                if seen >= visible_renderable {
+                    start_idx = idx;
+                    break;
+                }
+            }
+        }
+        start_idx
+    };
+
+    (
+        render_start_idx,
+        RenderedCompactedHistoryInfo {
+            total_messages: total_renderable,
+            visible_messages: visible_renderable,
+            remaining_messages: remaining_renderable,
+        },
+    )
+}
+
 fn image_source_for_message(role: Role, tool: Option<&ToolCall>) -> RenderedImageSource {
     if let Some(tool) = tool {
         return RenderedImageSource::ToolResult {
@@ -145,30 +200,40 @@ pub fn render_messages_and_images_with_compacted_history(
         .as_ref()
         .map(|state| state.compacted_count.min(session.messages.len()))
         .unwrap_or(0);
-    let visible_compacted = compacted_history_visible.min(compacted_count);
-    let render_start_idx = compacted_count.saturating_sub(visible_compacted);
-    let remaining_compacted = render_start_idx;
-    let compacted_info = (compacted_count > 0).then_some(RenderedCompactedHistoryInfo {
-        total_messages: compacted_count,
-        visible_messages: visible_compacted,
-        remaining_messages: remaining_compacted,
-    });
+    let (render_start_idx, compacted_info) = compacted_history_render_window(
+        &session.messages,
+        compacted_count,
+        compacted_history_visible,
+    );
+    let compacted_info = (compacted_count > 0).then_some(compacted_info);
 
     if compacted_count > 0 {
+        let visible_compacted = compacted_info
+            .as_ref()
+            .map(|info| info.visible_messages)
+            .unwrap_or(0);
+        let remaining_compacted = compacted_info
+            .as_ref()
+            .map(|info| info.remaining_messages)
+            .unwrap_or(0);
+        let total_compacted = compacted_info
+            .as_ref()
+            .map(|info| info.total_messages)
+            .unwrap_or(0);
         let content = if remaining_compacted == 0 {
             format!(
                 "Earlier conversation compacted — showing all {} compacted historical messages. Redraw may be slower while this view is open.",
-                compacted_count
+                total_compacted
             )
         } else if visible_compacted == 0 {
             format!(
                 "Earlier conversation compacted — {} historical messages hidden from the UI. Scroll to the top to load older history.",
-                compacted_count
+                remaining_compacted
             )
         } else {
             format!(
                 "Earlier conversation compacted — {} older historical messages hidden. Showing {} of {} compacted messages. Scroll to the top to load more.",
-                remaining_compacted, visible_compacted, compacted_count
+                remaining_compacted, visible_compacted, total_compacted
             )
         };
         rendered.push(RenderedMessage {
@@ -250,7 +315,9 @@ pub fn render_messages_and_images_with_compacted_history(
                         tool_data,
                     });
                 }
-                ContentBlock::Reasoning { .. } => {}
+                ContentBlock::Reasoning { .. }
+                | ContentBlock::AnthropicThinking { .. }
+                | ContentBlock::OpenAIReasoning { .. } => {}
                 ContentBlock::Image { media_type, data } => {
                     images.push(RenderedImage {
                         media_type: media_type.clone(),

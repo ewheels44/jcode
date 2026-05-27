@@ -165,6 +165,7 @@ fn test_handle_server_event_history_clears_connection_type_on_session_change_whe
             mcp_servers: vec![],
             skills: vec![],
             total_tokens: None,
+            token_usage_totals: None,
             all_sessions: vec![],
             client_count: None,
             is_canary: None,
@@ -216,6 +217,7 @@ fn test_handle_server_event_history_preserves_connection_type_for_same_session_w
             mcp_servers: vec![],
             skills: vec![],
             total_tokens: None,
+            token_usage_totals: None,
             all_sessions: vec![],
             client_count: None,
             is_canary: None,
@@ -270,6 +272,7 @@ fn test_handle_server_event_history_session_change_clears_pending_interleaves() 
             mcp_servers: vec![],
             skills: vec![],
             total_tokens: None,
+            token_usage_totals: None,
             all_sessions: vec![],
             client_count: None,
             is_canary: None,
@@ -566,6 +569,8 @@ fn test_handle_server_event_token_usage_uses_per_call_deltas() {
 
     assert_eq!(app.streaming_output_tokens, 30);
     assert_eq!(app.streaming_total_output_tokens, 30);
+    assert_eq!(app.total_input_tokens, 100);
+    assert_eq!(app.total_output_tokens, 30);
 }
 
 #[test]
@@ -830,6 +835,8 @@ fn test_remote_done_auto_pokes_again_when_todos_remain() {
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
             }],
         )
         .expect("save todos");

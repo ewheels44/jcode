@@ -22,6 +22,8 @@ fn test_finish_turn_does_not_duplicate_existing_poke_followup() {
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
             }],
         )
         .expect("save todos");
@@ -438,7 +440,7 @@ fn test_remote_startup_judge_hidden_prompt_dispatches_once_history_is_loaded() {
 }
 
 #[test]
-fn test_new_for_remote_fresh_spawn_skips_local_transcript_restore() {
+fn test_new_for_remote_fresh_spawn_restores_local_transcript() {
     with_temp_jcode_home(|| {
         let session_id = "session_spawn_fresh_skip";
         let mut session = crate::session::Session::create_with_id(
@@ -451,7 +453,7 @@ fn test_new_for_remote_fresh_spawn_skips_local_transcript_restore() {
             id: "msg_spawn_fresh_skip".to_string(),
             role: crate::message::Role::Assistant,
             content: vec![crate::message::ContentBlock::Text {
-                text: "persisted transcript should not be restored locally".to_string(),
+                text: "persisted transcript should be restored locally".to_string(),
                 cache_control: None,
             }],
             display_role: None,
@@ -471,15 +473,16 @@ fn test_new_for_remote_fresh_spawn_skips_local_transcript_restore() {
         assert_eq!(crate::tui::TuiState::provider_model(&app), "gpt-5.4");
         assert!(app.pending_queued_dispatch);
         assert_eq!(app.hidden_queued_system_messages.len(), 1);
-        assert_eq!(app.display_messages().len(), 1);
+        assert_eq!(app.display_messages().len(), 2);
+        assert!(
+            app.display_messages().iter().any(|message| message
+                .content
+                .contains("persisted transcript should be restored locally")),
+            "fresh-spawn resumes should render persisted parent transcript immediately"
+        );
         let startup_banner = app.display_messages().last().expect("startup banner");
         assert_eq!(startup_banner.role, "system");
         assert_eq!(startup_banner.title.as_deref(), Some("Autojudge"));
-        assert!(
-            !startup_banner
-                .content
-                .contains("persisted transcript should not be restored locally")
-        );
     });
 }
 
@@ -772,10 +775,11 @@ fn test_remote_prompt_defers_while_model_switch_is_in_flight() {
         .expect("prompt should be deferred until ModelChanged arrives");
     assert_eq!(queued.raw_input, "hello after model switch");
     assert_eq!(queued.images.len(), 1);
-    assert!(app
-        .display_messages
-        .iter()
-        .all(|message| message.role != "user"));
+    assert!(
+        app.display_messages
+            .iter()
+            .all(|message| message.role != "user")
+    );
 }
 
 #[test]

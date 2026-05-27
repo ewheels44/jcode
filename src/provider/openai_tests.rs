@@ -8,11 +8,10 @@ use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 const BRIGHT_PEARL_WRAPPED_TOOL_CALL_FIXTURE: &str =
     include_str!("../../tests/fixtures/openai/bright_pearl_wrapped_tool_call.txt");
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvVarGuard {
     key: &'static str,
@@ -89,7 +88,7 @@ struct LiveOpenAITestEnv {
 
 impl LiveOpenAITestEnv {
     fn new() -> Result<Option<Self>> {
-        let lock = ENV_LOCK.lock().unwrap();
+        let lock = crate::storage::lock_test_env();
         let Some(source_auth) = real_codex_auth_path() else {
             return Ok(None);
         };

@@ -74,7 +74,7 @@ mod observe;
 mod remote;
 mod remote_notifications;
 mod replay;
-mod run_shell;
+pub(crate) mod run_shell;
 mod runtime_memory;
 mod split_view;
 mod state_ui;
@@ -95,6 +95,8 @@ pub(crate) use self::state_ui_storage::compact_display_messages_for_storage;
 pub(crate) fn extract_input_shell_command(input: &str) -> Option<&str> {
     self::input::extract_input_shell_command(input)
 }
+
+pub(crate) const COMMAND_SUGGESTION_VISIBLE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
 struct PendingRemoteMessage {
@@ -231,6 +233,7 @@ struct ModelPickerCacheSignature {
     provider_name: String,
     current_model: String,
     config_default_model: Option<String>,
+    config_default_provider: Option<String>,
     reasoning_effort: Option<String>,
     available_efforts: Vec<String>,
     simplified_model_picker: bool,
@@ -563,6 +566,7 @@ pub struct App {
     cache_next_optimal_input_tokens: Option<u64>,
     kv_cache_baseline: Option<KvCacheBaseline>,
     pending_kv_cache_request: Option<PendingKvCacheRequest>,
+    current_api_usage_recorded: bool,
     kv_cache_turn_number: Option<usize>,
     kv_cache_turn_call_index: u16,
     kv_cache_miss_samples: Vec<KvCacheMissSample>,
@@ -708,6 +712,8 @@ pub struct App {
     remote_skills: Vec<String>,
     // Total session token usage (from server in remote mode)
     remote_total_tokens: Option<(u64, u64)>,
+    // Detailed persisted token/cache usage totals (from server in remote mode)
+    remote_token_usage_totals: Option<crate::protocol::TokenUsageTotals>,
     // Whether the remote session is canary/self-dev (from server)
     remote_is_canary: Option<bool>,
     // Remote server version (from server)
@@ -833,7 +839,7 @@ pub struct App {
     last_client_focus_session_id: Option<String>,
     // Most recently focused side panel page, used to restore visibility when toggled off.
     last_side_panel_focus_id: Option<String>,
-    // User explicitly hid the side panel with Alt+M. While set, incoming snapshots may update
+    // User explicitly hid the side panel with the side-panel toggle key. While set, incoming snapshots may update
     // pages but must not reopen the panel by restoring focused_page_id.
     side_panel_user_hidden: bool,
     // Pin read images to side pane
@@ -937,6 +943,8 @@ pub struct App {
     // Tab completion state: (base_input, suggestion_index)
     // base_input is the original input before cycling, suggestion_index is current position
     tab_completion_state: Option<(String, usize)>,
+    // Selected row in the visible command suggestion list.
+    command_suggestion_selected: usize,
     // Time when app started (for startup animations)
     app_started: Instant,
     // Optional client runtime memory logger for low-overhead attribution journaling.
@@ -975,6 +983,8 @@ pub struct App {
     /// Scroll offset for changelog overlay (None = not visible)
     changelog_scroll: Option<usize>,
     help_scroll: Option<usize>,
+    model_status_scroll: Option<usize>,
+    model_status_content: String,
     /// Session picker overlay (None = not visible)
     session_picker_overlay: Option<RefCell<super::session_picker::SessionPicker>>,
     session_picker_mode: SessionPickerMode,
@@ -1085,6 +1095,7 @@ impl App {
             self.kv_cache_turn_call_index,
             baseline.as_ref(),
         );
+        self.current_api_usage_recorded = false;
 
         self.pending_kv_cache_request = Some(PendingKvCacheRequest {
             turn_number,
@@ -1125,6 +1136,7 @@ impl App {
             self.kv_cache_turn_call_index,
             baseline.as_ref(),
         );
+        self.current_api_usage_recorded = false;
         self.pending_kv_cache_request = Some(PendingKvCacheRequest {
             turn_number,
             call_index: self.kv_cache_turn_call_index,
@@ -1173,11 +1185,14 @@ impl App {
         )));
     }
 
-    pub(super) fn record_completed_stream_cache_usage(&mut self) {
+    pub(super) fn record_completed_stream_cache_usage(&mut self) -> bool {
         let has_cache_telemetry = self.streaming_cache_read_tokens.is_some()
             || self.streaming_cache_creation_tokens.is_some();
+        if self.current_api_usage_recorded {
+            return false;
+        }
         if self.streaming_input_tokens == 0 {
-            return;
+            return false;
         }
 
         let optimal_input_tokens = self.cache_next_optimal_input_tokens;
@@ -1187,6 +1202,7 @@ impl App {
             .pending_kv_cache_request
             .take()
             .unwrap_or_else(|| self.fallback_pending_kv_cache_request());
+        self.current_api_usage_recorded = true;
 
         self.record_kv_cache_miss_sample(&request);
 
@@ -1199,7 +1215,7 @@ impl App {
                 upstream_provider: request.upstream_provider,
                 signature: request.signature,
             });
-            return;
+            return true;
         }
 
         self.total_cache_reported_input_tokens = self
@@ -1230,6 +1246,7 @@ impl App {
             upstream_provider: request.upstream_provider,
             signature: request.signature,
         });
+        true
     }
 
     fn log_kv_cache_usage_summary(

@@ -25,6 +25,12 @@ impl App {
             "model" => {
                 "`/model`\nOpen model picker.\n\n`/model <name>`\nSwitch model.\n\n`/model <name>@<provider>`\nPin OpenRouter routing (`@auto` clears pin)."
             }
+            "provider-test-coverage"
+            | "provider test coverage"
+            | "model-status"
+            | "model status" => {
+                "`/provider-test-coverage`\nShow jcode live verification evidence for the current provider/model.\n\n`/provider-test-coverage <provider> <model>`\nLook up a specific provider/model pair in the live-test coverage ledger.\n\nThe report shows last-tested time, jcode build, passed/missing checkpoints, readiness gaps, and a caveat that missing evidence is not a provider failure."
+            }
             "refresh-model-list" => {
                 "`/refresh-model-list`\nForce-refresh provider model catalogs, update `/model`, and persist the refreshed cache."
             }
@@ -125,7 +131,7 @@ impl App {
                 "`/split`\nSplit the current session into a new window. Clones the full conversation history so both sessions continue from the same point."
             }
             "resume" | "sessions" => {
-                "`/resume`\nOpen the interactive session picker. Browse and search all sessions, preview conversation history, and open any session in a new terminal window.\n\nPress `Esc` to return to your current session."
+                "`/resume`\nOpen the interactive session picker. Browse and search all sessions, preview conversation history, and resume the highlighted session. By default, `Enter` resumes in the current terminal and `Ctrl+Enter` opens a new terminal; `keybindings.session_picker_enter` can swap those actions.\n\nPress `Esc` to return to your current session."
             }
             "info" => "`/info`\nShow session metadata and token usage.",
             "context" => {

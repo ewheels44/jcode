@@ -35,7 +35,8 @@ mod render;
 use loading::collect_recent_session_stems;
 use loading::{build_messages_preview, build_search_index, crashed_sessions_from_all_sessions};
 pub use loading::{
-    invalidate_session_list_cache, load_servers, load_sessions, load_sessions_grouped,
+    invalidate_session_list_cache, load_cached_sessions_grouped, load_servers, load_sessions,
+    load_sessions_grouped,
 };
 
 const SEARCH_CONTENT_BUDGET_BYTES: usize = 12_000;
@@ -126,6 +127,11 @@ enum SessionRef {
     Orphan(usize),
 }
 
+struct PendingSessionPreviewLoad {
+    session_id: String,
+    receiver: std::sync::mpsc::Receiver<Option<Vec<PreviewMessage>>>,
+}
+
 pub struct SessionPicker {
     /// Flat list of items (headers and sessions)
     items: Vec<PickerItem>,
@@ -169,6 +175,8 @@ pub struct SessionPicker {
     cached_search_refs: Vec<SessionRef>,
     /// Lightweight placeholder shown while the picker list is loading.
     loading_message: Option<String>,
+    pending_preview_load: Option<PendingSessionPreviewLoad>,
+    preview_load_failures: HashSet<String>,
 }
 
 impl SessionPicker {
@@ -206,6 +214,8 @@ impl SessionPicker {
             cached_search_query: String::new(),
             cached_search_refs: Vec::new(),
             loading_message: None,
+            pending_preview_load: None,
+            preview_load_failures: HashSet::new(),
         };
         picker.rebuild_items();
         picker
@@ -239,6 +249,8 @@ impl SessionPicker {
             cached_search_query: String::new(),
             cached_search_refs: Vec::new(),
             loading_message: Some("Loading sessions…".to_string()),
+            pending_preview_load: None,
+            preview_load_failures: HashSet::new(),
         }
     }
 
@@ -305,6 +317,8 @@ impl SessionPicker {
             cached_search_query: String::new(),
             cached_search_refs: Vec::new(),
             loading_message: None,
+            pending_preview_load: None,
+            preview_load_failures: HashSet::new(),
         };
         picker.rebuild_items();
         picker
@@ -405,6 +419,30 @@ impl SessionPicker {
         }
     }
 
+    fn session_ref_for_id(&self, session_id: &str) -> Option<SessionRef> {
+        if !self.all_server_groups.is_empty() {
+            for (group_idx, group) in self.all_server_groups.iter().enumerate() {
+                if let Some(session_idx) = group.sessions.iter().position(|s| s.id == session_id) {
+                    return Some(SessionRef::Group {
+                        group_idx,
+                        session_idx,
+                    });
+                }
+            }
+            if let Some(idx) = self
+                .all_orphan_sessions
+                .iter()
+                .position(|s| s.id == session_id)
+            {
+                return Some(SessionRef::Orphan(idx));
+            }
+        } else if let Some(idx) = self.all_sessions.iter().position(|s| s.id == session_id) {
+            return Some(SessionRef::Flat(idx));
+        }
+
+        None
+    }
+
     fn push_visible_session(&mut self, session_ref: SessionRef) {
         let session_idx = self.visible_sessions.len();
         self.visible_sessions.push(session_ref);
@@ -419,7 +457,90 @@ impl SessionPicker {
             .filter_map(|session_ref| self.session_by_ref(*session_ref))
     }
 
-    fn ensure_selected_preview_loaded(&mut self) {
+    fn load_preview_for_target(
+        resume_target: ResumeTarget,
+        external_path: Option<String>,
+    ) -> Option<Vec<PreviewMessage>> {
+        match resume_target {
+            ResumeTarget::JcodeSession { session_id } => {
+                let Ok(session) = Session::load(&session_id) else {
+                    return None;
+                };
+                Some(build_messages_preview(&session))
+            }
+            ResumeTarget::ClaudeCodeSession { session_id, .. } => external_path
+                .as_deref()
+                .and_then(|path| {
+                    loading::load_claude_code_preview_from_path(std::path::Path::new(path))
+                })
+                .or_else(|| loading::load_claude_code_preview(&session_id)),
+            ResumeTarget::CodexSession { session_id, .. } => external_path
+                .as_deref()
+                .and_then(|path| loading::load_codex_preview_from_path(std::path::Path::new(path)))
+                .or_else(|| loading::load_codex_preview(&session_id)),
+            ResumeTarget::PiSession { session_path } => {
+                loading::load_pi_preview_from_path(std::path::Path::new(&session_path))
+            }
+            ResumeTarget::OpenCodeSession { .. } => external_path.as_deref().and_then(|path| {
+                loading::load_opencode_preview_from_path(std::path::Path::new(path))
+            }),
+        }
+    }
+
+    fn apply_session_preview(&mut self, session_id: &str, preview: Vec<PreviewMessage>) {
+        let Some(session_ref) = self.session_ref_for_id(session_id) else {
+            return;
+        };
+        if let Some(s) = self.session_by_ref_mut(session_ref) {
+            s.search_index = build_search_index(
+                &s.id,
+                &s.short_name,
+                &s.title,
+                s.working_dir.as_deref(),
+                s.save_label.as_deref(),
+                &preview,
+            );
+            s.messages_preview = preview;
+        }
+    }
+
+    fn poll_preview_load(&mut self) -> bool {
+        let recv_result = {
+            let Some(pending) = self.pending_preview_load.as_ref() else {
+                return false;
+            };
+            pending.receiver.try_recv()
+        };
+
+        match recv_result {
+            Ok(Some(preview)) => {
+                let session_id = self
+                    .pending_preview_load
+                    .as_ref()
+                    .map(|pending| pending.session_id.clone())
+                    .unwrap_or_default();
+                self.pending_preview_load = None;
+                self.preview_load_failures.remove(&session_id);
+                self.apply_session_preview(&session_id, preview);
+                true
+            }
+            Ok(None) => {
+                if let Some(pending) = self.pending_preview_load.take() {
+                    self.preview_load_failures.insert(pending.session_id);
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if let Some(pending) = self.pending_preview_load.take() {
+                    self.preview_load_failures.insert(pending.session_id);
+                }
+                true
+            }
+        }
+    }
+
+    fn ensure_selected_preview_loading(&mut self) {
         let Some(session_ref) = self.selected_session_ref() else {
             return;
         };
@@ -431,91 +552,59 @@ impl SessionPicker {
             return;
         }
 
-        let Some((resume_target, session_id, external_path)) =
+        let Some((cache_session_id, resume_target, external_path)) =
             self.session_by_ref(session_ref).map(|s| {
                 (
+                    s.id.clone(),
                     s.resume_target.clone(),
-                    match &s.resume_target {
-                        ResumeTarget::JcodeSession { session_id } => Some(session_id.clone()),
-                        ResumeTarget::ClaudeCodeSession { session_id, .. } => {
-                            Some(session_id.clone())
-                        }
-                        ResumeTarget::CodexSession { session_id, .. } => Some(session_id.clone()),
-                        ResumeTarget::OpenCodeSession { session_id, .. } => {
-                            Some(session_id.clone())
-                        }
-                        _ => None,
-                    },
                     s.external_path.clone(),
                 )
             })
         else {
             return;
         };
-        let Some(session_id) = session_id else {
+
+        if self.preview_load_failures.contains(&cache_session_id)
+            || self
+                .pending_preview_load
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == cache_session_id)
+        {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_session_id = cache_session_id.clone();
+        let _ = std::thread::Builder::new()
+            .name("jcode-session-preview-loader".to_string())
+            .spawn(move || {
+                let preview = Self::load_preview_for_target(resume_target, external_path);
+                let _ = tx.send(preview);
+            });
+        self.pending_preview_load = Some(PendingSessionPreviewLoad {
+            session_id: thread_session_id,
+            receiver: rx,
+        });
+    }
+
+    #[cfg(test)]
+    fn ensure_selected_preview_loaded(&mut self) {
+        let Some(session_ref) = self.selected_session_ref() else {
             return;
         };
-
-        let preview = match resume_target {
-            ResumeTarget::JcodeSession { .. } => {
-                let Ok(session) = Session::load(&session_id) else {
-                    return;
-                };
-                build_messages_preview(&session)
-            }
-            ResumeTarget::ClaudeCodeSession { .. } => {
-                let preview = external_path
-                    .as_deref()
-                    .and_then(|path| {
-                        loading::load_claude_code_preview_from_path(std::path::Path::new(path))
-                    })
-                    .or_else(|| loading::load_claude_code_preview(&session_id));
-                let Some(preview) = preview else {
-                    return;
-                };
-                preview
-            }
-            ResumeTarget::CodexSession { .. } => {
-                let preview = external_path
-                    .as_deref()
-                    .and_then(|path| {
-                        loading::load_codex_preview_from_path(std::path::Path::new(path))
-                    })
-                    .or_else(|| loading::load_codex_preview(&session_id));
-                let Some(preview) = preview else {
-                    return;
-                };
-                preview
-            }
-            ResumeTarget::PiSession { session_path } => {
-                let Some(preview) =
-                    loading::load_pi_preview_from_path(std::path::Path::new(&session_path))
-                else {
-                    return;
-                };
-                preview
-            }
-            ResumeTarget::OpenCodeSession { .. } => {
-                let preview = external_path.as_deref().and_then(|path| {
-                    loading::load_opencode_preview_from_path(std::path::Path::new(path))
-                });
-                let Some(preview) = preview else {
-                    return;
-                };
-                preview
-            }
+        let Some((session_id, resume_target, external_path)) =
+            self.session_by_ref(session_ref).map(|s| {
+                (
+                    s.id.clone(),
+                    s.resume_target.clone(),
+                    s.external_path.clone(),
+                )
+            })
+        else {
+            return;
         };
-
-        if let Some(s) = self.session_by_ref_mut(session_ref) {
-            s.search_index = build_search_index(
-                &s.id,
-                &s.short_name,
-                &s.title,
-                s.working_dir.as_deref(),
-                s.save_label.as_deref(),
-                &preview,
-            );
-            s.messages_preview = preview;
+        if let Some(preview) = Self::load_preview_for_target(resume_target, external_path) {
+            self.apply_session_preview(&session_id, preview);
         }
     }
 
@@ -692,7 +781,8 @@ impl SessionPicker {
             return;
         }
 
-        self.ensure_selected_preview_loaded();
+        let _ = self.poll_preview_load();
+        self.ensure_selected_preview_loading();
 
         let Some(session) = self.selected_session().cloned() else {
             let block = Block::default()
@@ -1029,12 +1119,19 @@ impl SessionPicker {
         }
 
         if rendered_messages == 0 {
+            let preview_loading = session.messages_preview.is_empty()
+                && self
+                    .pending_preview_load
+                    .as_ref()
+                    .is_some_and(|pending| pending.session_id == session.id);
+            let text = if preview_loading {
+                "Loading preview…"
+            } else {
+                "(empty session)"
+            };
             lines.push(
-                Line::from(vec![Span::styled(
-                    "(empty session)",
-                    Style::default().fg(dim_color),
-                )])
-                .alignment(align),
+                Line::from(vec![Span::styled(text, Style::default().fg(dim_color))])
+                    .alignment(align),
             );
         }
 

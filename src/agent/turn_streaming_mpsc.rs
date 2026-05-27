@@ -1,5 +1,38 @@
 use super::*;
 
+fn reload_interrupted_tool_result(tc: &ToolCall, elapsed_secs: f64) -> (String, bool) {
+    if tc.name == "selfdev" {
+        return ("Reload initiated. Process restarting...".to_string(), false);
+    }
+
+    let action = tc
+        .input
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let is_wait_like =
+        (tc.name == "bg" && action == "wait") || (tc.name == "swarm" && action == "await_members");
+
+    if is_wait_like {
+        let input = serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".to_string());
+        return (
+            format!(
+                "[Tool '{}' wait interrupted by server reload after {:.1}s. The underlying operation may still be running. Resume the wait by rerunning the same tool call with input: {}]",
+                tc.name, elapsed_secs, input
+            ),
+            false,
+        );
+    }
+
+    (
+        format!(
+            "[Tool '{}' interrupted by server reload after {:.1}s]",
+            tc.name, elapsed_secs
+        ),
+        true,
+    )
+}
+
 impl Agent {
     pub(super) async fn run_turn_streaming_mpsc(
         &mut self,
@@ -88,11 +121,12 @@ impl Agent {
             // false-positive violations every turn (prior turn's memory ≠ current history prefix).
             self.record_client_cache_request(&messages);
 
-            let cache_signature_messages = if crate::config::config().features.message_timestamps {
-                Message::with_timestamps(&messages)
-            } else {
-                messages.iter().cloned().collect()
-            };
+            let mut cache_signature_messages =
+                if crate::config::config().features.message_timestamps {
+                    Message::with_timestamps(&messages)
+                } else {
+                    messages.iter().cloned().collect()
+                };
             let mut ephemeral_signature_messages = Vec::new();
 
             // Inject memory as a user message at the end (preserves cache prefix)
@@ -113,11 +147,12 @@ impl Agent {
                     prompt_chars: memory.prompt.chars().count(),
                     computed_age_ms,
                 });
-                let memory_msg = Message::user(&format!(
-                    "<system-reminder>\n{}\n</system-reminder>",
-                    memory.prompt
-                ));
-                ephemeral_signature_messages.push(memory_msg.clone());
+                let (memory_msg, persisted) = self.prepare_memory_injection_message(memory);
+                if !persisted {
+                    ephemeral_signature_messages.push(memory_msg.clone());
+                } else {
+                    cache_signature_messages.push(memory_msg.clone());
+                }
                 messages_with_memory.push(memory_msg);
             }
 
@@ -229,8 +264,12 @@ impl Agent {
             let mut stop_reason: Option<String> = None;
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
-            let store_reasoning_content = self.provider.name() == "openrouter";
+            let provider_name = self.provider.name().to_string();
+            let store_reasoning_content =
+                crate::provider::stores_reasoning_content_for_context(&provider_name);
             let mut reasoning_content = String::new();
+            let mut reasoning_signature = String::new();
+            let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
             let mut tool_id_to_name: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
@@ -335,6 +374,11 @@ impl Agent {
 
                 match event {
                     StreamEvent::ThinkingStart | StreamEvent::ThinkingEnd => {}
+                    StreamEvent::ThinkingSignatureDelta(signature) => {
+                        if store_reasoning_content {
+                            reasoning_signature.push_str(&signature);
+                        }
+                    }
                     StreamEvent::ThinkingDelta(thinking_text) => {
                         // Only send thinking content if enabled in config
                         if crate::config::config().display.show_thinking {
@@ -530,6 +574,21 @@ impl Agent {
                         self.provider_session_id = Some(sid.clone());
                         self.session.provider_session_id = Some(sid.clone());
                         let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
+                    }
+                    StreamEvent::OpenAIReasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                        status,
+                    } => {
+                        if store_reasoning_content {
+                            openai_reasoning_items.push(ContentBlock::OpenAIReasoning {
+                                id,
+                                summary,
+                                encrypted_content,
+                                status,
+                            });
+                        }
                     }
                     StreamEvent::Compaction {
                         openai_encrypted_content,
@@ -741,10 +800,14 @@ impl Agent {
                     cache_control: None,
                 });
             }
-            if store_reasoning_content && !reasoning_content.is_empty() {
-                content_blocks.push(ContentBlock::Reasoning {
-                    text: reasoning_content.clone(),
-                });
+            if store_reasoning_content {
+                crate::message::push_reasoning_content_block(
+                    &mut content_blocks,
+                    &provider_name,
+                    &reasoning_content,
+                    Some(&reasoning_signature),
+                );
+                content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
@@ -1078,28 +1141,20 @@ impl Agent {
                     ));
                     tool_handle.abort();
 
-                    // For selfdev reload, the interruption is intentional -
-                    // the tool triggered the reload and blocked waiting for shutdown.
-                    // Use a non-error message so the conversation history is clean.
-                    let is_selfdev_reload = tc.name == "selfdev";
-                    let interrupted_msg = if is_selfdev_reload {
-                        "Reload initiated. Process restarting...".to_string()
-                    } else {
-                        format!(
-                            "[Tool '{}' interrupted by server reload after {:.1}s]",
-                            tc.name,
-                            tool_elapsed.as_secs_f64()
-                        )
-                    };
+                    // For selfdev reload and wait-like tools, the interruption is expected:
+                    // selfdev initiated the restart, while wait-like tools should be resumed
+                    // after reload rather than treated as failed work.
+                    let (interrupted_msg, is_error) =
+                        reload_interrupted_tool_result(tc, tool_elapsed.as_secs_f64());
 
                     let _ = event_tx.send(ServerEvent::ToolDone {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         output: interrupted_msg.clone(),
-                        error: if is_selfdev_reload {
-                            None
-                        } else {
+                        error: if is_error {
                             Some("interrupted by reload".to_string())
+                        } else {
+                            None
                         },
                     });
 
@@ -1108,7 +1163,7 @@ impl Agent {
                         vec![ContentBlock::ToolResult {
                             tool_use_id: tc.id.clone(),
                             content: interrupted_msg,
-                            is_error: Some(!is_selfdev_reload),
+                            is_error: Some(is_error),
                         }],
                         Some(tool_elapsed.as_millis() as u64),
                     );
@@ -1196,5 +1251,44 @@ impl Agent {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(name: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "toolu_test".to_string(),
+            name: name.to_string(),
+            input,
+            intent: None,
+        }
+    }
+
+    #[test]
+    fn reload_interrupted_bg_wait_is_non_error_and_resumable() {
+        let tc = tool_call(
+            "bg",
+            json!({"action": "wait", "task_id": "bg-123", "max_wait_seconds": 300}),
+        );
+
+        let (message, is_error) = reload_interrupted_tool_result(&tc, 1.2);
+
+        assert!(!is_error);
+        assert!(message.contains("Resume the wait"));
+        assert!(message.contains("\"task_id\":\"bg-123\""));
+    }
+
+    #[test]
+    fn reload_interrupted_non_wait_tool_remains_error() {
+        let tc = tool_call("bash", json!({"command": "sleep 10"}));
+
+        let (message, is_error) = reload_interrupted_tool_result(&tc, 1.2);
+
+        assert!(is_error);
+        assert!(message.contains("interrupted by server reload"));
     }
 }

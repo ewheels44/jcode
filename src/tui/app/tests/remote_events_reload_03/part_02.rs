@@ -47,6 +47,7 @@ fn test_metadata_only_history_preserves_fast_restored_startup_state() {
             mcp_servers: vec![],
             skills: vec![],
             total_tokens: None,
+            token_usage_totals: None,
             all_sessions: vec![session_id.to_string()],
             client_count: Some(1),
             is_canary: Some(false),
@@ -122,6 +123,7 @@ fn test_duplicate_history_for_same_session_is_ignored_after_fast_path_restore() 
             mcp_servers: vec![],
             skills: vec![],
             total_tokens: None,
+            token_usage_totals: None,
             all_sessions: vec![],
             client_count: None,
             is_canary: None,
@@ -214,7 +216,9 @@ fn test_local_compacted_history_marker_scroll_expands_from_session() {
         compacted_count: 2,
     });
 
-    let rendered = crate::session::render_messages(&app.session)
+    let (rendered_messages, _images, _compacted_info) =
+        crate::session::render_messages_and_images_with_compacted_history(&app.session, 0);
+    let rendered = rendered_messages
         .into_iter()
         .map(|msg| DisplayMessage {
             role: msg.role,
@@ -226,14 +230,14 @@ fn test_local_compacted_history_marker_scroll_expands_from_session() {
         })
         .collect();
     app.replace_display_messages(rendered);
-    assert_eq!(app.compacted_history_lazy_state().remaining_messages, 2);
+    assert_eq!(app.compacted_history_lazy_state().remaining_messages, 1);
 
     app.auto_scroll_paused = true;
     app.scroll_offset = 0;
     app.scroll_up(1);
 
     assert_eq!(app.take_pending_compacted_history_load(), None);
-    assert_eq!(app.compacted_history_lazy_state().visible_messages, 2);
+    assert_eq!(app.compacted_history_lazy_state().visible_messages, 1);
     assert_eq!(app.compacted_history_lazy_state().remaining_messages, 0);
     assert!(
         app.display_messages()

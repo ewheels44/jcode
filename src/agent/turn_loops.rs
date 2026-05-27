@@ -5,6 +5,7 @@ impl Agent {
     /// Maximum number of context-limit compaction retries before giving up.
     pub(super) const MAX_CONTEXT_LIMIT_RETRIES: u32 = 5;
     pub(super) const MAX_INCOMPLETE_CONTINUATION_ATTEMPTS: u32 = 3;
+    pub(super) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 1;
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
         // VERIFY: This code path is being reached
@@ -14,6 +15,7 @@ impl Agent {
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
+        let mut empty_post_tool_continuations = 0u32;
 
         // AUTO-ENRICH: Call Mimir enrich_task ONCE per user request (not per tool-call round-trip).
         // Computing this inside the loop caused N+1 Python subprocess spawns and 303MB payloads.
@@ -85,9 +87,8 @@ impl Agent {
                     "Memory injected as message ({} chars)",
                     memory.prompt.len()
                 ));
-                let memory_msg =
-                    format!("<system-reminder>\n{}\n</system-reminder>", memory.prompt);
-                messages_with_memory.push(Message::user(&memory_msg));
+                let (memory_msg, _persisted) = self.prepare_memory_injection_message(memory);
+                messages_with_memory.push(memory_msg);
             }
 
             logging::info(&format!(
@@ -111,6 +112,7 @@ impl Agent {
             } else {
                 &messages_with_memory
             };
+            let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
             let mut stream = match self
                 .provider
@@ -175,8 +177,12 @@ impl Agent {
             let mut saw_message_end = false;
             let mut stop_reason: Option<String> = None;
             let mut _thinking_start: Option<Instant> = None;
-            let store_reasoning_content = self.provider.name() == "openrouter";
+            let provider_name = self.provider.name().to_string();
+            let store_reasoning_content =
+                crate::provider::stores_reasoning_content_for_context(&provider_name);
             let mut reasoning_content = String::new();
+            let mut reasoning_signature = String::new();
+            let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             // Track tool results from provider (already executed by Claude Code CLI)
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
@@ -239,6 +245,11 @@ impl Agent {
                         }
                         if store_reasoning_content {
                             reasoning_content.push_str(&thinking_text);
+                        }
+                    }
+                    StreamEvent::ThinkingSignatureDelta(signature) => {
+                        if store_reasoning_content {
+                            reasoning_signature.push_str(&signature);
                         }
                     }
                     StreamEvent::ThinkingEnd => {
@@ -453,6 +464,21 @@ impl Agent {
                         }
                         self.last_upstream_provider = Some(provider);
                     }
+                    StreamEvent::OpenAIReasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                        status,
+                    } => {
+                        if store_reasoning_content {
+                            openai_reasoning_items.push(ContentBlock::OpenAIReasoning {
+                                id,
+                                summary,
+                                encrypted_content,
+                                status,
+                            });
+                        }
+                    }
                     StreamEvent::Compaction {
                         trigger,
                         pre_tokens,
@@ -646,18 +672,27 @@ impl Agent {
 
             self.recover_text_wrapped_tool_call(&mut text_content, &mut tool_calls);
 
-            // Add assistant message to history
+            let visible_text_is_empty = text_content.trim().is_empty();
+
+            // Add assistant message to history. Avoid persisting whitespace-only text as a
+            // successful visible answer: some OpenRouter/Kimi tool continuations can finish
+            // cleanly with only spaces despite non-zero output tokens. Persisting that makes the
+            // UI look like the agent stopped after tools with no explanation.
             let mut content_blocks = Vec::new();
-            if !text_content.is_empty() {
+            if !text_content.is_empty() && !visible_text_is_empty {
                 content_blocks.push(ContentBlock::Text {
                     text: text_content.clone(),
                     cache_control: None,
                 });
             }
-            if store_reasoning_content && !reasoning_content.is_empty() {
-                content_blocks.push(ContentBlock::Reasoning {
-                    text: reasoning_content.clone(),
-                });
+            if store_reasoning_content {
+                crate::message::push_reasoning_content_block(
+                    &mut content_blocks,
+                    &provider_name,
+                    &reasoning_content,
+                    Some(&reasoning_signature),
+                );
+                content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {
@@ -710,6 +745,27 @@ impl Agent {
 
             // If no tool calls, we're done
             if tool_calls.is_empty() {
+                if visible_text_is_empty
+                    && prompt_has_recent_tool_result
+                    && empty_post_tool_continuations
+                        < Self::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS
+                {
+                    empty_post_tool_continuations += 1;
+                    logging::warn(&format!(
+                        "Provider returned whitespace-only final response after tool results; requesting final answer continuation (attempt {}/{})",
+                        empty_post_tool_continuations,
+                        Self::MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS
+                    ));
+                    self.add_message(
+                        Role::User,
+                        vec![ContentBlock::Text {
+                            text: "The previous provider response was empty after tool results. Please provide the final answer to the user's last request using the tool results above. Do not call more tools unless absolutely necessary.".to_string(),
+                            cache_control: None,
+                        }],
+                    );
+                    self.session.save()?;
+                    continue;
+                }
                 if self.maybe_continue_incomplete_response(
                     stop_reason.as_deref(),
                     &mut incomplete_continuations,
@@ -985,5 +1041,83 @@ impl Agent {
         }
 
         Ok(final_text)
+    }
+
+    fn messages_end_with_tool_result(messages: &[Message]) -> bool {
+        messages.iter().rev().any(|message| {
+            if !matches!(message.role, Role::User) {
+                return false;
+            }
+            if message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            {
+                return true;
+            }
+            message.content.iter().any(|block| match block {
+                ContentBlock::Text { text, .. } => text.trim().starts_with("<system-reminder>"),
+                _ => false,
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_text(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: Some(1),
+        }
+    }
+
+    #[test]
+    fn messages_end_with_tool_result_detects_tool_continuation_context() {
+        let messages = vec![
+            user_text("tell me about the desktop application"),
+            tool_result("functions.read:0", "desktop architecture docs"),
+            tool_result("functions.agentgrep:4", "desktop source summary"),
+        ];
+
+        assert!(Agent::messages_end_with_tool_result(&messages));
+    }
+
+    #[test]
+    fn messages_end_with_tool_result_allows_memory_after_tool_results() {
+        let messages = vec![
+            user_text("tell me about the desktop application"),
+            tool_result("functions.read:0", "desktop architecture docs"),
+            user_text("<system-reminder>Relevant memory</system-reminder>"),
+        ];
+
+        assert!(Agent::messages_end_with_tool_result(&messages));
+    }
+
+    #[test]
+    fn messages_end_with_tool_result_ignores_plain_user_prompt() {
+        let messages = vec![user_text("hello")];
+
+        assert!(!Agent::messages_end_with_tool_result(&messages));
     }
 }

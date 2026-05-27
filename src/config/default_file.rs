@@ -56,8 +56,8 @@ workspace_down = "alt+j"
 workspace_up = "alt+k"
 workspace_right = "alt+l"
 
-# /resume picker behavior. Options: "current-terminal" or "new-terminal".
-# Ctrl+Enter performs the alternate action.
+# /resume picker Enter behavior. Options: "current-terminal" or "new-terminal".
+# By default Enter resumes in this terminal; Ctrl+Enter performs the alternate action.
 session_picker_enter = "current-terminal"
 
 [dictation]
@@ -137,6 +137,10 @@ prompt_entry_animation = true
 # Runtime policy may cap this lower on slower environments such as WSL/Windows Terminal.
 # redraw_fps = 60
 
+# Label shown for the Alt/Option modifier in copy badges.
+# Empty = auto ("⌥" on macOS, "Alt" elsewhere). Examples: "Option", "Alt", "⌥".
+# copy_badge_alt_label = ""
+
 [features]
 # Memory: retrieval + extraction sidecar features
 memory = true
@@ -144,6 +148,8 @@ memory = true
 swarm = true
 # Inject timestamps into user messages and tool results sent to the model
 message_timestamps = true
+# Persist memory injections into session history instead of sending them as request-only ephemeral context
+persist_memory_injections = false
 # Update channel: "stable" (releases only) or "main" (latest commits on push)
 # Set to "main" for bleeding edge updates every time code is pushed
 update_channel = "stable"
@@ -160,6 +166,31 @@ fallback_engines = ["bing"]
 # Bing market/region, for example "en-US" or "zh-CN".
 bing_market = "en-US"
 
+[tools]
+# Controls which built-in tools are sent to the model.
+# Profiles: "full" (default), "acp", "minimal"/"lite", or "none".
+# acp keeps core coding tools plus batch for generic ACP clients.
+# minimal keeps core coding tools only: bash, read, write, edit, multiedit,
+# apply_patch, patch, agentgrep, glob, grep, and ls.
+profile = "full"
+# Explicit allow-list. When non-empty, only these tools are exposed.
+# enabled = ["bash", "read", "write", "apply_patch", "agentgrep", "ls"]
+# Privacy-sensitive or stub tools such as gmail and lsp are disabled by default.
+# To expose every tool including default-disabled tools, use: enabled = ["*"]
+# Hide selected tools after applying the profile/allow-list.
+# disabled = ["browser", "gmail", "lsp", "swarm"]
+# Disable all built-in tools unless enabled is set.
+disable_base_tools = false
+
+[acp]
+# Agent Client Protocol adapter compatibility profile: standard, extended, or full.
+# standard emits only spec-compatible ACP messages.
+# extended/full additionally emit ignorable _jcode/* extension notifications.
+profile = "standard"
+# Tool profile requested when `jcode acp` starts the daemon itself.
+# Existing daemons keep their current server-wide tool config.
+tool_profile = "acp"
+
 [provider]
 # Default model (optional, uses provider default if not set)
 # Set via /model picker with Ctrl+D to save as default
@@ -169,12 +200,17 @@ bing_market = "en-US"
 # default_provider = "copilot"
 # OpenAI reasoning effort (none|low|medium|high|xhigh)
 openai_reasoning_effort = "low"
+# Anthropic reasoning effort for Claude reasoning models (none|low|medium|high; xhigh on Opus 4.7; max aliases to the strongest supported level)
+# anthropic_reasoning_effort = "medium"
 # OpenAI transport mode (auto|websocket|https)
 # openai_transport = "auto"
 # OpenAI service tier override (priority|flex)
 # Defaults to `priority` to match Codex /fast behavior for OpenAI OAuth
 # (higher speed, higher usage). Set to "off" to disable.
 openai_service_tier = "priority"
+# Preserve provider-native reasoning/thinking for future-turn context when supported.
+# Applies to OpenRouter, Anthropic, and OpenAI native reasoning replay. Display is separate.
+preserve_reasoning_context = true
 # Cross-provider failover when the same prompt would be resent elsewhere.
 # countdown = 3-second countdown before retrying on another provider; press Esc to cancel (default)
 # manual = show a notice and let you switch yourself

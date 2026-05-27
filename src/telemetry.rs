@@ -672,7 +672,7 @@ fn mark_tool_feature_usage(state: &mut SessionTelemetry, name: &str, input: &Val
                 turn.feature_side_panel_used = true;
             }
         }
-        "goal" => {
+        "initiative" => {
             state.feature_goal_used = true;
             if let Some(turn) = state.current_turn.as_mut() {
                 turn.feature_goal_used = true;

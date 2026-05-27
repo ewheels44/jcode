@@ -38,6 +38,7 @@ fn stored_message_visible_text(message: &crate::session::StoredMessage) -> Strin
                     parts.push(text.trim().to_string());
                 }
             }
+            ContentBlock::AnthropicThinking { .. } | ContentBlock::OpenAIReasoning { .. } => {}
             ContentBlock::ToolUse { name, input, .. } => {
                 parts.push(format!("[tool:{} {}]", name, input));
             }

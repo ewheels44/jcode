@@ -15,6 +15,17 @@ struct DelayedProvider {
 
 struct NativeAutoCompactionProvider;
 
+fn content_text(content: &[ContentBlock]) -> &str {
+    match content.first() {
+        Some(ContentBlock::Text { text, .. }) => text,
+        _ => "",
+    }
+}
+
+fn message_text(message: &Message) -> &str {
+    content_text(&message.content)
+}
+
 #[async_trait]
 impl Provider for DelayedProvider {
     async fn complete(
@@ -462,6 +473,74 @@ async fn new_agent_registers_active_pid_and_clear_swaps_it() {
     );
 }
 
+#[tokio::test]
+async fn default_disabled_tools_are_not_exposed_or_executable() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_tools = std::env::var_os("JCODE_TOOLS");
+    let prev_disabled_tools = std::env::var_os("JCODE_DISABLED_TOOLS");
+    let prev_tool_profile = std::env::var_os("JCODE_TOOL_PROFILE");
+    let prev_disable_base_tools = std::env::var_os("JCODE_DISABLE_BASE_TOOLS");
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+
+    crate::env::set_var("JCODE_HOME", temp_home.path());
+    crate::env::remove_var("JCODE_TOOLS");
+    crate::env::remove_var("JCODE_DISABLED_TOOLS");
+    crate::env::remove_var("JCODE_TOOL_PROFILE");
+    crate::env::remove_var("JCODE_DISABLE_BASE_TOOLS");
+    crate::config::Config::invalidate_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let definitions = agent.tool_definitions().await;
+    let tool_names = agent.tool_names().await;
+
+    for tool_name in ["gmail", "lsp"] {
+        assert!(
+            !definitions
+                .iter()
+                .any(|definition| definition.name == tool_name),
+            "default-disabled {tool_name} tool must not be sent in model-visible tool definitions"
+        );
+        assert!(
+            !tool_names.iter().any(|name| name == tool_name),
+            "default-disabled {tool_name} tool must not be listed as model-visible"
+        );
+        let err = agent.validate_tool_allowed(tool_name).expect_err(&format!(
+            "default-disabled {tool_name} tool must not be executable"
+        ));
+        assert!(err.to_string().contains("disabled"));
+    }
+
+    if let Some(previous) = prev_home {
+        crate::env::set_var("JCODE_HOME", previous);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    if let Some(previous) = prev_tools {
+        crate::env::set_var("JCODE_TOOLS", previous);
+    } else {
+        crate::env::remove_var("JCODE_TOOLS");
+    }
+    if let Some(previous) = prev_disabled_tools {
+        crate::env::set_var("JCODE_DISABLED_TOOLS", previous);
+    } else {
+        crate::env::remove_var("JCODE_DISABLED_TOOLS");
+    }
+    if let Some(previous) = prev_tool_profile {
+        crate::env::set_var("JCODE_TOOL_PROFILE", previous);
+    } else {
+        crate::env::remove_var("JCODE_TOOL_PROFILE");
+    }
+    if let Some(previous) = prev_disable_base_tools {
+        crate::env::set_var("JCODE_DISABLE_BASE_TOOLS", previous);
+    } else {
+        crate::env::remove_var("JCODE_DISABLE_BASE_TOOLS");
+    }
+    crate::config::Config::invalidate_cache();
+}
+
 fn seed_transient_session_state(agent: &mut Agent) {
     agent.push_alert("pending alert".to_string());
     agent.queue_soft_interrupt(
@@ -645,6 +724,77 @@ async fn build_memory_prompt_nonblocking_defers_pending_memory_during_tool_loop(
     assert!(!crate::memory::has_pending_memory(&session_id));
 
     crate::memory::clear_all_pending_memory();
+}
+
+#[tokio::test]
+async fn memory_injection_message_defaults_to_ephemeral_history() {
+    let _guard = crate::storage::lock_test_env();
+    let previous = std::env::var_os("JCODE_PERSIST_MEMORY_INJECTIONS");
+    crate::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", "false");
+    crate::config::invalidate_config_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let before = agent.session.messages.len();
+    let memory = crate::memory::PendingMemory {
+        prompt: "# Memory\n\n## Facts\n1. Use ephemeral mode".to_string(),
+        display_prompt: None,
+        computed_at: Instant::now(),
+        count: 1,
+        memory_ids: vec!["mem-ephemeral".to_string()],
+    };
+
+    let (message, persisted) = agent.prepare_memory_injection_message(&memory);
+
+    assert!(!persisted);
+    assert_eq!(agent.session.messages.len(), before);
+    assert!(matches!(message.role, Role::User));
+    assert!(message_text(&message).contains("Use ephemeral mode"));
+
+    match previous {
+        Some(value) => crate::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", value),
+        None => crate::env::remove_var("JCODE_PERSIST_MEMORY_INJECTIONS"),
+    }
+    crate::config::invalidate_config_cache();
+}
+
+#[tokio::test]
+async fn memory_injection_message_can_persist_to_history() {
+    let _guard = crate::storage::lock_test_env();
+    let previous = std::env::var_os("JCODE_PERSIST_MEMORY_INJECTIONS");
+    crate::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", "true");
+    crate::config::invalidate_config_cache();
+
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let before = agent.session.messages.len();
+    let memory = crate::memory::PendingMemory {
+        prompt: "# Memory\n\n## Facts\n1. Persist for cache".to_string(),
+        display_prompt: None,
+        computed_at: Instant::now(),
+        count: 1,
+        memory_ids: vec!["mem-persisted".to_string()],
+    };
+
+    let (message, persisted) = agent.prepare_memory_injection_message(&memory);
+
+    assert!(persisted);
+    assert_eq!(agent.session.messages.len(), before + 1);
+    assert_eq!(
+        content_text(&agent.session.messages.last().unwrap().content),
+        message_text(&message)
+    );
+    assert!(
+        content_text(&agent.session.messages.last().unwrap().content).contains("Persist for cache")
+    );
+
+    match previous {
+        Some(value) => crate::env::set_var("JCODE_PERSIST_MEMORY_INJECTIONS", value),
+        None => crate::env::remove_var("JCODE_PERSIST_MEMORY_INJECTIONS"),
+    }
+    crate::config::invalidate_config_cache();
 }
 
 #[tokio::test]

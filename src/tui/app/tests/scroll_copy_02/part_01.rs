@@ -109,7 +109,7 @@ fn test_copy_selection_select_all_uses_rendered_chat_text_without_copy_badges() 
     assert!(selected.contains("fn main() {"));
     assert!(selected.contains("println!(\"hello\");"));
     assert!(
-        !selected.contains("[Alt]"),
+        !selected.contains("[Alt]") && !selected.contains("[⌥]"),
         "selection should use chat text, not copy badge chrome: {}",
         selected
     );

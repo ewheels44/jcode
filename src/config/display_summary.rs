@@ -5,6 +5,9 @@ impl Config {
         let path = Self::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        let mut effective_disabled_tools: Vec<String> =
+            self.tools.selection().disabled_tools.into_iter().collect();
+        effective_disabled_tools.sort();
 
         format!(
             r#"**Configuration** (`{}`)
@@ -53,17 +56,26 @@ impl Config {
 - Performance tier: {}
 - Animation FPS: {}
 - Redraw FPS: {}
+- Copy badge Alt label: {}
 
 **Features:**
 - Memory: {}
 - Swarm: {}
 - Message timestamps: {}
+- Persist memory injections: {}
 - Update channel: {}
+
+**Tools:**
+- Profile: {}
+- Enabled allow-list: {}
+- Disabled tools: {}
+- Disable base tools: {}
 
 **Provider:**
 - Default model: {}
 - Default provider: {}
 - OpenAI reasoning effort: {}
+- Anthropic reasoning effort: {}
 - OpenAI transport: {}
 - OpenAI service tier: {}
 - OpenAI native compaction: {}
@@ -160,10 +172,32 @@ impl Config {
             },
             self.display.animation_fps,
             self.display.redraw_fps,
+            if self.display.copy_badge_alt_label.trim().is_empty() {
+                "auto"
+            } else {
+                self.display.copy_badge_alt_label.trim()
+            },
             self.features.memory,
             self.features.swarm,
             self.features.message_timestamps,
+            self.features.persist_memory_injections,
             self.features.update_channel,
+            if self.tools.profile.trim().is_empty() {
+                "full"
+            } else {
+                self.tools.profile.trim()
+            },
+            if self.tools.enabled.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.tools.enabled.join(", ")
+            },
+            if effective_disabled_tools.is_empty() {
+                "(none)".to_string()
+            } else {
+                effective_disabled_tools.join(", ")
+            },
+            self.tools.disable_base_tools,
             self.provider
                 .default_model
                 .as_deref()
@@ -174,6 +208,10 @@ impl Config {
                 .unwrap_or("(auto)"),
             self.provider
                 .openai_reasoning_effort
+                .as_deref()
+                .unwrap_or("(provider default)"),
+            self.provider
+                .anthropic_reasoning_effort
                 .as_deref()
                 .unwrap_or("(provider default)"),
             self.provider

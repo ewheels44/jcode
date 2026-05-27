@@ -98,6 +98,158 @@ fn cold_cache_warning_is_persisted_when_starting_next_request() {
 }
 
 #[test]
+fn remote_token_usage_records_cache_stats_before_done_and_dedupes_snapshots() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.remote_provider_name = Some("OpenAI".to_string());
+    app.remote_provider_model = Some("gpt-5.5".to_string());
+    app.display_messages
+        .push(DisplayMessage::user("live prompt"));
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::KvCacheRequest {
+            system_static_hash: 1,
+            tools_hash: 2,
+            messages_hash: 3,
+            message_hashes: vec![11, 22],
+            message_count: 2,
+            tool_count: 33,
+            system_static_chars: 11155,
+            tools_json_chars: 35228,
+            messages_json_chars: 198612,
+            ephemeral_hash: None,
+            ephemeral_chars: 2,
+            ephemeral_message_count: 0,
+        },
+        &mut remote,
+    );
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 63_762,
+            output: 153,
+            cache_read_input: Some(0),
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.total_cache_reported_input_tokens, 63_762);
+    assert_eq!(app.total_cache_read_tokens, 0);
+    assert_eq!(app.last_cache_reported_input_tokens, Some(63_762));
+    assert_eq!(app.total_input_tokens, 63_762);
+    assert!(app.last_api_completed.is_some());
+    assert!(app.pending_kv_cache_request.is_none());
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TokenUsage {
+            input: 63_762,
+            output: 153,
+            cache_read_input: Some(0),
+            cache_creation_input: None,
+        },
+        &mut remote,
+    );
+
+    assert_eq!(app.total_cache_reported_input_tokens, 63_762);
+    assert_eq!(app.total_input_tokens, 63_762);
+
+    assert!(super::state_ui::handle_info_command(
+        &mut app,
+        "/cache stats"
+    ));
+    let stats = app.display_messages().last().unwrap().content.clone();
+    assert!(
+        stats.contains("- total_cache_reported_input_tokens: **63.8k (63,762)**"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- baseline.signature.messages_json_chars: **198.6k (198,612)**"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- current_api_usage_recorded: **true**"),
+        "{stats}"
+    );
+}
+
+#[test]
+fn cache_stats_uses_remote_history_token_usage_totals() {
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_total_tokens = Some((1_250_000, 200_000));
+    app.remote_token_usage_totals = Some(crate::protocol::TokenUsageTotals {
+        messages_with_token_usage: 3,
+        input_tokens: 1_250_000,
+        output_tokens: 200_000,
+        cache_reported_input_tokens: 1_000_000,
+        cache_read_input_tokens: 600_000,
+        cache_creation_input_tokens: 50_000,
+    });
+
+    assert!(super::state_ui::handle_info_command(
+        &mut app,
+        "/cache stats"
+    ));
+    let stats = app.display_messages().last().unwrap().content.clone();
+    assert!(
+        stats.contains("- total_tokens_source: `remote_history`"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- total_input_tokens: **1.25m (1,250,000)**"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- cache_totals_source: `remote_history`"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- total_cache_reported_input_tokens: **1m (1,000,000)**"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- persisted_token_usage_source: `remote_history`"),
+        "{stats}"
+    );
+    assert!(
+        stats.contains("- messages_with_token_usage: **3**"),
+        "{stats}"
+    );
+}
+
+#[test]
+fn remote_done_finalizes_resumed_activity_without_current_message_id() {
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.is_remote = true;
+    app.is_processing = true;
+    app.status = ProcessingStatus::RunningTool("bg".to_string());
+    app.remote_resume_activity = Some(RemoteResumeActivity {
+        session_id: "session_resume_cache_stats".to_string(),
+        observed_at: Instant::now(),
+        current_tool_name: Some("bg".to_string()),
+    });
+    app.streaming_input_tokens = 63_762;
+    app.streaming_output_tokens = 153;
+    app.streaming_cache_read_tokens = Some(0);
+    app.stream_message_ended = true;
+
+    app.handle_server_event(crate::protocol::ServerEvent::Done { id: 99 }, &mut remote);
+
+    assert!(!app.is_processing);
+    assert!(matches!(app.status, ProcessingStatus::Idle));
+    assert!(app.remote_resume_activity.is_none());
+    assert!(app.last_api_completed.is_some());
+}
+
+#[test]
 fn oversized_pasted_submit_is_rejected_and_preserves_input() {
     let mut app = create_test_app();
     let pasted = format!(

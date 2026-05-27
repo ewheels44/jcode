@@ -153,8 +153,7 @@ fn test_model_picker_bedrock_selection_prefixes_model() {
 fn test_model_picker_bedrock_arn_selection_prefixes_model() {
     let mut app = create_test_app();
     app.is_remote = true;
-    let model =
-        "arn:aws:bedrock:us-east-2:302154194530:inference-profile/us.deepseek.r1-v1:0";
+    let model = "arn:aws:bedrock:us-east-2:302154194530:inference-profile/us.deepseek.r1-v1:0";
     app.remote_available_entries = vec![model.to_string()];
     app.remote_model_options = vec![crate::provider::ModelRoute {
         model: model.to_string(),
@@ -195,8 +194,7 @@ fn test_model_picker_bedrock_arn_selection_prefixes_model() {
 fn test_remote_fallback_bedrock_arn_does_not_create_openrouter_route() {
     let mut app = create_test_app();
     app.is_remote = true;
-    let model =
-        "arn:aws:bedrock:us-east-2:302154194530:inference-profile/us.deepseek.r1-v1:0";
+    let model = "arn:aws:bedrock:us-east-2:302154194530:inference-profile/us.deepseek.r1-v1:0";
     app.remote_available_entries = vec![model.to_string()];
     app.remote_model_options.clear();
 
@@ -205,9 +203,11 @@ fn test_remote_fallback_bedrock_arn_does_not_create_openrouter_route() {
     assert!(routes.iter().any(|route| {
         route.model == model && route.api_method == "bedrock" && route.provider == "AWS Bedrock"
     }));
-    assert!(!routes
-        .iter()
-        .any(|route| route.model == model && route.api_method == "openrouter"));
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.model == model && route.api_method == "openrouter")
+    );
 }
 
 #[test]
@@ -345,6 +345,108 @@ fn test_handle_key_ctrl_backspace_csi_u_char_fallback_deletes_word() {
 
     assert_eq!(app.input(), "hello world ");
     assert_eq!(app.cursor_pos(), "hello world ".len());
+}
+
+#[test]
+fn test_handle_key_super_backspace_deletes_to_start() {
+    let mut app = create_test_app();
+    app.set_input_for_test("hello world again");
+
+    app.handle_key(KeyCode::Left, KeyModifiers::CONTROL)
+        .unwrap();
+    app.handle_key(KeyCode::Backspace, KeyModifiers::SUPER)
+        .unwrap();
+
+    assert_eq!(app.input(), "again");
+    assert_eq!(app.cursor_pos(), 0);
+}
+
+#[test]
+fn test_handle_key_super_delete_aliases_delete_to_start() {
+    for code in [KeyCode::Delete, KeyCode::Char('\u{7f}')] {
+        let mut app = create_test_app();
+        app.set_input_for_test("hello world again");
+
+        app.handle_key(KeyCode::Left, KeyModifiers::CONTROL)
+            .unwrap();
+        app.handle_key(code, KeyModifiers::SUPER).unwrap();
+
+        assert_eq!(app.input(), "again");
+        assert_eq!(app.cursor_pos(), 0);
+    }
+}
+
+#[test]
+fn test_handle_key_alt_delete_aliases_delete_previous_word() {
+    for code in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Char('\u{7f}')] {
+        let mut app = create_test_app();
+        app.set_input_for_test("hello world again");
+
+        app.handle_key(KeyCode::Left, KeyModifiers::CONTROL)
+            .unwrap();
+        app.handle_key(code, KeyModifiers::ALT).unwrap();
+
+        assert_eq!(app.input(), "hello again");
+        assert_eq!(app.cursor_pos(), "hello ".len());
+    }
+}
+
+#[test]
+fn test_remote_super_backspace_deletes_to_start() {
+    let mut app = create_test_app();
+    app.set_input_for_test("hello world again");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+
+    app.handle_key(KeyCode::Left, KeyModifiers::CONTROL)
+        .unwrap();
+    rt.block_on(app.handle_remote_key(KeyCode::Backspace, KeyModifiers::SUPER, &mut remote))
+        .unwrap();
+
+    assert_eq!(app.input(), "again");
+    assert_eq!(app.cursor_pos(), 0);
+}
+
+#[test]
+fn test_handle_key_ctrl_k_deletes_to_end() {
+    let mut app = create_test_app();
+    app.set_input_for_test("hello world again");
+
+    app.handle_key(KeyCode::Left, KeyModifiers::CONTROL)
+        .unwrap();
+    app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    assert_eq!(app.input(), "hello world ");
+    assert_eq!(app.cursor_pos(), "hello world ".len());
+}
+
+#[test]
+fn test_handle_key_super_left_right_move_to_edges() {
+    let mut app = create_test_app();
+    app.set_input_for_test("hello world");
+
+    app.handle_key(KeyCode::Left, KeyModifiers::SUPER).unwrap();
+    assert_eq!(app.cursor_pos(), 0);
+
+    app.handle_key(KeyCode::Right, KeyModifiers::SUPER).unwrap();
+    assert_eq!(app.cursor_pos(), "hello world".len());
+}
+
+#[test]
+fn test_handle_key_super_z_undoes_input_change() {
+    let mut app = create_test_app();
+
+    app.handle_key(KeyCode::Char('a'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('b'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('z'), KeyModifiers::SUPER)
+        .unwrap();
+
+    assert_eq!(app.input(), "a");
+    assert_eq!(app.cursor_pos(), 1);
 }
 
 #[test]
@@ -635,6 +737,8 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
             }],
         )
         .expect("save todos");
@@ -674,7 +778,6 @@ fn test_shift_enter_inserts_newline() {
     assert_eq!(app.queued_count(), 0);
     assert_eq!(app.interleave_message.as_deref(), None);
 }
-
 
 #[test]
 fn test_alt_enter_inserts_newline() {
@@ -769,6 +872,8 @@ fn test_escape_interrupt_disables_auto_poke_while_processing() {
                 priority: "high".to_string(),
                 blocked_by: Vec::new(),
                 assigned_to: None,
+                confidence: None,
+                completion_confidence: None,
             },
         ]));
 
@@ -855,7 +960,7 @@ fn test_ctrl_a_keeps_home_behavior_when_input_present() {
 }
 
 #[test]
-fn test_ctrl_up_edits_queued_message() {
+fn test_retrieve_pending_message_edits_queued_message() {
     let mut app = create_test_app();
     app.queue_mode = true;
     app.is_processing = true;
@@ -877,7 +982,6 @@ fn test_ctrl_up_edits_queued_message() {
     assert_eq!(app.queued_count(), 1);
     assert!(app.input().is_empty());
 
-    // Press Ctrl+Up to bring it back for editing
     app.handle_key(KeyCode::Up, KeyModifiers::CONTROL).unwrap();
 
     assert_eq!(app.queued_count(), 0);
@@ -886,7 +990,7 @@ fn test_ctrl_up_edits_queued_message() {
 }
 
 #[test]
-fn test_ctrl_up_prefers_pending_interleave_for_editing() {
+fn test_retrieve_pending_message_prefers_pending_interleave_for_editing() {
     let mut app = create_test_app();
     app.is_processing = true;
     app.queue_mode = false; // Enter=interleave, Ctrl+Enter=queue
@@ -908,7 +1012,7 @@ fn test_ctrl_up_prefers_pending_interleave_for_editing() {
     assert_eq!(app.interleave_message.as_deref(), Some("urgent"));
     assert_eq!(app.queued_count(), 1);
 
-    app.handle_key(KeyCode::Up, KeyModifiers::CONTROL).unwrap();
+    app.retrieve_pending_message_for_edit();
 
     assert_eq!(app.input(), "urgent\n\nlater");
     assert_eq!(app.interleave_message.as_deref(), None);

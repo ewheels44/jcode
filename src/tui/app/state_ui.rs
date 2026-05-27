@@ -797,16 +797,71 @@ fn cache_ratio_pct(numerator: u64, denominator: u64) -> u8 {
     if denominator == 0 {
         0
     } else {
-        ((numerator as f32 / denominator as f32) * 100.0)
+        ((numerator as f64 / denominator as f64) * 100.0)
             .round()
             .clamp(0.0, 100.0) as u8
     }
 }
 
-fn opt_u64(value: Option<u64>) -> String {
+fn grouped_u64(value: u64) -> String {
+    let raw = value.to_string();
+    let mut grouped = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, ch) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn trim_decimal_zeros(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
     value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "None".to_string())
+}
+
+fn compact_count(value: u64) -> String {
+    let Some((unit, suffix)) = [(1_000_000_000_u64, "b"), (1_000_000, "m"), (1_000, "k")]
+        .into_iter()
+        .find(|(unit, _)| value >= *unit)
+    else {
+        return value.to_string();
+    };
+
+    let scaled = value as f64 / unit as f64;
+    let decimals = if scaled >= 10.0 { 1 } else { 2 };
+    format!(
+        "{}{}",
+        trim_decimal_zeros(format!("{scaled:.decimals$}")),
+        suffix
+    )
+}
+
+fn human_count(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else {
+        format!("{} ({})", compact_count(value), grouped_u64(value))
+    }
+}
+
+fn bold_count(value: u64) -> String {
+    format!("**{}**", human_count(value))
+}
+
+fn bold_count_usize(value: usize) -> String {
+    bold_count(value as u64)
+}
+
+fn opt_u64(value: Option<u64>) -> String {
+    value.map(human_count).unwrap_or_else(|| "None".to_string())
 }
 
 fn opt_usize(value: Option<usize>) -> String {
@@ -853,16 +908,19 @@ fn push_cache_signature(
             label, signature.tool_count
         ));
         lines.push(format!(
-            "- {}.system_static_chars: **{}**",
-            label, signature.system_static_chars
+            "- {}.system_static_chars: {}",
+            label,
+            bold_count(signature.system_static_chars as u64)
         ));
         lines.push(format!(
-            "- {}.tools_json_chars: **{}**",
-            label, signature.tools_json_chars
+            "- {}.tools_json_chars: {}",
+            label,
+            bold_count(signature.tools_json_chars as u64)
         ));
         lines.push(format!(
-            "- {}.messages_json_chars: **{}**",
-            label, signature.messages_json_chars
+            "- {}.messages_json_chars: {}",
+            label,
+            bold_count(signature.messages_json_chars as u64)
         ));
         lines.push(format!(
             "- {}.ephemeral_hash: {}",
@@ -873,8 +931,9 @@ fn push_cache_signature(
                 .unwrap_or_else(|| "None".to_string())
         ));
         lines.push(format!(
-            "- {}.ephemeral_chars: **{}**",
-            label, signature.ephemeral_chars
+            "- {}.ephemeral_chars: {}",
+            label,
+            bold_count(signature.ephemeral_chars as u64)
         ));
         lines.push(format!(
             "- {}.ephemeral_message_count: **{}**",
@@ -888,8 +947,9 @@ fn push_cache_signature(
 fn push_cache_baseline(lines: &mut Vec<String>, label: &str, baseline: Option<&KvCacheBaseline>) {
     if let Some(baseline) = baseline {
         lines.push(format!(
-            "- {}.input_tokens: **{}**",
-            label, baseline.input_tokens
+            "- {}.input_tokens: {}",
+            label,
+            bold_count(baseline.input_tokens)
         ));
         lines.push(format!(
             "- {}.age_secs: **{}**",
@@ -914,13 +974,54 @@ fn push_cache_baseline(lines: &mut Vec<String>, label: &str, baseline: Option<&K
 }
 
 fn format_cache_stats(app: &App) -> String {
-    let reported = app.total_cache_reported_input_tokens;
-    let read = app.total_cache_read_tokens;
-    let write = app.total_cache_creation_tokens;
+    let remote_usage = app.remote_token_usage_totals;
+    let remote_cache_reported = remote_usage
+        .map(|usage| usage.cache_reported_input_tokens)
+        .unwrap_or(0);
+    let remote_cache_read = remote_usage
+        .map(|usage| usage.cache_read_input_tokens)
+        .unwrap_or(0);
+    let remote_cache_write = remote_usage
+        .map(|usage| usage.cache_creation_input_tokens)
+        .unwrap_or(0);
+    let reported = remote_cache_reported.saturating_add(app.total_cache_reported_input_tokens);
+    let read = remote_cache_read.saturating_add(app.total_cache_read_tokens);
+    let write = remote_cache_write.saturating_add(app.total_cache_creation_tokens);
     let optimal = app.total_cache_optimal_input_tokens;
     let read_pct = cache_ratio_pct(read, reported);
     let write_pct = cache_ratio_pct(write, reported);
     let optimal_pct = (optimal > 0).then(|| cache_ratio_pct(read, optimal));
+    let cache_totals_source = match (
+        remote_usage.is_some(),
+        app.total_cache_reported_input_tokens > 0,
+    ) {
+        (true, true) => "remote_history+client_observed_api_calls",
+        (true, false) => "remote_history",
+        (false, true) => "client_observed_api_calls",
+        (false, false) => "none_yet",
+    };
+    let live_cache_telemetry = app.streaming_input_tokens > 0
+        && !app.current_api_usage_recorded
+        && (app.streaming_cache_read_tokens.is_some()
+            || app.streaming_cache_creation_tokens.is_some());
+    let live_reported = if live_cache_telemetry {
+        app.streaming_input_tokens
+    } else {
+        0
+    };
+    let reported_including_live = reported.saturating_add(live_reported);
+    let read_including_live = read.saturating_add(if live_cache_telemetry {
+        app.streaming_cache_read_tokens.unwrap_or(0)
+    } else {
+        0
+    });
+    let write_including_live = write.saturating_add(if live_cache_telemetry {
+        app.streaming_cache_creation_tokens.unwrap_or(0)
+    } else {
+        0
+    });
+    let read_pct_including_live = cache_ratio_pct(read_including_live, reported_including_live);
+    let write_pct_including_live = cache_ratio_pct(write_including_live, reported_including_live);
     let ttl = if crate::provider::anthropic::is_cache_ttl_1h() {
         "1 hour"
     } else {
@@ -941,22 +1042,108 @@ fn format_cache_stats(app: &App) -> String {
         app.provider.model()
     };
 
-    let persisted_usage = app
+    let local_persisted_usage = app
         .session
         .messages
         .iter()
         .filter_map(|message| message.token_usage.as_ref())
-        .fold((0_u64, 0_u64, 0_u64, 0_u64, 0_usize), |acc, usage| {
+        .fold(
+            (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_usize),
+            |acc, usage| {
+                (
+                    acc.0.saturating_add(usage.input_tokens),
+                    acc.1.saturating_add(usage.output_tokens),
+                    acc.2.saturating_add(
+                        if usage.cache_read_input_tokens.is_some()
+                            || usage.cache_creation_input_tokens.is_some()
+                        {
+                            usage.input_tokens
+                        } else {
+                            0
+                        },
+                    ),
+                    acc.3
+                        .saturating_add(usage.cache_read_input_tokens.unwrap_or(0)),
+                    acc.4
+                        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
+                    acc.5.saturating_add(1),
+                )
+            },
+        );
+
+    let (
+        persisted_source,
+        persisted_messages_len,
+        persisted_messages_with_usage,
+        persisted_input_tokens,
+        persisted_output_tokens,
+        persisted_cache_reported_input_tokens,
+        persisted_cache_read_input_tokens,
+        persisted_cache_creation_input_tokens,
+    ) = if let Some(usage) = remote_usage {
+        (
+            "remote_history",
+            None,
+            usage.messages_with_token_usage,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_reported_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+        )
+    } else {
+        (
+            "local_client_session",
+            Some(app.session.messages.len()),
+            local_persisted_usage.5,
+            local_persisted_usage.0,
+            local_persisted_usage.1,
+            local_persisted_usage.2,
+            local_persisted_usage.3,
+            local_persisted_usage.4,
+        )
+    };
+
+    let remote_history_tokens = app
+        .remote_total_tokens
+        .or_else(|| remote_usage.map(|usage| (usage.input_tokens, usage.output_tokens)));
+    let (history_input_tokens, history_output_tokens, totals_source) = if app.is_remote {
+        if let Some((input, output)) = remote_history_tokens {
             (
-                acc.0.saturating_add(usage.input_tokens),
-                acc.1.saturating_add(usage.output_tokens),
-                acc.2
-                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0)),
-                acc.3
-                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
-                acc.4.saturating_add(1),
+                input.saturating_add(app.total_input_tokens),
+                output.saturating_add(app.total_output_tokens),
+                if app.total_input_tokens > 0 || app.total_output_tokens > 0 {
+                    "remote_history+client_observed_api_calls"
+                } else {
+                    "remote_history"
+                },
             )
-        });
+        } else {
+            (
+                app.total_input_tokens,
+                app.total_output_tokens,
+                "client_observed_api_calls",
+            )
+        }
+    } else {
+        (
+            app.total_input_tokens,
+            app.total_output_tokens,
+            "local_completed_turns",
+        )
+    };
+    let live_unrecorded_input_tokens =
+        if app.streaming_input_tokens > 0 && !app.current_api_usage_recorded {
+            app.streaming_input_tokens
+        } else {
+            0
+        };
+    let live_unrecorded_output_tokens =
+        if app.streaming_output_tokens > 0 && !app.current_api_usage_recorded {
+            app.streaming_output_tokens
+        } else {
+            0
+        };
 
     let mut lines = Vec::new();
     lines.push("**KV cache stats**".to_string());
@@ -984,14 +1171,31 @@ fn format_cache_stats(app: &App) -> String {
     ));
     lines.push(String::new());
 
-    lines.push("**Session token totals (raw counters)**".to_string());
+    lines.push("**Session token totals**".to_string());
+    lines.push(format!("- total_tokens_source: `{}`", totals_source));
     lines.push(format!(
-        "- total_input_tokens: **{}**",
-        app.total_input_tokens
+        "- total_input_tokens: {}",
+        bold_count(history_input_tokens)
     ));
     lines.push(format!(
-        "- total_output_tokens: **{}**",
-        app.total_output_tokens
+        "- total_output_tokens: {}",
+        bold_count(history_output_tokens)
+    ));
+    lines.push(format!(
+        "- total_input_tokens_including_unrecorded_live: {}",
+        bold_count(history_input_tokens.saturating_add(live_unrecorded_input_tokens))
+    ));
+    lines.push(format!(
+        "- total_output_tokens_including_unrecorded_live: {}",
+        bold_count(history_output_tokens.saturating_add(live_unrecorded_output_tokens))
+    ));
+    lines.push(format!(
+        "- client_observed_completed_input_tokens: {}",
+        bold_count(app.total_input_tokens)
+    ));
+    lines.push(format!(
+        "- client_observed_completed_output_tokens: {}",
+        bold_count(app.total_output_tokens)
     ));
     lines.push(format!("- total_cost_usd: **{:.6}**", app.total_cost));
     lines.push(format!(
@@ -1006,7 +1210,10 @@ fn format_cache_stats(app: &App) -> String {
             .map(|price| format!("{:.6}", price))
             .unwrap_or_else(|| "None".to_string())
     ));
-    lines.push(format!("- context_limit: **{}**", app.context_limit));
+    lines.push(format!(
+        "- context_limit: {}",
+        bold_count(app.context_limit)
+    ));
     lines.push(format!(
         "- last_turn_input_tokens: {}",
         opt_u64(app.last_turn_input_tokens)
@@ -1028,15 +1235,19 @@ fn format_cache_stats(app: &App) -> String {
     lines.push(String::new());
 
     lines.push("**Provider cache telemetry totals**".to_string());
+    lines.push(format!("- cache_totals_source: `{}`", cache_totals_source));
     lines.push(format!(
-        "- total_cache_reported_input_tokens: **{}**",
-        reported
+        "- total_cache_reported_input_tokens: {}",
+        bold_count(reported)
     ));
-    lines.push(format!("- total_cache_read_tokens: **{}**", read));
-    lines.push(format!("- total_cache_creation_tokens: **{}**", write));
+    lines.push(format!("- total_cache_read_tokens: {}", bold_count(read)));
     lines.push(format!(
-        "- total_cache_optimal_input_tokens: **{}**",
-        optimal
+        "- total_cache_creation_tokens: {}",
+        bold_count(write)
+    ));
+    lines.push(format!(
+        "- total_cache_optimal_input_tokens: {}",
+        bold_count(optimal)
     ));
     lines.push(format!(
         "- cache_read_pct_of_reported_input: **{}%**",
@@ -1045,6 +1256,26 @@ fn format_cache_stats(app: &App) -> String {
     lines.push(format!(
         "- cache_write_pct_of_reported_input: **{}%**",
         write_pct
+    ));
+    lines.push(format!(
+        "- total_cache_reported_input_tokens_including_unrecorded_live: {}",
+        bold_count(reported_including_live)
+    ));
+    lines.push(format!(
+        "- total_cache_read_tokens_including_unrecorded_live: {}",
+        bold_count(read_including_live)
+    ));
+    lines.push(format!(
+        "- total_cache_creation_tokens_including_unrecorded_live: {}",
+        bold_count(write_including_live)
+    ));
+    lines.push(format!(
+        "- cache_read_pct_of_reported_input_including_unrecorded_live: **{}%**",
+        read_pct_including_live
+    ));
+    lines.push(format!(
+        "- cache_write_pct_of_reported_input_including_unrecorded_live: **{}%**",
+        write_pct_including_live
     ));
     lines.push(format!(
         "- cache_read_pct_of_optimal_input: {}",
@@ -1072,16 +1303,16 @@ fn format_cache_stats(app: &App) -> String {
 
     lines.push("**Current / live stream counters**".to_string());
     lines.push(format!(
-        "- streaming_input_tokens: **{}**",
-        app.streaming_input_tokens
+        "- streaming_input_tokens: {}",
+        bold_count(app.streaming_input_tokens)
     ));
     lines.push(format!(
-        "- streaming_output_tokens: **{}**",
-        app.streaming_output_tokens
+        "- streaming_output_tokens: {}",
+        bold_count(app.streaming_output_tokens)
     ));
     lines.push(format!(
-        "- streaming_total_output_tokens: **{}**",
-        app.streaming_total_output_tokens
+        "- streaming_total_output_tokens: {}",
+        bold_count(app.streaming_total_output_tokens)
     ));
     lines.push(format!(
         "- streaming_cache_read_tokens: {}",
@@ -1090,6 +1321,10 @@ fn format_cache_stats(app: &App) -> String {
     lines.push(format!(
         "- streaming_cache_creation_tokens: {}",
         opt_u64(app.streaming_cache_creation_tokens)
+    ));
+    lines.push(format!(
+        "- current_api_usage_recorded: **{}**",
+        app.current_api_usage_recorded
     ));
     lines.push(format!("- status: `{:?}`", app.status));
     lines.push(format!("- is_processing: **{}**", app.is_processing));
@@ -1169,28 +1404,42 @@ fn format_cache_stats(app: &App) -> String {
 
     lines.push("**Persisted transcript token usage**".to_string());
     lines.push(format!(
-        "- session.messages_len: **{}**",
-        app.session.messages.len()
+        "- persisted_token_usage_source: `{}`",
+        persisted_source
+    ));
+    lines.push(format!(
+        "- local_client_session.messages_len: {}",
+        bold_count_usize(app.session.messages.len())
+    ));
+    lines.push(format!(
+        "- persisted_messages_len: {}",
+        persisted_messages_len
+            .map(bold_count_usize)
+            .unwrap_or_else(|| "None".to_string())
     ));
     lines.push(format!(
         "- messages_with_token_usage: **{}**",
-        persisted_usage.4
+        persisted_messages_with_usage
     ));
     lines.push(format!(
-        "- persisted_input_tokens: **{}**",
-        persisted_usage.0
+        "- persisted_input_tokens: {}",
+        bold_count(persisted_input_tokens)
     ));
     lines.push(format!(
-        "- persisted_output_tokens: **{}**",
-        persisted_usage.1
+        "- persisted_output_tokens: {}",
+        bold_count(persisted_output_tokens)
     ));
     lines.push(format!(
-        "- persisted_cache_read_input_tokens: **{}**",
-        persisted_usage.2
+        "- persisted_cache_reported_input_tokens: {}",
+        bold_count(persisted_cache_reported_input_tokens)
     ));
     lines.push(format!(
-        "- persisted_cache_creation_input_tokens: **{}**",
-        persisted_usage.3
+        "- persisted_cache_read_input_tokens: {}",
+        bold_count(persisted_cache_read_input_tokens)
+    ));
+    lines.push(format!(
+        "- persisted_cache_creation_input_tokens: {}",
+        bold_count(persisted_cache_creation_input_tokens)
     ));
     lines.push(String::new());
 
@@ -1203,7 +1452,7 @@ fn format_cache_stats(app: &App) -> String {
                 "- turn={} call={} missed_tokens={} reason=`{}`",
                 sample.turn_number,
                 sample.call_index,
-                sample.missed_tokens,
+                human_count(sample.missed_tokens),
                 sample.reason.label()
             ));
         }
@@ -1470,9 +1719,17 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             todo_lines.push_str("- none\n");
         } else {
             for todo in todos.iter().take(8) {
+                let (confidence_label, confidence) = if todo.status == "completed" {
+                    ("done", todo.completion_confidence.or(todo.confidence))
+                } else {
+                    ("confidence", todo.confidence)
+                };
+                let confidence = confidence
+                    .map(|score| format!("{}%", score))
+                    .unwrap_or_else(|| "?".to_string());
                 todo_lines.push_str(&format!(
-                    "- [{}|{}] {}\n",
-                    todo.status, todo.priority, todo.content
+                    "- [{}|{}|{} {}] {}\n",
+                    todo.status, todo.priority, confidence_label, confidence, todo.content
                 ));
             }
             if todos.len() > 8 {
@@ -1546,7 +1803,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             context.tool_definition_tokens(),
         ));
         context_report.push_str(&format!(
-            "- system prompt: {} chars\n- session context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/.AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
+            "- system prompt: {} chars\n- session context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/.AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- preferred tools: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
             context.system_prompt_chars,
             context.session_context_chars,
             if context.has_project_agents_md { "loaded" } else { "not loaded" },
@@ -1554,6 +1811,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             if context.has_global_agents_md { "loaded" } else { "not loaded" },
             context.global_agents_md_chars,
             context.prompt_overlay_chars,
+            context.preferred_tools_chars,
             context.skills_chars,
             context.selfdev_chars,
             context.memory_chars,

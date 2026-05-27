@@ -36,7 +36,14 @@ async fn apply_remote_effort_direction(
     remote: &mut RemoteConnection,
     direction: i8,
 ) -> Result<()> {
-    let efforts = ["none", "low", "medium", "high", "xhigh"];
+    let efforts = app_mod::inferred_reasoning_efforts(
+        app.remote_provider_name.as_deref(),
+        app.remote_provider_model.as_deref(),
+    );
+    if efforts.is_empty() {
+        app.set_status_notice("Reasoning effort not available for this provider");
+        return Ok(());
+    }
     let current = app.remote_reasoning_effort.as_deref();
     let current_index = current
         .and_then(|c| efforts.iter().position(|e| *e == c))
@@ -287,11 +294,15 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('m')) {
+    if crate::tui::keybind::matches_side_panel_toggle_key(code, modifiers) {
         app.toggle_side_panel();
         return Ok(());
     }
-    if modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('t')) {
+    let macos_option_shortcut =
+        crate::tui::keybind::shortcut_char_for_macos_option_key(code, modifiers);
+    if (modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('t')))
+        || macos_option_shortcut == Some('t')
+    {
         app.toggle_diagram_pane_position();
         return Ok(());
     }
@@ -313,7 +324,9 @@ async fn handle_remote_key_internal(
         apply_remote_effort_direction(app, remote, direction).await?;
         return Ok(());
     }
-    if modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('s')) {
+    if (modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('s')))
+        || macos_option_shortcut == Some('s')
+    {
         app.toggle_typing_scroll_lock();
         return Ok(());
     }
@@ -330,8 +343,9 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if modifiers.contains(KeyModifiers::ALT) {
-        match code {
+    if modifiers.contains(KeyModifiers::ALT) || macos_option_shortcut.is_some() {
+        let alt_code = macos_option_shortcut.map(KeyCode::Char).unwrap_or(code);
+        match alt_code {
             KeyCode::Char('b') => {
                 if matches!(app.status, ProcessingStatus::RunningTool(_)) {
                     remote.background_tool().await?;
@@ -353,13 +367,8 @@ async fn handle_remote_key_internal(
                 app.input.drain(app.cursor_pos..end);
                 return Ok(());
             }
-            KeyCode::Backspace => {
-                let start = app.find_word_boundary_back();
-                if start < app.cursor_pos {
-                    app.remember_input_undo_state();
-                }
-                app.input.drain(start..app.cursor_pos);
-                app.cursor_pos = start;
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('\u{7f}') => {
+                input::delete_input_word_back(app);
                 return Ok(());
             }
             KeyCode::Char('v') => {
@@ -368,6 +377,40 @@ async fn handle_remote_key_internal(
             }
             _ => {}
         }
+    }
+
+    if modifiers.contains(KeyModifiers::SUPER) {
+        match code {
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('\u{7f}') => {
+                input::delete_input_to_start(app);
+                return Ok(());
+            }
+            KeyCode::Left | KeyCode::Home | KeyCode::Char('a') => {
+                app.cursor_pos = 0;
+                return Ok(());
+            }
+            KeyCode::Right | KeyCode::End | KeyCode::Char('e') => {
+                app.cursor_pos = app.input.len();
+                return Ok(());
+            }
+            KeyCode::Char('z') => {
+                app.undo_input_change();
+                return Ok(());
+            }
+            KeyCode::Char('x') => {
+                input::cut_input_line_to_clipboard(app);
+                return Ok(());
+            }
+            KeyCode::Char('v') => {
+                app.paste_from_clipboard();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    if app.handle_command_suggestion_key(code, modifiers) {
+        return Ok(());
     }
 
     if let Some(amount) = app.scroll_keys.scroll_amount(code, modifiers) {
@@ -423,6 +466,11 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if modifiers == KeyModifiers::CONTROL && code == KeyCode::Down {
+        input::handle_prompt_history_navigation(app, code, modifiers);
+        return Ok(());
+    }
+
     if modifiers.contains(KeyModifiers::CONTROL) {
         if app.handle_diagram_ctrl_key(code, diagram_available) {
             return Ok(());
@@ -456,18 +504,11 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('u') => {
-                if app.cursor_pos > 0 {
-                    app.remember_input_undo_state();
-                }
-                app.input.drain(..app.cursor_pos);
-                app.cursor_pos = 0;
+                input::delete_input_to_start(app);
                 return Ok(());
             }
             KeyCode::Char('k') => {
-                if app.cursor_pos < app.input.len() {
-                    app.remember_input_undo_state();
-                }
-                app.input.truncate(app.cursor_pos);
+                input::delete_input_to_end(app);
                 return Ok(());
             }
             KeyCode::Char('z') => {
@@ -483,7 +524,7 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('e') => {
-                app.cursor_pos = app.input.len();
+                input::edit_input_in_external_editor(app);
                 return Ok(());
             }
             KeyCode::Char('f') => {
@@ -505,13 +546,7 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('w') | KeyCode::Char('\u{8}') | KeyCode::Backspace => {
-                let start = app.find_word_boundary_back();
-                if start < app.cursor_pos {
-                    app.remember_input_undo_state();
-                }
-                app.input.drain(start..app.cursor_pos);
-                app.cursor_pos = start;
-                app.sync_model_picker_preview_from_input();
+                input::delete_input_word_back(app);
                 return Ok(());
             }
             KeyCode::Char('s') => {
@@ -580,7 +615,13 @@ async fn handle_remote_key_internal(
                 let had_pending = app.retrieve_pending_message_for_edit();
                 if had_pending {
                     let _ = remote.cancel_soft_interrupts().await;
+                } else {
+                    input::handle_prompt_history_navigation(app, code, modifiers);
                 }
+                return Ok(());
+            }
+            KeyCode::Down => {
+                input::handle_prompt_history_navigation(app, code, modifiers);
                 return Ok(());
             }
             _ => {}
@@ -619,6 +660,12 @@ async fn handle_remote_key_internal(
     if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
         input::insert_input_text(app, "\n");
         app.follow_chat_bottom_for_typing();
+        return Ok(());
+    }
+
+    if input::handle_multiline_input_navigation(app, code, modifiers)
+        || input::handle_prompt_history_navigation(app, code, modifiers)
+    {
         return Ok(());
     }
 
@@ -944,7 +991,16 @@ async fn handle_remote_key_internal(
                     let label = current
                         .map(app_mod::effort_display_label)
                         .unwrap_or("default");
-                    let efforts = ["none", "low", "medium", "high", "xhigh"];
+                    let efforts = app_mod::inferred_reasoning_efforts(
+                        app.remote_provider_name.as_deref(),
+                        app.remote_provider_model.as_deref(),
+                    );
+                    if efforts.is_empty() {
+                        app.push_display_message(DisplayMessage::system(
+                            "Reasoning effort not available for this provider.".to_string(),
+                        ));
+                        return Ok(());
+                    }
                     let list: Vec<String> = efforts
                         .iter()
                         .map(|e| {
@@ -969,8 +1025,11 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::error("Usage: /effort <level>"));
                         return Ok(());
                     }
-                    const EFFORTS: [&str; 5] = ["none", "low", "medium", "high", "xhigh"];
-                    if EFFORTS.contains(&level) {
+                    let efforts = app_mod::inferred_reasoning_efforts(
+                        app.remote_provider_name.as_deref(),
+                        app.remote_provider_model.as_deref(),
+                    );
+                    if efforts.contains(&level) {
                         app.remote_reasoning_effort = Some(level.to_string());
                         app.invalidate_model_picker_cache();
                         app.set_status_notice(format!(
@@ -1459,6 +1518,14 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if app_mod::commands::handle_test_command(app, trimmed) {
+                    return Ok(());
+                }
+
+                if app_mod::commands::handle_disabled_mission_command(app, trimmed) {
+                    return Ok(());
+                }
+
                 if app_mod::commands::handle_goals_command(app, trimmed) {
                     return Ok(());
                 }
@@ -1512,7 +1579,7 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/resume" || trimmed == "/sessions" {
+                if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
                     app.open_session_picker();
                     return Ok(());
                 }

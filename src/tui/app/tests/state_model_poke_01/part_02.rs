@@ -84,16 +84,16 @@ fn test_mouse_scroll_over_tool_side_panel_updates_visible_render() {
         row: diff_area.y + diff_area.height.saturating_sub(2).min(3),
         modifiers: KeyModifiers::empty(),
     });
-    assert_eq!(app.diff_pane_scroll, 1);
+    assert_eq!(app.diff_pane_scroll, 3);
 
     let after = render_and_snap(&app, &mut terminal);
-    assert_eq!(crate::tui::ui::last_diff_pane_effective_scroll(), 1);
+    assert_eq!(crate::tui::ui::last_diff_pane_effective_scroll(), 3);
     assert_ne!(
         before, after,
         "hover scrolling should repaint the side panel"
     );
-    assert!(after.contains("side-scroll-02"));
-    assert!(after.contains("side-scroll-03"));
+    assert!(after.contains("side-scroll-04"));
+    assert!(after.contains("side-scroll-05"));
     assert!(!after.contains("side-scroll-01"));
 }
 

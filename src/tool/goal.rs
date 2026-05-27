@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub struct GoalTool;
+pub struct InitiativeTool;
 
-impl GoalTool {
+impl InitiativeTool {
     pub fn new() -> Self {
         Self
     }
@@ -102,13 +102,13 @@ fn goal_milestone_schema() -> Value {
 }
 
 #[async_trait]
-impl Tool for GoalTool {
+impl Tool for InitiativeTool {
     fn name(&self) -> &str {
-        "goal"
+        "initiative"
     }
 
     fn description(&self) -> &str {
-        "Manage goals."
+        "Manage durable initiatives."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -194,14 +194,14 @@ impl Tool for GoalTool {
                 )?;
                 let metadata = serde_json::to_value(&goal)?;
                 let output = if display == crate::goal::GoalDisplayMode::None {
-                    ToolOutput::new(format!("Created goal `{}` ({})", goal.id, goal.title))
+                    ToolOutput::new(format!("Created initiative `{}` ({})", goal.id, goal.title))
                 } else {
                     let snapshot =
                         crate::goal::write_goal_page(&ctx.session_id, working_dir, &goal, display)?;
                     publish_side_panel_snapshot(&ctx.session_id, &snapshot);
                     maybe_publish_goals_overview_refresh(&ctx.session_id, working_dir)?;
                     ToolOutput::new(format!(
-                        "Created goal `{}` ({}) and opened it in the side panel.",
+                        "Created initiative `{}` ({}) and opened it in the side panel.",
                         goal.id, goal.title
                     ))
                 };
@@ -216,7 +216,7 @@ impl Tool for GoalTool {
                     .ok_or_else(|| anyhow::anyhow!("id is required for show/focus"))?;
                 if display == crate::goal::GoalDisplayMode::None {
                     let Some(goal) = crate::goal::load_goal(id, None, working_dir)? else {
-                        anyhow::bail!("goal not found: {}", id);
+                        anyhow::bail!("initiative not found: {}", id);
                     };
                     crate::goal::attach_goal_to_session(&ctx.session_id, &goal, working_dir)?;
                     Ok(ToolOutput::new(crate::goal::render_goal_detail(&goal))
@@ -230,7 +230,7 @@ impl Tool for GoalTool {
                         params.action == "focus" || display == crate::goal::GoalDisplayMode::Focus,
                     )?
                     else {
-                        anyhow::bail!("goal not found: {}", id);
+                        anyhow::bail!("initiative not found: {}", id);
                     };
                     publish_side_panel_snapshot(&ctx.session_id, &result.snapshot);
                     Ok(
@@ -259,7 +259,7 @@ impl Tool for GoalTool {
                     publish_side_panel_snapshot(&ctx.session_id, &result.snapshot);
                     result.goal
                 };
-                let mut output = format!("Resumed goal `{}` ({})", goal.id, goal.title);
+                let mut output = format!("Resumed initiative `{}` ({})", goal.id, goal.title);
                 if let Some(progress) = goal.progress_percent {
                     output.push_str(&format!(" — {}%", progress));
                 }
@@ -319,7 +319,7 @@ impl Tool for GoalTool {
                         },
                     },
                 )?
-                .ok_or_else(|| anyhow::anyhow!("goal not found: {}", id))?;
+                .ok_or_else(|| anyhow::anyhow!("initiative not found: {}", id))?;
                 if display != crate::goal::GoalDisplayMode::None {
                     let should_write_goal_page = match display {
                         crate::goal::GoalDisplayMode::None => false,
@@ -341,7 +341,7 @@ impl Tool for GoalTool {
                     maybe_publish_goals_overview_refresh(&ctx.session_id, working_dir)?;
                 }
                 Ok(
-                    ToolOutput::new(format!("Updated goal `{}` ({})", goal.id, goal.title))
+                    ToolOutput::new(format!("Updated initiative `{}` ({})", goal.id, goal.title))
                         .with_title(goal.title.clone())
                         .with_metadata(serde_json::to_value(&goal)?),
                 )

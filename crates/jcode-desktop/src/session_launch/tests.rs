@@ -39,19 +39,63 @@ fn desktop_event_parser_maps_streaming_server_events() {
     assert_eq!(
         desktop_event_from_server_value(&json!({"type": "tool_start", "name": "bash"})),
         Some(DesktopSessionEvent::ToolStarted {
+            id: None,
+            name: "bash".to_string()
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(
+            &json!({"type": "tool_start", "id": " tool-1 ", "name": "bash"})
+        ),
+        Some(DesktopSessionEvent::ToolStarted {
+            id: Some("tool-1".to_string()),
             name: "bash".to_string()
         })
     );
     assert_eq!(
         desktop_event_from_server_value(&json!({"type": "tool_input", "delta": "{\"command\":"})),
         Some(DesktopSessionEvent::ToolInput {
+            id: None,
             delta: "{\"command\":".to_string()
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(
+            &json!({"type": "tool_input", "id": "tool-1", "delta": "cargo"})
+        ),
+        Some(DesktopSessionEvent::ToolInput {
+            id: Some("tool-1".to_string()),
+            delta: "cargo".to_string()
         })
     );
     assert_eq!(
         desktop_event_from_server_value(&json!({"type": "tool_exec", "name": "bash"})),
         Some(DesktopSessionEvent::ToolExecuting {
+            id: None,
             name: "bash".to_string()
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(
+            &json!({"type": "tool_exec", "id": "tool-1", "name": "bash"})
+        ),
+        Some(DesktopSessionEvent::ToolExecuting {
+            id: Some("tool-1".to_string()),
+            name: "bash".to_string()
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "tool_done",
+            "id": "tool-1",
+            "name": "bash",
+            "output": "hello\nworld"
+        })),
+        Some(DesktopSessionEvent::ToolFinished {
+            id: Some("tool-1".to_string()),
+            name: "bash".to_string(),
+            summary: "hello".to_string(),
+            is_error: false
         })
     );
     assert_eq!(
@@ -61,6 +105,7 @@ fn desktop_event_parser_maps_streaming_server_events() {
             "output": "hello\nworld"
         })),
         Some(DesktopSessionEvent::ToolFinished {
+            id: None,
             name: "bash".to_string(),
             summary: "hello".to_string(),
             is_error: false
@@ -235,6 +280,97 @@ fn desktop_event_parser_maps_streaming_server_events() {
         None,
         "malformed stdin requests must not fall back to tool_call_id=unknown"
     );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "reload_progress",
+            "step": "build",
+            "message": "compiled",
+            "success": true,
+            "output": "ok"
+        })),
+        Some(DesktopSessionEvent::ReloadProgress {
+            step: "build".to_string(),
+            message: "compiled".to_string(),
+            success: Some(true),
+            output: Some("ok".to_string())
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "tokens",
+            "input": 12,
+            "output": 34,
+            "cache_read_input": 5
+        })),
+        Some(DesktopSessionEvent::TokenUsage {
+            input: 12,
+            output: 34,
+            cache_read_input: Some(5),
+            cache_creation_input: None
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({"type": "message_end"})),
+        None,
+        "message completion is represented by streaming state and should not add timeline noise"
+    );
+    assert_eq!(
+        desktop_event_from_server_value(&json!({
+            "type": "kv_cache_request",
+            "status": "started"
+        })),
+        None,
+        "KV cache bookkeeping is internal and should not appear as a system notice"
+    );
+    for event_type in [
+        "batch_progress",
+        "mcp_status",
+        "memory_injected",
+        "memory_activity",
+        "notification",
+        "compaction",
+        "soft_interrupt_injected",
+        "side_panel_state",
+        "swarm_status",
+        "swarm_plan",
+        "swarm_plan_proposal",
+        "transcript",
+        "input_shell_result",
+        "split_response",
+        "compacted_history",
+        "comm_request",
+        "comm_response",
+        "comm_status",
+        "comm_presence",
+    ] {
+        assert_eq!(
+            desktop_event_from_server_value(&json!({
+                "type": event_type,
+                "message": "should not render",
+                "status": "running"
+            })),
+            None,
+            "{event_type} is internal protocol state and should not render into desktop chat"
+        );
+    }
+    assert_eq!(
+        desktop_event_from_server_value(
+            &json!({"type": "connection_type", "connection": "websocket"})
+        ),
+        Some(DesktopSessionEvent::RuntimeMetadata {
+            connection_type: Some("websocket".to_string()),
+            status_detail: None,
+            upstream_provider: None
+        })
+    );
+    assert_eq!(
+        desktop_event_from_server_value(
+            &json!({"type": "session_close_requested", "reason": "handoff"})
+        ),
+        Some(DesktopSessionEvent::SessionCloseRequested {
+            reason: "handoff".to_string()
+        })
+    );
 }
 
 #[test]
@@ -261,6 +397,21 @@ fn desktop_session_handle_sends_stdin_response_command() {
         Ok(DesktopSessionCommand::StdinResponse {
             request_id: "stdin-1".to_string(),
             input: "secret".to_string()
+        })
+    );
+}
+
+#[test]
+fn desktop_session_handle_sends_reasoning_effort_command() {
+    let (command_tx, command_rx) = mpsc::channel();
+    let handle = DesktopSessionHandle { command_tx };
+
+    handle.set_reasoning_effort("high".to_string()).unwrap();
+
+    assert_eq!(
+        command_rx.try_recv(),
+        Ok(DesktopSessionCommand::SetReasoningEffort {
+            effort: "high".to_string()
         })
     );
 }

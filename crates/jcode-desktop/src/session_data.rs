@@ -1,8 +1,8 @@
 use crate::workspace::SessionCard;
+pub use crate::workspace::SessionTranscriptMessage;
 use anyhow::{Context, Result};
 use jcode_tui_messages::{
-    TranscriptPreviewLabels, latest_user_transcript_preview, normalize_transcript_preview_text,
-    transcript_preview_lines,
+    TranscriptPreviewLabels, latest_user_transcript_preview, transcript_preview_lines,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -15,6 +15,9 @@ const SESSION_PREVIEW_LINE_LIMIT: usize = 5;
 const SESSION_PREVIEW_CHAR_LIMIT: usize = 72;
 const SESSION_DETAIL_LINE_LIMIT: usize = 28;
 const SESSION_DETAIL_CHAR_LIMIT: usize = 128;
+const SESSION_CARD_TRANSCRIPT_MESSAGE_LIMIT: usize = 64;
+const SESSION_CARD_TRANSCRIPT_CHAR_LIMIT: usize = 48_000;
+const SESSION_CARD_TRANSCRIPT_MESSAGE_CHAR_LIMIT: usize = 4_000;
 
 pub fn load_recent_session_cards() -> Result<Vec<SessionCard>> {
     load_recent_session_cards_with_limit(DEFAULT_SESSION_LIMIT)
@@ -37,12 +40,6 @@ pub fn load_session_card_by_id(session_id: &str) -> Result<Option<SessionCard>> 
     Ok(load_recent_session_cards_with_limit(DEFAULT_SESSION_LIMIT)?
         .into_iter()
         .find(|card| card.session_id == session_id))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionTranscriptMessage {
-    pub role: String,
-    pub content: String,
 }
 
 pub fn load_session_transcript_by_id(
@@ -116,7 +113,7 @@ fn load_recent_session_cards_with_limit(limit: usize) -> Result<Vec<SessionCard>
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
 
     let mut cards = Vec::new();
-    for candidate in candidates.into_iter().take(limit.saturating_mul(3)) {
+    for candidate in candidates {
         match load_session_card(&candidate.path, candidate.modified) {
             Ok(Some(card)) => cards.push(card),
             Ok(None) => {}
@@ -271,9 +268,10 @@ fn load_session_card(path: &Path, modified: SystemTime) -> Result<Option<Session
     let short_name =
         stored_string(session.short_name.as_deref()).unwrap_or_else(|| short_session_name(&id));
     let message_count = session.messages.len();
+    let transcript_messages = session_transcript_messages(&session);
     let title = stored_string(session.custom_title.as_deref())
         .or_else(|| stored_string(session.title.as_deref()))
-        .or_else(|| latest_user_preview(&session))
+        .or_else(|| latest_user_preview(&transcript_messages))
         .unwrap_or_else(|| short_name.clone());
 
     let status = stored_string(session.status.as_deref()).unwrap_or_else(|| "unknown".to_string());
@@ -292,15 +290,16 @@ fn load_session_card(path: &Path, modified: SystemTime) -> Result<Option<Session
         None => format!("{message_count} msgs · {cwd}"),
     };
     let preview_lines = recent_message_preview_lines(
-        &session.messages,
+        &transcript_messages,
         SESSION_PREVIEW_LINE_LIMIT,
         SESSION_PREVIEW_CHAR_LIMIT,
     );
     let detail_lines = recent_message_preview_lines(
-        &session.messages,
+        &transcript_messages,
         SESSION_DETAIL_LINE_LIMIT,
         SESSION_DETAIL_CHAR_LIMIT,
     );
+    let card_transcript_messages = session_card_transcript_messages(&transcript_messages);
 
     Ok(Some(SessionCard {
         session_id: id,
@@ -309,6 +308,7 @@ fn load_session_card(path: &Path, modified: SystemTime) -> Result<Option<Session
         detail,
         preview_lines,
         detail_lines,
+        transcript_messages: card_transcript_messages,
     }))
 }
 
@@ -336,44 +336,28 @@ fn stored_string(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn latest_user_preview(session: &StoredSession) -> Option<String> {
-    let messages = transcript_preview_messages(&session.messages);
+fn latest_user_preview(messages: &[SessionTranscriptMessage]) -> Option<String> {
     latest_user_transcript_preview(
         messages
             .iter()
-            .map(|(role, text)| (role.as_str(), text.as_str())),
+            .map(|message| (message.role.as_str(), message.content.as_str())),
         64,
     )
 }
 
 fn recent_message_preview_lines(
-    messages: &[StoredMessage],
+    messages: &[SessionTranscriptMessage],
     limit: usize,
     char_limit: usize,
 ) -> Vec<String> {
-    let messages = transcript_preview_messages(messages);
     transcript_preview_lines(
         messages
             .iter()
-            .map(|(role, text)| (role.as_str(), text.as_str())),
+            .map(|message| (message.role.as_str(), message.content.as_str())),
         limit,
         char_limit,
         TranscriptPreviewLabels::DESKTOP,
     )
-}
-
-fn transcript_preview_messages(messages: &[StoredMessage]) -> Vec<(String, String)> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role.as_deref()? {
-                role @ ("user" | "assistant" | "system") => role.to_string(),
-                _ => return None,
-            };
-            let text = message_preview_text(message)?;
-            Some((role, text))
-        })
-        .collect()
 }
 
 fn session_transcript_messages(messages: &StoredSession) -> Vec<SessionTranscriptMessage> {
@@ -389,6 +373,36 @@ fn session_transcript_messages(messages: &StoredSession) -> Vec<SessionTranscrip
             Some(SessionTranscriptMessage { role, content })
         })
         .collect()
+}
+
+fn session_card_transcript_messages(
+    messages: &[SessionTranscriptMessage],
+) -> Vec<SessionTranscriptMessage> {
+    let mut selected = Vec::new();
+    let mut total_chars = 0usize;
+
+    for message in messages.iter().rev() {
+        if selected.len() >= SESSION_CARD_TRANSCRIPT_MESSAGE_LIMIT {
+            break;
+        }
+
+        let content = truncate_chars(&message.content, SESSION_CARD_TRANSCRIPT_MESSAGE_CHAR_LIMIT);
+        let content_chars = content.chars().count();
+        if !selected.is_empty()
+            && total_chars.saturating_add(content_chars) > SESSION_CARD_TRANSCRIPT_CHAR_LIMIT
+        {
+            break;
+        }
+
+        total_chars = total_chars.saturating_add(content_chars);
+        selected.push(SessionTranscriptMessage {
+            role: message.role.clone(),
+            content,
+        });
+    }
+
+    selected.reverse();
+    selected
 }
 
 fn transcript_display_role(role: Option<&str>) -> String {
@@ -435,36 +449,6 @@ fn message_transcript_text(message: &StoredMessage) -> Option<String> {
 
 fn should_skip_desktop_transcript_message(role: &str, content: &str) -> bool {
     role == "user" && content.trim_start().starts_with("<system-reminder>")
-}
-
-fn message_preview_text(message: &StoredMessage) -> Option<String> {
-    let mut fragments = Vec::new();
-    for block in &message.content {
-        match block.block_type.as_deref() {
-            Some("text") | None => {
-                if let Some(text) = block.text.as_deref() {
-                    let normalized = normalize_transcript_preview_text(text);
-                    if !normalized.is_empty() {
-                        fragments.push(normalized);
-                    }
-                }
-            }
-            Some("tool_use") => {
-                if let Some(name) = block.name.as_deref() {
-                    fragments.push(format!("tool {name}"));
-                }
-            }
-            Some("tool_result") => {}
-            _ => {}
-        }
-    }
-
-    let joined = fragments.join(" ");
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
-    }
 }
 
 fn short_session_name(id: &str) -> String {
@@ -532,8 +516,10 @@ mod tests {
             ]
         }));
 
+        let messages = session_transcript_messages(&session);
+
         assert_eq!(
-            latest_user_preview(&session),
+            latest_user_preview(&messages),
             Some("newer prompt".to_string())
         );
     }
@@ -549,8 +535,10 @@ mod tests {
             ]
         }));
 
+        let messages = session_transcript_messages(&session);
+
         assert_eq!(
-            recent_message_preview_lines(&session.messages, 4, SESSION_PREVIEW_CHAR_LIMIT),
+            recent_message_preview_lines(&messages, 4, SESSION_PREVIEW_CHAR_LIMIT),
             vec!["user hello there", "asst tool bash", "asst done now"]
         );
     }
@@ -589,6 +577,115 @@ mod tests {
     }
 
     #[test]
+    fn load_session_card_filters_startup_reminder_from_preview_and_transcript() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-desktop-session-card-reminder-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("session_reminder_123.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "status": "active",
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "<system-reminder>startup context</system-reminder>"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "clean prompt"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "clean answer"}]}
+                ]
+            }))?,
+        )?;
+
+        let card = load_session_card(&path, SystemTime::UNIX_EPOCH)?.unwrap();
+        let preview = card.preview_lines.join("\n");
+        let detail = card.detail_lines.join("\n");
+
+        assert_eq!(card.title, "clean prompt");
+        assert!(!preview.contains("system-reminder"));
+        assert!(!detail.contains("system-reminder"));
+        assert_eq!(
+            card.preview_lines,
+            vec!["user clean prompt", "asst clean answer"]
+        );
+        assert_eq!(
+            card.transcript_messages,
+            vec![
+                SessionTranscriptMessage {
+                    role: "user".to_string(),
+                    content: "clean prompt".to_string(),
+                },
+                SessionTranscriptMessage {
+                    role: "assistant".to_string(),
+                    content: "clean answer".to_string(),
+                },
+            ]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_card_transcript_messages_are_bounded_to_recent_visible_text() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "jcode-desktop-session-card-bound-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("session_large_123.json");
+        let messages = (0..80)
+            .map(|index| {
+                json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("prompt {index}")}],
+                })
+            })
+            .chain(std::iter::once(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "x".repeat(SESSION_CARD_TRANSCRIPT_MESSAGE_CHAR_LIMIT + 12)}],
+            })))
+            .collect::<Vec<_>>();
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "status": "active",
+                "model": "test-model",
+                "messages": messages,
+            }))?,
+        )?;
+
+        let card = load_session_card(&path, SystemTime::UNIX_EPOCH)?.unwrap();
+
+        assert_eq!(
+            card.transcript_messages.len(),
+            SESSION_CARD_TRANSCRIPT_MESSAGE_LIMIT
+        );
+        assert_eq!(
+            card.transcript_messages
+                .first()
+                .map(|message| message.content.as_str()),
+            Some("prompt 17")
+        );
+        let last = card
+            .transcript_messages
+            .last()
+            .expect("last bounded message");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(
+            last.content.chars().count(),
+            SESSION_CARD_TRANSCRIPT_MESSAGE_CHAR_LIMIT + 1,
+            "long card transcript message should be truncated with an ellipsis"
+        );
+        assert!(last.content.ends_with('…'));
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
     fn typed_session_parser_accepts_legacy_string_content() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "jcode-desktop-session-data-test-{}",
@@ -621,6 +718,50 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    #[test]
+    fn recent_session_loader_scans_past_many_invalid_recent_files() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_home = std::env::temp_dir().join(format!(
+            "jcode-desktop-session-loader-test-{}-{unique}",
+            std::process::id()
+        ));
+        let sessions_dir = temp_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        fs::write(
+            sessions_dir.join("valid_old.json"),
+            r#"{"id":"valid_old","title":"valid old","status":"Closed","messages":[{"role":"user","content":[{"type":"text","text":"hello from valid session"}]}]}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for index in 0..100 {
+            fs::write(
+                sessions_dir.join(format!("invalid_new_{index:03}.json")),
+                "{ not valid json",
+            )
+            .unwrap();
+        }
+
+        let previous_home = std::env::var_os("JCODE_HOME");
+        unsafe { std::env::set_var("JCODE_HOME", &temp_home) };
+        let cards = load_recent_session_cards().unwrap();
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("JCODE_HOME", value) },
+            None => unsafe { std::env::remove_var("JCODE_HOME") },
+        }
+        let _ = fs::remove_dir_all(&temp_home);
+
+        assert!(
+            cards.iter().any(|card| card.session_id == "valid_old"),
+            "loader should keep scanning after invalid recent files: {cards:?}"
+        );
     }
 
     #[test]

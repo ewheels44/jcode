@@ -106,6 +106,7 @@ fn test_active_file_diff_context_resolves_visible_edit() {
                 file_path: "src/one.rs".to_string(),
                 start_line: 2,
                 end_line: 5,
+                expandable: true,
             },
             EditToolRange {
                 edit_index: 1,
@@ -113,6 +114,7 @@ fn test_active_file_diff_context_resolves_visible_edit() {
                 file_path: "src/two.rs".to_string(),
                 start_line: 10,
                 end_line: 14,
+                expandable: true,
             },
         ],
         copy_targets: Vec::new(),

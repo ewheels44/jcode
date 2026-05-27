@@ -96,6 +96,116 @@ fn make_session_with_flags(
 }
 
 #[test]
+#[ignore = "developer benchmark: profiles real /resume through first rendered picker frame"]
+fn benchmark_real_resume_first_render_reports_timings() {
+    invalidate_session_list_cache();
+
+    let total_start = std::time::Instant::now();
+
+    let loading_render_start = std::time::Instant::now();
+    let mut loading_picker = SessionPicker::loading();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| loading_picker.render(frame))
+        .expect("render loading picker");
+    let loading_render_elapsed = loading_render_start.elapsed();
+
+    let load_start = std::time::Instant::now();
+    let (server_groups, orphan_sessions) = load_sessions_grouped().expect("load sessions grouped");
+    let load_elapsed = load_start.elapsed();
+    let loaded_count: usize = server_groups
+        .iter()
+        .map(|group| group.sessions.len())
+        .sum::<usize>()
+        + orphan_sessions.len();
+
+    let construct_start = std::time::Instant::now();
+    let mut picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
+    let selected_before_render = picker.selected_session().map(|session| {
+        (
+            session.id.clone(),
+            session.title.clone(),
+            session.external_path.clone(),
+            session.messages_preview.len(),
+        )
+    });
+    let construct_elapsed = construct_start.elapsed();
+
+    let first_render_start = std::time::Instant::now();
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render loaded picker");
+    let first_render_elapsed = first_render_start.elapsed();
+    let selected_after_first_render = picker
+        .selected_session()
+        .map(|session| (session.id.clone(), session.messages_preview.len()));
+
+    let second_render_start = std::time::Instant::now();
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render loaded picker again");
+    let second_render_elapsed = second_render_start.elapsed();
+
+    eprintln!(
+        "real resume first render: total={}ms loading_render={}ms load_grouped={}ms/{} construct={}ms first_render={}ms second_render={}ms selected_before={:?} selected_after={:?}",
+        total_start.elapsed().as_millis(),
+        loading_render_elapsed.as_millis(),
+        load_elapsed.as_millis(),
+        loaded_count,
+        construct_elapsed.as_millis(),
+        first_render_elapsed.as_millis(),
+        second_render_elapsed.as_millis(),
+        selected_before_render,
+        selected_after_first_render,
+    );
+}
+
+#[test]
+#[ignore = "developer benchmark: profiles cached /resume first render latency"]
+fn benchmark_real_resume_cached_first_render_reports_timings() {
+    invalidate_session_list_cache();
+
+    let refresh_start = std::time::Instant::now();
+    let (_fresh_groups, _fresh_orphans) =
+        load_sessions_grouped().expect("refresh sessions grouped");
+    let refresh_elapsed = refresh_start.elapsed();
+
+    let total_start = std::time::Instant::now();
+    let cache_start = std::time::Instant::now();
+    let (server_groups, orphan_sessions) =
+        load_cached_sessions_grouped().expect("load cached sessions grouped");
+    let cache_elapsed = cache_start.elapsed();
+    let cached_count: usize = server_groups
+        .iter()
+        .map(|group| group.sessions.len())
+        .sum::<usize>()
+        + orphan_sessions.len();
+
+    let construct_start = std::time::Instant::now();
+    let mut picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
+    let construct_elapsed = construct_start.elapsed();
+
+    let render_start = std::time::Instant::now();
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render cached picker");
+    let render_elapsed = render_start.elapsed();
+
+    eprintln!(
+        "real resume cached first render: total={}ms cache_read={}ms/{} construct={}ms first_render={}ms cache_refresh={}ms",
+        total_start.elapsed().as_millis(),
+        cache_elapsed.as_millis(),
+        cached_count,
+        construct_elapsed.as_millis(),
+        render_elapsed.as_millis(),
+        refresh_elapsed.as_millis(),
+    );
+}
+
+#[test]
 fn test_format_estimated_tokens_uses_compact_units() {
     assert_eq!(SessionPicker::format_estimated_tokens(0), "~0 tok");
     assert_eq!(SessionPicker::format_estimated_tokens(999), "~999 tok");
@@ -736,7 +846,7 @@ fn test_space_selects_multiple_sessions_and_enter_returns_them() {
         .unwrap();
 
     match action {
-        OverlayAction::Selected(PickerResult::SelectedInNewTerminal(ids)) => {
+        OverlayAction::Selected(PickerResult::SelectedInCurrentTerminal(ids)) => {
             assert_eq!(
                 ids,
                 vec![
@@ -750,6 +860,27 @@ fn test_space_selects_multiple_sessions_and_enter_returns_them() {
             );
         }
         other => panic!("expected selected sessions, got {other:?}"),
+    }
+
+    let alternate_action = picker
+        .handle_overlay_key(KeyCode::Enter, KeyModifiers::CONTROL)
+        .unwrap();
+
+    match alternate_action {
+        OverlayAction::Selected(PickerResult::SelectedInNewTerminal(ids)) => {
+            assert_eq!(
+                ids,
+                vec![
+                    ResumeTarget::JcodeSession {
+                        session_id: "session_newer".to_string(),
+                    },
+                    ResumeTarget::JcodeSession {
+                        session_id: "session_older".to_string(),
+                    }
+                ]
+            );
+        }
+        other => panic!("expected alternate selected sessions, got {other:?}"),
     }
 }
 

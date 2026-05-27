@@ -31,7 +31,7 @@ use account_failover::{
     same_provider_account_candidates, same_provider_account_failover_enabled,
     set_account_override_for_provider,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 #[cfg(test)]
 use jcode_provider_core::FailoverDecision;
@@ -57,6 +57,23 @@ pub(crate) use routing::{
     anthropic_api_key_route_availability, anthropic_oauth_route_availability,
     is_transient_transport_error, should_eager_detect_copilot_tier,
 };
+
+/// Whether reasoning deltas should be persisted in session history for later
+/// provider context reconstruction.
+///
+/// Display is controlled separately by `display.show_thinking`. Persist only
+/// when a provider request builder can safely send the stored block back in
+/// the provider-native shape. Anthropic is included only because we preserve
+/// its thinking signatures in `ContentBlock::AnthropicThinking`.
+pub fn stores_reasoning_content_for_context(provider_name: &str) -> bool {
+    if !crate::config::config().provider.preserve_reasoning_context {
+        return false;
+    }
+    matches!(
+        provider_name.to_ascii_lowercase().as_str(),
+        "openrouter" | "anthropic" | "openai"
+    )
+}
 
 fn cached_live_models_for_openai_compatible_profile(
     resolved: &crate::provider_catalog::ResolvedOpenAiCompatibleProfile,
@@ -1465,53 +1482,108 @@ impl Provider for MultiProvider {
     }
 
     async fn prefetch_models(&self) -> Result<()> {
-        if let Some(anthropic) = self.anthropic_provider() {
-            anthropic.prefetch_models().await?;
-        }
-        if let Some(claude) = self.claude_provider() {
-            claude.prefetch_models().await?;
-        }
-        if let Some(openai) = self.openai_provider() {
-            openai.prefetch_models().await?;
-        }
+        let anthropic = self.anthropic_provider();
+        let claude = self.claude_provider();
+        let openai = self.openai_provider();
         let openrouter = self.openrouter_provider();
-        if let Some(openrouter) = openrouter {
-            openrouter.prefetch_models().await?;
-        }
-        {
-            let copilot = self
-                .copilot_api
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            if let Some(copilot) = copilot {
-                copilot.prefetch_models().await?;
+        let copilot = self
+            .copilot_api
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let antigravity = self.antigravity_provider();
+        let gemini = self.gemini_provider();
+        let cursor = self.cursor_provider();
+        let bedrock = self.bedrock_provider();
+
+        let (
+            anthropic_result,
+            claude_result,
+            openai_result,
+            openrouter_result,
+            copilot_result,
+            antigravity_result,
+            gemini_result,
+            cursor_result,
+            bedrock_result,
+        ) = tokio::join!(
+            async {
+                match anthropic {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match claude {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match openai {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match openrouter {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match copilot {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match antigravity {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match gemini {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match cursor {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match bedrock {
+                    Some(provider) => provider.prefetch_models().await,
+                    None => Ok(()),
+                }
+            },
+        );
+
+        let mut errors = Vec::new();
+        for (provider_name, result) in [
+            ("anthropic", anthropic_result),
+            ("claude", claude_result),
+            ("openai", openai_result),
+            ("openrouter", openrouter_result),
+            ("copilot", copilot_result),
+            ("antigravity", antigravity_result),
+            ("gemini", gemini_result),
+            ("cursor", cursor_result),
+            ("bedrock", bedrock_result),
+        ] {
+            if let Err(err) = result {
+                errors.push(format!("{provider_name}: {err}"));
             }
         }
-        {
-            let antigravity = self.antigravity_provider();
-            if let Some(antigravity) = antigravity {
-                antigravity.prefetch_models().await?;
-            }
+
+        if !errors.is_empty() {
+            return Err(anyhow!("{}", errors.join("; ")));
         }
-        {
-            let gemini = self.gemini_provider();
-            if let Some(gemini) = gemini {
-                gemini.prefetch_models().await?;
-            }
-        }
-        {
-            let cursor = self.cursor_provider();
-            if let Some(cursor) = cursor {
-                cursor.prefetch_models().await?;
-            }
-        }
-        {
-            let bedrock = self.bedrock_provider();
-            if let Some(bedrock) = bedrock {
-                bedrock.prefetch_models().await?;
-            }
-        }
+
         Ok(())
     }
 
@@ -1565,7 +1637,14 @@ impl Provider for MultiProvider {
 
     fn reasoning_effort(&self) -> Option<String> {
         match self.active_provider() {
-            ActiveProvider::Claude => None,
+            ActiveProvider::Claude => {
+                if self.use_claude_cli {
+                    None
+                } else {
+                    self.anthropic_provider()
+                        .and_then(|provider| provider.reasoning_effort())
+                }
+            }
             ActiveProvider::OpenAI => self.openai_provider().and_then(|o| o.reasoning_effort()),
             ActiveProvider::Copilot => None,
             ActiveProvider::Antigravity => None,
@@ -1580,6 +1659,10 @@ impl Provider for MultiProvider {
 
     fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
         match self.active_provider() {
+            ActiveProvider::Claude if !self.use_claude_cli => self
+                .anthropic_provider()
+                .ok_or_else(|| anyhow::anyhow!("Anthropic provider not available"))?
+                .set_reasoning_effort(effort),
             ActiveProvider::OpenAI => self
                 .openai_provider()
                 .ok_or_else(|| anyhow::anyhow!("OpenAI provider not available"))?
@@ -1589,13 +1672,17 @@ impl Provider for MultiProvider {
                 .ok_or_else(|| anyhow::anyhow!("OpenAI-compatible provider not available"))?
                 .set_reasoning_effort(effort),
             _ => Err(anyhow::anyhow!(
-                "Reasoning effort is only supported for OpenAI models"
+                "Reasoning effort is only supported for OpenAI, Anthropic, and compatible reasoning models"
             )),
         }
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
         match self.active_provider() {
+            ActiveProvider::Claude if !self.use_claude_cli => self
+                .anthropic_provider()
+                .map(|provider| provider.available_efforts())
+                .unwrap_or_default(),
             ActiveProvider::OpenAI => self
                 .openai_provider()
                 .map(|o| o.available_efforts())

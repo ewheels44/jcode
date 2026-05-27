@@ -64,6 +64,23 @@ impl App {
         }
     }
 
+    fn remove_client_maintenance_message(
+        &mut self,
+        action: crate::bus::ClientMaintenanceAction,
+    ) -> bool {
+        let title = Self::client_maintenance_card_title(action);
+        let Some(idx) = self
+            .display_messages
+            .iter()
+            .rposition(|message| Self::is_client_maintenance_message(message, &title))
+        else {
+            return false;
+        };
+        self.display_messages.remove(idx);
+        self.bump_display_messages_version();
+        true
+    }
+
     pub(super) fn start_background_client_rebuild(&mut self, session_id: String) {
         self.start_background_client_maintenance(
             crate::bus::ClientMaintenanceAction::Rebuild,
@@ -98,15 +115,6 @@ impl App {
 
         match action {
             crate::bus::ClientMaintenanceAction::Update => {
-                self.set_status_notice("Checking for updates...");
-                self.set_client_maintenance_message(
-                    action,
-                    Self::client_maintenance_card_message(
-                        action,
-                        "checking for updates",
-                        "Running in the background. jcode will reload automatically when the update is ready.",
-                    ),
-                );
                 crate::update::spawn_background_session_update(session_id);
             }
             crate::bus::ClientMaintenanceAction::Rebuild => {
@@ -120,6 +128,88 @@ impl App {
                     ),
                 );
                 crate::cli::hot_exec::spawn_background_session_rebuild(session_id);
+            }
+        }
+    }
+
+    pub(super) fn handle_update_status(&mut self, status: crate::bus::UpdateStatus) {
+        use crate::bus::{ClientMaintenanceAction, UpdateStatus};
+
+        let action = ClientMaintenanceAction::Update;
+        match status {
+            UpdateStatus::Checking => {
+                // Background update checks run at startup for normal sessions. Keep the
+                // UI quiet unless there is an update to report or work to perform.
+            }
+            UpdateStatus::Available { current, latest } => {
+                self.set_status_notice(format!("Update available: {} → {}", current, latest));
+                self.set_client_maintenance_message(
+                    action,
+                    Self::client_maintenance_card_message(
+                        action,
+                        format!("{} → {} available", current, latest),
+                        format!(
+                            "Current: `{}`\nLatest: `{}`\n\nRun `/update` to install, or wait while auto-update continues if enabled.",
+                            current, latest
+                        ),
+                    ),
+                );
+            }
+            UpdateStatus::Downloading { version } => {
+                self.background_client_action = Some(action);
+                self.set_status_notice(format!("Updating to {}...", version));
+                self.set_client_maintenance_message(
+                    action,
+                    Self::client_maintenance_card_message(
+                        action,
+                        format!("downloading {}", version),
+                        "jcode will restart automatically when the update is ready.",
+                    ),
+                );
+            }
+            UpdateStatus::Installing { version } => {
+                self.background_client_action = Some(action);
+                self.set_status_notice(format!("Installing {}...", version));
+                self.set_client_maintenance_message(
+                    action,
+                    Self::client_maintenance_card_message(
+                        action,
+                        format!("installing {}", version),
+                        "jcode will restart automatically when the update is ready.",
+                    ),
+                );
+            }
+            UpdateStatus::Installed { version } => {
+                self.background_client_action = None;
+                self.set_status_notice(format!("Updated to {}; restarting...", version));
+                self.set_client_maintenance_message(
+                    action,
+                    Self::client_maintenance_card_message(
+                        action,
+                        format!("updated to {}", version),
+                        "Restarting now.",
+                    ),
+                );
+            }
+            UpdateStatus::UpToDate => {
+                if self.background_client_action == Some(action) {
+                    self.background_client_action = None;
+                }
+                self.pending_background_client_reload = None;
+                self.remove_client_maintenance_message(action);
+            }
+            UpdateStatus::Error(error) => {
+                self.background_client_action = None;
+                self.pending_background_client_reload = None;
+                self.set_status_notice("Update failed; continuing current version");
+                self.set_client_maintenance_message(
+                    action,
+                    Self::client_maintenance_card_message(
+                        action,
+                        "failed",
+                        format!("{}\n\nContinuing with the current version.", error),
+                    ),
+                );
             }
         }
     }

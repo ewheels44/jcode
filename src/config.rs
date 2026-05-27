@@ -12,7 +12,7 @@ pub use jcode_config_types::{
     SessionPickerResumeAction, SwarmSpawnMode, UpdateChannel, WebSearchConfig, WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
@@ -44,6 +44,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_BING_MARKET",
     "JCODE_CENTERED_TOGGLE_KEY",
     "JCODE_CHAT_NATIVE_SCROLLBAR",
+    "JCODE_COPY_BADGE_ALT_LABEL",
     "JCODE_COPILOT_PREMIUM",
     "JCODE_CROSS_PROVIDER_FAILOVER",
     "JCODE_DEBUG_SOCKET",
@@ -53,7 +54,9 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DICTATION_TIMEOUT_SECS",
     "JCODE_DIFF_LINE_WRAP",
     "JCODE_DIFF_MODE",
+    "JCODE_DISABLE_BASE_TOOLS",
     "JCODE_DISABLED_ANIMATIONS",
+    "JCODE_DISABLED_TOOLS",
     "JCODE_DISCORD_BOT_TOKEN",
     "JCODE_DISCORD_BOT_USER_ID",
     "JCODE_DISCORD_CHANNEL_ID",
@@ -71,6 +74,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_IMAP_HOST",
     "JCODE_MARKDOWN_SPACING",
     "JCODE_MEMORY_ENABLED",
+    "JCODE_PERSIST_MEMORY_INJECTIONS",
     "JCODE_MESSAGE_TIMESTAMPS",
     "JCODE_MODEL",
     "JCODE_MODEL_SWITCH_KEY",
@@ -83,6 +87,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_OPENAI_REASONING_EFFORT",
     "JCODE_OPENAI_SERVICE_TIER",
     "JCODE_OPENAI_TRANSPORT",
+    "JCODE_ANTHROPIC_REASONING_EFFORT",
+    "JCODE_PRESERVE_REASONING_CONTEXT",
     "JCODE_PERFORMANCE",
     "JCODE_PIN_IMAGES",
     "JCODE_PROVIDER",
@@ -107,6 +113,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_TELEGRAM_BOT_TOKEN",
     "JCODE_TELEGRAM_CHAT_ID",
     "JCODE_TELEGRAM_REPLY_ENABLED",
+    "JCODE_TOOL_PROFILE",
+    "JCODE_TOOLS",
     "JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES",
     "JCODE_UPDATE_CHANNEL",
     "JCODE_WEBSEARCH_ENGINE",
@@ -335,6 +343,12 @@ pub struct Config {
     /// Web search tool configuration
     pub websearch: WebSearchConfig,
 
+    /// Built-in tool exposure configuration
+    pub tools: ToolConfig,
+
+    /// Agent Client Protocol adapter configuration
+    pub acp: AcpConfig,
+
     /// Auth trust / consent configuration
     pub auth: AuthConfig,
 
@@ -370,6 +384,172 @@ pub struct Config {
 
     /// Auto-judge configuration
     pub autojudge: AutoJudgeConfig,
+}
+
+/// Agent Client Protocol adapter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AcpConfig {
+    /// Client compatibility profile: "standard" (default), "extended", or "full".
+    pub profile: String,
+    /// Tool profile to request when `jcode acp` starts a daemon itself.
+    pub tool_profile: String,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            profile: "standard".to_string(),
+            tool_profile: "acp".to_string(),
+        }
+    }
+}
+
+/// Controls which tools are sent to the model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ToolConfig {
+    /// Tool profile: "full" (default), "acp", "minimal"/"lite", or "none".
+    pub profile: String,
+    /// Explicit allow-list. When set, only these tools are exposed.
+    /// Use "*" or "all" to expose all tools, including default-disabled tools.
+    pub enabled: Vec<String>,
+    /// Tools to remove after applying profile/enabled.
+    pub disabled: Vec<String>,
+    /// Disable all built-in tools unless `enabled` is provided.
+    pub disable_base_tools: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSelection {
+    pub allowed_tools: Option<HashSet<String>>,
+    pub disabled_tools: HashSet<String>,
+}
+
+impl ToolConfig {
+    const DEFAULT_DISABLED_TOOLS: &'static [&'static str] = &["gmail", "lsp"];
+
+    pub fn selection(&self) -> ToolSelection {
+        let mut allowed_tools = self.base_allowed_tools();
+        let (explicit_enabled, enables_all_tools) = self.normalized_enabled_tools();
+        let mut disabled_tools: HashSet<String> = self
+            .disabled
+            .iter()
+            .map(|name| normalize_tool_name(name))
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        for name in Self::DEFAULT_DISABLED_TOOLS {
+            let normalized = normalize_tool_name(name);
+            if !enables_all_tools && !explicit_enabled.contains(&normalized) {
+                disabled_tools.insert(normalized);
+            }
+        }
+
+        if let Some(allowed) = allowed_tools.as_mut() {
+            for name in &disabled_tools {
+                allowed.remove(name);
+            }
+        }
+
+        ToolSelection {
+            allowed_tools,
+            disabled_tools,
+        }
+    }
+
+    pub fn allowed_tools(&self) -> Option<HashSet<String>> {
+        self.selection().allowed_tools
+    }
+
+    pub fn apply_to_allowed_set(&self, allowed: &mut HashSet<String>) {
+        let selection = self.selection();
+        if let Some(global_allowed) = selection.allowed_tools {
+            allowed.retain(|name| global_allowed.contains(name));
+        }
+        for disabled in selection.disabled_tools {
+            allowed.remove(&disabled);
+        }
+    }
+
+    fn base_allowed_tools(&self) -> Option<HashSet<String>> {
+        let (explicit, enables_all_tools) = self.normalized_enabled_tools();
+
+        let profile = self.profile.trim().to_ascii_lowercase();
+        if enables_all_tools {
+            None
+        } else if !explicit.is_empty() {
+            Some(explicit)
+        } else if self.disable_base_tools || matches!(profile.as_str(), "none" | "off" | "disabled")
+        {
+            Some(HashSet::new())
+        } else if matches!(profile.as_str(), "acp") {
+            Some(
+                [
+                    "bash",
+                    "read",
+                    "write",
+                    "edit",
+                    "multiedit",
+                    "apply_patch",
+                    "patch",
+                    "agentgrep",
+                    "glob",
+                    "grep",
+                    "ls",
+                    "batch",
+                ]
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect(),
+            )
+        } else if matches!(profile.as_str(), "minimal" | "lite" | "small") {
+            Some(
+                [
+                    "bash",
+                    "read",
+                    "write",
+                    "edit",
+                    "multiedit",
+                    "apply_patch",
+                    "patch",
+                    "agentgrep",
+                    "glob",
+                    "grep",
+                    "ls",
+                ]
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn normalized_enabled_tools(&self) -> (HashSet<String>, bool) {
+        let mut enabled = HashSet::new();
+        let mut enables_all_tools = false;
+
+        for name in &self.enabled {
+            let normalized = normalize_tool_name(name);
+            if normalized.is_empty() {
+                continue;
+            }
+            if normalized == "*" || normalized.eq_ignore_ascii_case("all") {
+                enables_all_tools = true;
+            } else {
+                enabled.insert(normalized);
+            }
+        }
+
+        (enabled, enables_all_tools)
+    }
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    let trimmed = name.trim().trim_matches('"');
+    crate::tool::Registry::resolve_tool_name(trimmed).to_string()
 }
 
 /// External dictation / speech-to-text integration.

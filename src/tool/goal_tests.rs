@@ -2,7 +2,7 @@ use super::*;
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
-async fn goal_tool_create_and_resume_round_trip() {
+async fn initiative_tool_create_and_resume_round_trip() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("repo");
@@ -10,7 +10,7 @@ async fn goal_tool_create_and_resume_round_trip() {
     let prev_home = std::env::var_os("JCODE_HOME");
     crate::env::set_var("JCODE_HOME", temp.path());
 
-    let tool = GoalTool::new();
+    let tool = InitiativeTool::new();
     let ctx = ToolContext {
         session_id: "ses_goal_tool".to_string(),
         message_id: "msg1".to_string(),
@@ -35,7 +35,7 @@ async fn goal_tool_create_and_resume_round_trip() {
         )
         .await
         .expect("create goal");
-    assert!(create.output.contains("Created goal"));
+    assert!(create.output.contains("Created initiative"));
 
     let update = timeout(Duration::from_secs(1), bus_rx.recv())
         .await
@@ -61,7 +61,7 @@ async fn goal_tool_create_and_resume_round_trip() {
         .execute(json!({"action": "resume"}), ctx)
         .await
         .expect("resume goal");
-    assert!(resume.output.contains("Resumed goal"));
+    assert!(resume.output.contains("Resumed initiative"));
     assert!(resume.output.contains("finish reconnect flow"));
 
     if let Some(prev_home) = prev_home {
@@ -72,7 +72,7 @@ async fn goal_tool_create_and_resume_round_trip() {
 }
 
 #[tokio::test]
-async fn goal_tool_list_opens_goals_overview_by_default() {
+async fn initiative_tool_list_opens_goals_overview_by_default() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("repo");
@@ -90,7 +90,7 @@ async fn goal_tool_list_opens_goals_overview_by_default() {
     )
     .expect("create goal");
 
-    let tool = GoalTool::new();
+    let tool = InitiativeTool::new();
     let ctx = ToolContext {
         session_id: "ses_goal_list".to_string(),
         message_id: "msg1".to_string(),
@@ -119,7 +119,7 @@ async fn goal_tool_list_opens_goals_overview_by_default() {
 }
 
 #[tokio::test]
-async fn goal_tool_update_refreshes_open_overview_without_stealing_focus() {
+async fn initiative_tool_update_refreshes_open_overview_without_stealing_focus() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("repo");
@@ -138,7 +138,7 @@ async fn goal_tool_update_refreshes_open_overview_without_stealing_focus() {
     )
     .expect("create goal");
 
-    let tool = GoalTool::new();
+    let tool = InitiativeTool::new();
     let ctx = ToolContext {
         session_id: "ses_goal_update".to_string(),
         message_id: "msg1".to_string(),
@@ -182,8 +182,8 @@ async fn goal_tool_update_refreshes_open_overview_without_stealing_focus() {
 }
 
 #[test]
-fn test_goal_schema_milestones_define_items() {
-    let schema = GoalTool::new().parameters_schema();
+fn test_initiative_schema_milestones_define_items() {
+    let schema = InitiativeTool::new().parameters_schema();
     let milestone_items = &schema["properties"]["milestones"]["items"];
 
     assert_eq!(milestone_items["type"], "object");
@@ -196,14 +196,14 @@ fn test_goal_schema_milestones_define_items() {
 }
 
 #[test]
-fn test_goal_schema_omits_display_override() {
-    let schema = GoalTool::new().parameters_schema();
+fn test_initiative_schema_omits_display_override() {
+    let schema = InitiativeTool::new().parameters_schema();
     assert!(schema["properties"]["display"].is_null());
 }
 
 #[test]
-fn test_goal_schema_omits_public_enums_for_scope_and_status() {
-    let schema = GoalTool::new().parameters_schema();
+fn test_initiative_schema_omits_public_enums_for_scope_and_status() {
+    let schema = InitiativeTool::new().parameters_schema();
     assert!(schema["properties"]["scope"]["enum"].is_null());
     assert!(schema["properties"]["status"]["enum"].is_null());
 }

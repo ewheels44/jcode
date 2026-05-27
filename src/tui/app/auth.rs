@@ -203,6 +203,9 @@ impl App {
             }
             crate::provider_catalog::LoginProviderTarget::Jcode => self.start_jcode_login(),
             crate::provider_catalog::LoginProviderTarget::Claude => self.start_claude_login(),
+            crate::provider_catalog::LoginProviderTarget::ClaudeApiKey => {
+                self.start_anthropic_api_key_login()
+            }
             crate::provider_catalog::LoginProviderTarget::OpenAi => self.start_openai_login(),
             crate::provider_catalog::LoginProviderTarget::OpenAiApiKey => {
                 self.start_openai_api_key_login()
@@ -825,6 +828,19 @@ impl App {
             "OPENAI_API_KEY",
             Some("gpt-5.5"),
             Some("https://api.openai.com/v1"),
+            false,
+            None,
+        );
+    }
+
+    fn start_anthropic_api_key_login(&mut self) {
+        self.start_api_key_login(
+            "Anthropic API",
+            "https://console.anthropic.com/settings/keys",
+            "anthropic.env",
+            "ANTHROPIC_API_KEY",
+            Some("claude-sonnet-4-5-20250929"),
+            Some("https://api.anthropic.com"),
             false,
             None,
         );
@@ -2165,28 +2181,6 @@ impl App {
         }
         if self.pending_login.is_some() {
             self.pending_login = None;
-        }
-    }
-
-    pub(super) fn handle_update_status(&mut self, status: crate::bus::UpdateStatus) {
-        use crate::bus::UpdateStatus;
-        match status {
-            UpdateStatus::Checking => {
-                self.set_status_notice("Checking for updates...");
-            }
-            UpdateStatus::Available { current, latest } => {
-                self.set_status_notice(format!("Update available: {} → {}", current, latest));
-            }
-            UpdateStatus::Downloading { version } => {
-                self.set_status_notice(format!("⬇️  Downloading {}...", version));
-            }
-            UpdateStatus::Installed { version } => {
-                self.set_status_notice(format!("✅ Updated to {} — restarting", version));
-            }
-            UpdateStatus::UpToDate => {}
-            UpdateStatus::Error(e) => {
-                self.set_status_notice(format!("Update failed: {}", e));
-            }
         }
     }
 

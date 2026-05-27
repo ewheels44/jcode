@@ -84,6 +84,36 @@ impl Config {
             self.dictation.timeout_secs = parsed;
         }
 
+        // Tools
+        if let Ok(v) = std::env::var("JCODE_TOOL_PROFILE") {
+            self.tools.profile = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_TOOLS") {
+            self.tools.enabled = parse_env_list(&v);
+        }
+        if let Ok(v) = std::env::var("JCODE_DISABLED_TOOLS") {
+            self.tools.disabled = parse_env_list(&v);
+        }
+        if let Ok(v) = std::env::var("JCODE_DISABLE_BASE_TOOLS")
+            && let Some(parsed) = parse_env_bool(&v)
+        {
+            self.tools.disable_base_tools = parsed;
+        }
+
+        // ACP adapter
+        if let Ok(v) = std::env::var("JCODE_ACP_PROFILE") {
+            let trimmed = v.trim().to_ascii_lowercase();
+            if matches!(trimmed.as_str(), "standard" | "extended" | "full") {
+                self.acp.profile = trimmed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_ACP_TOOL_PROFILE") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.acp.tool_profile = trimmed.to_string();
+            }
+        }
+
         // Display
         if let Ok(v) = std::env::var("JCODE_DIFF_MODE") {
             match v.to_lowercase().as_str() {
@@ -184,6 +214,9 @@ impl Config {
                 self.display.redraw_fps = fps.clamp(1, 120);
             }
         }
+        if let Ok(v) = std::env::var("JCODE_COPY_BADGE_ALT_LABEL") {
+            self.display.copy_badge_alt_label = v;
+        }
         if let Ok(v) = std::env::var("JCODE_CHAT_NATIVE_SCROLLBAR") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.native_scrollbars.chat = parsed;
@@ -209,6 +242,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_MESSAGE_TIMESTAMPS") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.features.message_timestamps = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_PERSIST_MEMORY_INJECTIONS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.persist_memory_injections = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_UPDATE_CHANNEL") {
@@ -419,6 +457,12 @@ impl Config {
                 self.provider.openai_reasoning_effort = Some(trimmed);
             }
         }
+        if let Ok(v) = std::env::var("JCODE_ANTHROPIC_REASONING_EFFORT") {
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                self.provider.anthropic_reasoning_effort = Some(trimmed);
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_OPENAI_TRANSPORT") {
             let trimmed = v.trim().to_string();
             if !trimmed.is_empty() {
@@ -442,6 +486,11 @@ impl Config {
                 if parsed > 0 {
                     self.provider.openai_native_compaction_threshold_tokens = parsed;
                 }
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_PRESERVE_REASONING_CONTEXT") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.provider.preserve_reasoning_context = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_CROSS_PROVIDER_FAILOVER") {

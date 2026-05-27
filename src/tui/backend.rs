@@ -237,6 +237,7 @@ pub struct RemoteConnection {
 }
 
 const DETACHED_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_STRAY_REMOTE_PROTOCOL_LINES: usize = 32;
 
 pub(crate) trait RemoteEventState {
     fn handle_tool_start(&mut self, id: &str, name: &str);
@@ -325,6 +326,16 @@ impl RemoteConnection {
         } else {
             bootstrap_request = "subscribe_resume";
         }
+        // The initial History payload intentionally omits expanded model-route
+        // metadata to keep attach/resume fast. Request it immediately as a
+        // follow-up so `/model` does not have to render the lightweight
+        // `remote-catalog` fallback indefinitely.
+        conn.send_request(Request::GetModelCatalog {
+            id: conn.next_request_id,
+        })
+        .await?;
+        conn.next_request_id += 1;
+
         let bootstrap_request_ms = bootstrap_request_start.elapsed().as_millis();
 
         crate::logging::info(&format!(
@@ -640,6 +651,7 @@ impl RemoteConnection {
         let request = Request::SetReasoningEffort {
             id: self.next_request_id,
             effort: effort.to_string(),
+            target_session_id: None,
         };
         self.next_request_id += 1;
         self.send_request(request).await
@@ -886,6 +898,7 @@ impl RemoteConnection {
 
     /// Read the next event from the server.
     pub async fn next_event(&mut self) -> RemoteRead {
+        let mut stray_lines = 0usize;
         loop {
             self.line_buffer.clear();
             match self.reader.read_line(&mut self.line_buffer).await {
@@ -897,11 +910,30 @@ impl RemoteConnection {
                     return RemoteRead::Disconnected(RemoteDisconnectReason::PeerClosed);
                 }
                 Ok(_) => {
-                    if self.line_buffer.trim().is_empty() {
+                    let trimmed = self.line_buffer.trim_start();
+                    if trimmed.trim().is_empty() {
                         crate::logging::warn(&format!(
                             "RemoteConnection::next_event: skipping blank line (session_id={:?}, client_instance_id={:?})",
                             self.session_id, self.client_instance_id
                         ));
+                        continue;
+                    }
+                    if !trimmed.starts_with('{') {
+                        stray_lines += 1;
+                        let preview: String = self.line_buffer.chars().take(240).collect();
+                        crate::logging::warn(&format!(
+                            "RemoteConnection::next_event: skipping stray non-JSON protocol line {}/{} preview={:?} (session_id={:?}, client_instance_id={:?})",
+                            stray_lines,
+                            MAX_STRAY_REMOTE_PROTOCOL_LINES,
+                            preview,
+                            self.session_id,
+                            self.client_instance_id
+                        ));
+                        if stray_lines >= MAX_STRAY_REMOTE_PROTOCOL_LINES {
+                            return RemoteRead::Disconnected(RemoteDisconnectReason::Protocol(
+                                "too many stray non-JSON protocol lines".to_string(),
+                            ));
+                        }
                         continue;
                     }
                     match serde_json::from_str(&self.line_buffer) {
@@ -1152,6 +1184,30 @@ mod tests {
                 auth: None,
             } if provider == "azure-openai"
         ));
+    }
+
+    #[tokio::test]
+    async fn next_event_skips_stray_non_json_lines_before_valid_event() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote
+            ._dummy_peer
+            .take()
+            .expect("dummy remote should retain peer stream");
+        let (_reader, mut writer) = peer.into_split();
+
+        writer
+            .write_all(b"raw tool output leaked onto protocol\n")
+            .await
+            .expect("stray line should write");
+        writer
+            .write_all(crate::protocol::encode_event(&ServerEvent::Done { id: 7 }).as_bytes())
+            .await
+            .expect("valid event should write");
+
+        match remote.next_event().await {
+            RemoteRead::Event(ServerEvent::Done { id }) => assert_eq!(id, 7),
+            other => panic!("expected Done event after stray line, got {other:?}"),
+        }
     }
 
     #[tokio::test]

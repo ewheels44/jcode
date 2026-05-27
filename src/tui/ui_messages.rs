@@ -10,6 +10,8 @@ use cache_support::{centered_wrap_width, left_pad_lines_for_centered_mode};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
+const MAX_INLINE_DIFF_LINES: usize = 12;
+
 fn prefer_width_stable_system_glyphs() -> bool {
     std::env::var("TERM_PROGRAM")
         .ok()
@@ -1218,7 +1220,13 @@ fn render_background_task_progress_message(
         &progress.tool_name,
         progress.display_name.as_deref(),
     );
-    let title = format!("◌ bg {} · {}", task_label, progress.task_id);
+    let is_model_refresh =
+        progress.task_id == "refresh-model-list" && progress.tool_name == "catalog";
+    let title = if is_model_refresh {
+        format!("◌ model refresh · {}", task_label)
+    } else {
+        format!("◌ bg {} · {}", task_label, progress.task_id)
+    };
 
     let mut box_content = vec![render_compact_progress_line(
         progress,
@@ -1228,14 +1236,16 @@ fn render_background_task_progress_message(
         label_style,
         text_style,
     )];
-    let hint = format!(
-        "Latest status: bg action=\"status\" task_id=\"{}\"",
-        progress.task_id
-    );
-    box_content.push(super::truncate_line_with_ellipsis_to_width(
-        &Line::from(Span::styled(hint, label_style)),
-        inner_width,
-    ));
+    if !is_model_refresh {
+        let hint = format!(
+            "Latest status: bg action=\"status\" task_id=\"{}\"",
+            progress.task_id
+        );
+        box_content.push(super::truncate_line_with_ellipsis_to_width(
+            &Line::from(Span::styled(hint, label_style)),
+            inner_width,
+        ));
+    }
 
     let mut lines = render_rounded_box(&title, box_content, max_box_width, border_style);
     if centered {
@@ -1333,6 +1343,32 @@ pub(crate) fn render_swarm_message(
     }
 
     wrapped_lines
+}
+
+pub(super) fn edit_tool_inline_diff_is_expandable(
+    tc: &ToolCall,
+    content: &str,
+    width: u16,
+) -> bool {
+    let change_lines = {
+        let from_content = collect_diff_lines(content);
+        if !from_content.is_empty() {
+            from_content
+        } else {
+            generate_diff_lines_from_tool_input(tc)
+        }
+    };
+    if change_lines.len() > MAX_INLINE_DIFF_LINES {
+        return true;
+    }
+
+    change_lines.iter().any(|line| {
+        let border_prefix_width = unicode_width::UnicodeWidthStr::width("│ ")
+            + unicode_width::UnicodeWidthStr::width(line.prefix.as_str());
+        let max_content_width = (width as usize).saturating_sub(border_prefix_width + 1);
+        max_content_width > 1
+            && unicode_width::UnicodeWidthStr::width(line.content.as_str()) > max_content_width
+    })
 }
 
 pub(crate) fn render_tool_message(
@@ -1677,7 +1713,7 @@ pub(crate) fn render_tool_message(
             }
         };
 
-        const MAX_DIFF_LINES: usize = 12;
+        const MAX_DIFF_LINES: usize = MAX_INLINE_DIFF_LINES;
         let total_changes = change_lines.len();
         let additions = change_lines
             .iter()

@@ -71,11 +71,12 @@ impl Agent {
                 ));
             }
 
-            let cache_signature_messages = if crate::config::config().features.message_timestamps {
-                Message::with_timestamps(&messages)
-            } else {
-                messages.clone()
-            };
+            let mut cache_signature_messages =
+                if crate::config::config().features.message_timestamps {
+                    Message::with_timestamps(&messages)
+                } else {
+                    messages.clone()
+                };
             let mut ephemeral_signature_messages = Vec::new();
 
             // Inject memory as a user message at the end (preserves cache prefix)
@@ -96,11 +97,12 @@ impl Agent {
                     prompt_chars: memory.prompt.chars().count(),
                     computed_age_ms,
                 });
-                let memory_msg = Message::user(&format!(
-                    "<system-reminder>\n{}\n</system-reminder>",
-                    memory.prompt
-                ));
-                ephemeral_signature_messages.push(memory_msg.clone());
+                let (memory_msg, persisted) = self.prepare_memory_injection_message(memory);
+                if !persisted {
+                    ephemeral_signature_messages.push(memory_msg.clone());
+                } else {
+                    cache_signature_messages.push(memory_msg.clone());
+                }
                 messages_with_memory.push(memory_msg);
             }
 
@@ -206,8 +208,12 @@ impl Agent {
             let mut stop_reason: Option<String> = None;
             let mut sdk_tool_results: std::collections::HashMap<String, (String, bool)> =
                 std::collections::HashMap::new();
-            let store_reasoning_content = self.provider.name() == "openrouter";
+            let provider_name = self.provider.name().to_string();
+            let store_reasoning_content =
+                crate::provider::stores_reasoning_content_for_context(&provider_name);
             let mut reasoning_content = String::new();
+            let mut reasoning_signature = String::new();
+            let mut openai_reasoning_items: Vec<ContentBlock> = Vec::new();
             let mut openai_native_compaction: Option<(String, usize)> = None;
             // Track tool_use_id -> name for tool results
             let mut tool_id_to_name: std::collections::HashMap<String, String> =
@@ -297,6 +303,11 @@ impl Agent {
 
                 match event {
                     StreamEvent::ThinkingStart | StreamEvent::ThinkingEnd => {}
+                    StreamEvent::ThinkingSignatureDelta(signature) => {
+                        if store_reasoning_content {
+                            reasoning_signature.push_str(&signature);
+                        }
+                    }
                     StreamEvent::ThinkingDelta(thinking_text) => {
                         // Only send thinking content if enabled in config
                         if crate::config::config().display.show_thinking {
@@ -483,6 +494,21 @@ impl Agent {
                         self.provider_session_id = Some(sid.clone());
                         self.session.provider_session_id = Some(sid.clone());
                         let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
+                    }
+                    StreamEvent::OpenAIReasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                        status,
+                    } => {
+                        if store_reasoning_content {
+                            openai_reasoning_items.push(ContentBlock::OpenAIReasoning {
+                                id,
+                                summary,
+                                encrypted_content,
+                                status,
+                            });
+                        }
                     }
                     StreamEvent::Compaction {
                         openai_encrypted_content,
@@ -688,10 +714,14 @@ impl Agent {
                     cache_control: None,
                 });
             }
-            if store_reasoning_content && !reasoning_content.is_empty() {
-                content_blocks.push(ContentBlock::Reasoning {
-                    text: reasoning_content.clone(),
-                });
+            if store_reasoning_content {
+                crate::message::push_reasoning_content_block(
+                    &mut content_blocks,
+                    &provider_name,
+                    &reasoning_content,
+                    Some(&reasoning_signature),
+                );
+                content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
                 content_blocks.push(ContentBlock::ToolUse {

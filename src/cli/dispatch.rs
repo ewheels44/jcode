@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-    commands, debug, hot_exec, login, output, provider_init, selfdev, terminal, tui_launch,
+    acp, commands, debug, hot_exec, login, output, provider_init, selfdev, terminal, tui_launch,
 };
 use provider_init::ProviderChoice;
 
@@ -31,6 +31,26 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", profile_name);
         crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
         args.provider = ProviderChoice::OpenaiCompatible;
+    }
+
+    if let Some(tool_profile) = args.tool_profile.as_deref() {
+        crate::env::set_var("JCODE_TOOL_PROFILE", tool_profile);
+    }
+    if let Some(tools) = args.tools.as_deref() {
+        crate::env::set_var("JCODE_TOOLS", tools);
+    }
+    if let Some(disabled_tools) = args.disabled_tools.as_deref() {
+        crate::env::set_var("JCODE_DISABLED_TOOLS", disabled_tools);
+    }
+    if args.disable_base_tools {
+        crate::env::set_var("JCODE_DISABLE_BASE_TOOLS", "1");
+    }
+    if args.tool_profile.is_some()
+        || args.tools.is_some()
+        || args.disabled_tools.is_some()
+        || args.disable_base_tools
+    {
+        crate::config::invalidate_config_cache();
     }
 
     match args.command {
@@ -59,6 +79,15 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             ));
             server.run().await?;
         }
+        Some(Command::Acp) => {
+            acp::run_acp_command(
+                args.provider,
+                args.model.clone(),
+                args.provider_profile.clone(),
+                args.tool_profile.is_some(),
+            )
+            .await?;
+        }
         Some(Command::Connect) => {
             tui_launch::run_client().await?;
         }
@@ -78,6 +107,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             .await?;
         }
         Some(Command::Login {
+            provider: login_provider,
             account,
             no_browser,
             print_auth_url,
@@ -92,7 +122,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             api_key_env,
         }) => {
             login::run_login(
-                &args.provider,
+                &login_provider.unwrap_or(args.provider),
                 account.as_deref(),
                 login::LoginOptions {
                     no_browser,
@@ -286,6 +316,40 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     .await?;
             }
         },
+        Some(Command::ProviderTestCoverage {
+            provider_query,
+            model_query,
+            coverage_file,
+            coverage_limit,
+        }) => {
+            let coverage_path = coverage_file.as_deref().map(std::path::Path::new);
+            if let Some(provider) = provider_query {
+                let model = model_query
+                    .or_else(|| args.model.clone())
+                    .unwrap_or_else(|| "*".to_string());
+                print!(
+                    "{}",
+                    crate::live_tests::format_provider_test_coverage_report(
+                        &provider,
+                        &model,
+                        coverage_path,
+                    )
+                );
+            } else {
+                let (coverage, path) = crate::live_tests::load_coverage(coverage_path)?;
+                let summary = crate::live_tests::strict_live_provider_model_coverage_summary(
+                    &coverage,
+                    path.display().to_string(),
+                );
+                print!(
+                    "{}",
+                    crate::live_tests::format_strict_live_provider_model_coverage_summary(
+                        &summary,
+                        coverage_limit,
+                    )
+                );
+            }
+        }
         Some(Command::AuthTest {
             login,
             all_configured,
@@ -295,6 +359,7 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             json,
             output,
             coverage,
+            context_audit,
             coverage_file,
             coverage_limit,
         }) => {
@@ -305,6 +370,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                     coverage_file.as_deref(),
                     coverage_limit,
                 )?;
+            } else if context_audit {
+                commands::run_auth_test_context_audit_command(
+                    &args.provider,
+                    all_configured,
+                    json,
+                    output.as_deref(),
+                )
+                .await?;
             } else {
                 commands::run_auth_test_command(
                     &args.provider,
@@ -428,8 +501,13 @@ async fn run_default_command(args: Args) -> Result<()> {
     let explicit_provider_or_model = args.provider != ProviderChoice::Auto
         || args.model.is_some()
         || args.provider_profile.is_some();
+    let explicit_tool_options = args.tool_profile.is_some()
+        || args.tools.is_some()
+        || args.disabled_tools.is_some()
+        || args.disable_base_tools;
     if args.resume.is_none()
         && !explicit_provider_or_model
+        && !explicit_tool_options
         && commands::maybe_run_pending_restart_restore_on_startup().await?
     {
         return Ok(());
@@ -494,6 +572,12 @@ async fn run_default_command(args: Args) -> Result<()> {
                 .map(|m| format!(" --model {}", m))
                 .unwrap_or_default()
         ));
+    }
+
+    if server_running && explicit_tool_options {
+        output::stderr_info(
+            "Server already running; tool flags only apply when starting a new server. Restart server or edit [tools] in config.toml to change the active toolset.",
+        );
     }
 
     if !server_running {

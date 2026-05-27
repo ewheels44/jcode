@@ -286,6 +286,9 @@ impl Agent {
         }
 
         let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
+        if !self.disabled_tools.is_empty() {
+            tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
+        }
         if !self.session.is_canary {
             tools.retain(|tool| tool.name != "selfdev");
         }
@@ -301,7 +304,11 @@ impl Agent {
     }
 
     pub async fn tool_names(&self) -> Vec<String> {
-        self.registry.tool_names().await
+        self.tool_definitions_for_debug()
+            .await
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
     }
 
     /// Get full tool definitions for debug introspection (bypasses lock)
@@ -310,6 +317,9 @@ impl Agent {
             self.registry.register_selfdev_tools().await;
         }
         let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
+        if !self.disabled_tools.is_empty() {
+            tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
+        }
         if !self.session.is_canary {
             tools.retain(|tool| tool.name != "selfdev");
         }
@@ -394,6 +404,9 @@ impl Agent {
         {
             return Err(anyhow::anyhow!("Tool '{}' is not allowed", name));
         }
+        if self.disabled_tools.contains(name) {
+            return Err(anyhow::anyhow!("Tool '{}' is disabled", name));
+        }
         Ok(())
     }
 
@@ -413,9 +426,16 @@ impl Agent {
         let previous_status = session.status.clone();
 
         let assign_start = Instant::now();
+        let previous_session_id = self.session.id.clone();
         // Restore provider_session_id for Claude CLI session resume
         self.provider_session_id = session.provider_session_id.clone();
         self.session = session;
+        crate::tool::clear_session_tool_policy(&previous_session_id);
+        crate::tool::set_session_tool_policy(
+            &self.session.id,
+            self.allowed_tools.clone(),
+            self.disabled_tools.clone(),
+        );
         let assign_ms = assign_start.elapsed().as_millis();
 
         let reset_start = Instant::now();
@@ -677,7 +697,9 @@ impl Agent {
                         };
                         transcript.push_str(&format!("[Result: {}]\n", preview));
                     }
-                    ContentBlock::Reasoning { .. } => {}
+                    ContentBlock::Reasoning { .. }
+                    | ContentBlock::AnthropicThinking { .. }
+                    | ContentBlock::OpenAIReasoning { .. } => {}
                     ContentBlock::Image { .. } => {
                         transcript.push_str("[Image]\n");
                     }

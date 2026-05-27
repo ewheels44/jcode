@@ -755,6 +755,21 @@ impl OpenRouterProvider {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
     }
 
+    fn profile_supports_unified_reasoning(
+        profile_id: Option<&str>,
+        send_openrouter_headers: bool,
+    ) -> bool {
+        profile_id.is_none() && send_openrouter_headers
+    }
+
+    fn supports_reasoning_effort_for_profile(
+        profile_id: Option<&str>,
+        send_openrouter_headers: bool,
+    ) -> bool {
+        Self::profile_supports_reasoning_effort(profile_id)
+            || Self::profile_supports_unified_reasoning(profile_id, send_openrouter_headers)
+    }
+
     fn normalize_reasoning_effort(raw: &str) -> Option<String> {
         let value = raw.trim().to_ascii_lowercase();
         if value.is_empty() {
@@ -771,6 +786,35 @@ impl OpenRouterProvider {
                 ));
                 Some("max".to_string())
             }
+        }
+    }
+
+    fn normalize_unified_reasoning_effort(raw: &str) -> Option<String> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return None;
+        }
+        match value.as_str() {
+            "none" | "low" | "medium" | "high" | "xhigh" => Some(value),
+            "max" => Some("xhigh".to_string()),
+            other => {
+                crate::logging::info(&format!(
+                    "Warning: Unsupported OpenRouter reasoning effort '{}'; expected none|low|medium|high|xhigh|max alias. Using 'xhigh'.",
+                    other
+                ));
+                Some("xhigh".to_string())
+            }
+        }
+    }
+
+    fn normalize_reasoning_effort_for_profile(
+        profile_id: Option<&str>,
+        effort: &str,
+    ) -> Option<String> {
+        if Self::profile_supports_reasoning_effort(profile_id) {
+            Self::normalize_reasoning_effort(effort)
+        } else {
+            Self::normalize_unified_reasoning_effort(effort)
         }
     }
 

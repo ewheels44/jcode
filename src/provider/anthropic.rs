@@ -409,6 +409,7 @@ struct CachedCredentials {
 pub struct AnthropicProvider {
     client: Client,
     model: Arc<std::sync::RwLock<String>>,
+    reasoning_effort: Arc<std::sync::RwLock<Option<String>>>,
     /// Cached OAuth credentials (None if using API key)
     credentials: Arc<RwLock<Option<CachedCredentials>>>,
     max_tokens: u32,
@@ -442,15 +443,140 @@ impl AnthropicProvider {
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(DEFAULT_MAX_TOKENS);
+        let reasoning_effort = crate::config::config()
+            .provider
+            .anthropic_reasoning_effort
+            .as_deref()
+            .and_then(Self::normalize_reasoning_effort)
+            .map(|effort| Self::actual_effort_for_model(&model, &effort));
 
         Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(std::sync::RwLock::new(model)),
+            reasoning_effort: Arc::new(std::sync::RwLock::new(reasoning_effort)),
             credentials: Arc::new(RwLock::new(None)),
             max_tokens,
             oauth_session_id: Uuid::new_v4().to_string(),
             oauth_preflight_done: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn normalized_model_key(model: &str) -> String {
+        strip_1m_suffix(model).trim().to_ascii_lowercase()
+    }
+
+    fn model_supports_output_effort(model: &str) -> bool {
+        let model = Self::normalized_model_key(model);
+        model.contains("claude-mythos")
+            || model.contains("claude-opus-4-7")
+            || model.contains("claude-opus-4-6")
+            || model.contains("claude-sonnet-4-6")
+            || model.contains("claude-opus-4-5")
+    }
+
+    fn model_supports_adaptive_thinking(model: &str) -> bool {
+        let model = Self::normalized_model_key(model);
+        model.contains("claude-mythos")
+            || model.contains("claude-opus-4-7")
+            || model.contains("claude-opus-4-6")
+            || model.contains("claude-sonnet-4-6")
+    }
+
+    fn model_supports_manual_thinking(model: &str) -> bool {
+        let model = Self::normalized_model_key(model);
+        model.contains("claude-opus-4-5")
+            || model.contains("claude-3-7-sonnet")
+            || model.contains("claude-sonnet-3-7")
+    }
+
+    fn model_supports_xhigh_effort(model: &str) -> bool {
+        Self::normalized_model_key(model).contains("claude-opus-4-7")
+    }
+
+    fn model_supports_reasoning_effort(model: &str) -> bool {
+        Self::model_supports_output_effort(model) || Self::model_supports_manual_thinking(model)
+    }
+
+    fn normalize_reasoning_effort(raw: &str) -> Option<String> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value.is_empty() || matches!(value.as_str(), "default" | "auto") {
+            return None;
+        }
+        match value.as_str() {
+            "off" | "disabled" => Some("none".to_string()),
+            "none" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
+            other => {
+                crate::logging::info(&format!(
+                    "Warning: Unsupported Anthropic reasoning effort '{}'; expected none|low|medium|high|xhigh|max alias. Using the model maximum.",
+                    other
+                ));
+                Some("max".to_string())
+            }
+        }
+    }
+
+    fn actual_effort_for_model(model: &str, effort: &str) -> String {
+        if effort == "max" {
+            if Self::model_supports_xhigh_effort(model) {
+                "xhigh".to_string()
+            } else {
+                "high".to_string()
+            }
+        } else if effort == "xhigh" && !Self::model_supports_xhigh_effort(model) {
+            "high".to_string()
+        } else {
+            effort.to_string()
+        }
+    }
+
+    fn manual_thinking_budget(effort: &str, max_tokens: u32) -> Option<u32> {
+        let desired = match effort {
+            "low" => 1_024,
+            "medium" => 4_096,
+            "high" => 8_192,
+            "xhigh" | "max" => 16_384,
+            _ => return None,
+        };
+        let budget = desired.min(max_tokens.saturating_sub(1));
+        (budget >= 1_024).then_some(budget)
+    }
+
+    fn build_reasoning_request_parts(
+        &self,
+        model: &str,
+        is_oauth: bool,
+    ) -> (Option<ApiThinking>, Option<ApiOutputConfig>, Option<f32>) {
+        let effort = self.reasoning_effort();
+        let effort = effort.as_deref().filter(|effort| *effort != "none");
+
+        let output_config = effort
+            .filter(|_| Self::model_supports_output_effort(model))
+            .map(|effort| ApiOutputConfig {
+                effort: Self::actual_effort_for_model(model, effort),
+            });
+
+        let thinking = effort.and_then(|effort| {
+            if Self::model_supports_adaptive_thinking(model) {
+                Some(ApiThinking::Adaptive {
+                    display: Some("summarized"),
+                })
+            } else if Self::model_supports_manual_thinking(model) {
+                Self::manual_thinking_budget(effort, self.max_tokens)
+                    .map(|budget_tokens| ApiThinking::Enabled { budget_tokens })
+            } else {
+                None
+            }
+        });
+
+        // Extended/adaptive thinking is incompatible with temperature. OAuth path
+        // normally mirrors Claude Code's temperature=1.0, so omit it when thinking is active.
+        let temperature = if is_oauth && thinking.is_none() {
+            Some(1.0)
+        } else {
+            None
+        };
+
+        (thinking, output_config, temperature)
     }
 
     /// Get the access token from credentials
@@ -704,6 +830,15 @@ impl AnthropicProvider {
                         cache_control: None,
                     });
                 }
+                ContentBlock::AnthropicThinking {
+                    thinking,
+                    signature,
+                } => {
+                    result.push(ApiContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    });
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     result.push(ApiContentBlock::ToolUse {
                         id: crate::message::sanitize_tool_id(id),
@@ -886,6 +1021,8 @@ fn log_anthropic_canonical_input(
         "system": system_value.as_ref(),
         "messages": messages_value,
         "tools": tools_value.as_ref(),
+        "thinking": &request.thinking,
+        "output_config": &request.output_config,
         "temperature": request.temperature,
     });
 
@@ -934,6 +1071,8 @@ impl Provider for AnthropicProvider {
         // Format request
         let api_messages = self.format_messages(messages, is_oauth);
         let api_tools = self.format_tools(tools, is_oauth);
+        let (thinking, output_config, temperature) =
+            self.build_reasoning_request_parts(&model, is_oauth);
 
         let request = ApiRequest {
             model: api_model,
@@ -950,7 +1089,9 @@ impl Provider for AnthropicProvider {
             } else {
                 None
             },
-            temperature: if is_oauth { Some(1.0) } else { None },
+            thinking,
+            output_config,
+            temperature,
             stream: true,
         };
 
@@ -1015,6 +1156,19 @@ impl Provider for AnthropicProvider {
             .model
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = model.to_string();
+        match self.reasoning_effort.write() {
+            Ok(mut guard) => {
+                if let Some(current) = guard.clone() {
+                    *guard = Some(Self::actual_effort_for_model(model, &current));
+                }
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                if let Some(current) = guard.clone() {
+                    *guard = Some(Self::actual_effort_for_model(model, &current));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1029,6 +1183,54 @@ impl Provider for AnthropicProvider {
 
     fn available_models_display(&self) -> Vec<String> {
         self.available_models_for_switching()
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        if !Self::model_supports_reasoning_effort(&self.model()) {
+            return None;
+        }
+        let effort = self
+            .reasoning_effort
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        Some(effort.unwrap_or_else(|| "none".to_string()))
+    }
+
+    fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
+        let normalized = Self::normalize_reasoning_effort(effort);
+        let model = self.model();
+        if normalized.is_some() && !Self::model_supports_reasoning_effort(&model) {
+            anyhow::bail!(
+                "Reasoning effort is only supported for Claude 3.7 reasoning models and Claude 4.5+ models that expose Anthropic thinking/output_config"
+            );
+        }
+        if normalized.as_deref() == Some("xhigh") && !Self::model_supports_xhigh_effort(&model) {
+            anyhow::bail!("Anthropic xhigh effort is only supported for Claude Opus 4.7 models");
+        }
+        let normalized = normalized.map(|effort| Self::actual_effort_for_model(&model, &effort));
+        match self.reasoning_effort.write() {
+            Ok(mut guard) => {
+                *guard = normalized;
+                Ok(())
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = normalized;
+                Ok(())
+            }
+        }
+    }
+
+    fn available_efforts(&self) -> Vec<&'static str> {
+        let model = self.model();
+        if !Self::model_supports_reasoning_effort(&model) {
+            return vec![];
+        }
+        if Self::model_supports_xhigh_effort(&model) {
+            vec!["none", "low", "medium", "high", "xhigh"]
+        } else {
+            vec!["none", "low", "medium", "high"]
+        }
     }
 
     async fn prefetch_models(&self) -> Result<()> {
@@ -1078,6 +1280,7 @@ impl Provider for AnthropicProvider {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone(),
             )),
+            reasoning_effort: Arc::new(std::sync::RwLock::new(self.reasoning_effort())),
             credentials: Arc::new(RwLock::new(None)),
             max_tokens: self.max_tokens,
             oauth_session_id: self.oauth_session_id.clone(),
@@ -1126,6 +1329,8 @@ impl Provider for AnthropicProvider {
         // Format request
         let api_messages = self.format_messages(messages, is_oauth);
         let api_tools = self.format_tools(tools, is_oauth);
+        let (thinking, output_config, temperature) =
+            self.build_reasoning_request_parts(&model, is_oauth);
 
         let request = ApiRequest {
             model: api_model,
@@ -1142,7 +1347,9 @@ impl Provider for AnthropicProvider {
             } else {
                 None
             },
-            temperature: if is_oauth { Some(1.0) } else { None },
+            thinking,
+            output_config,
+            temperature,
             stream: true,
         };
 
@@ -1402,23 +1609,29 @@ async fn stream_response(
         // 2. User-Agent matching Claude CLI
         // 3. Multiple beta headers
         // 4. ?beta=true query param (in URL above)
+        let beta_header = anthropic_beta_header_with_thinking(
+            oauth_beta_headers(model_name),
+            request.thinking.is_some(),
+        );
         req = apply_oauth_attribution_headers(
             req.header("Authorization", format!("Bearer {}", token))
                 .header("User-Agent", CLAUDE_CLI_USER_AGENT)
-                .header("anthropic-beta", oauth_beta_headers(model_name)),
+                .header("anthropic-beta", beta_header),
             oauth_session_id,
         );
     } else {
         // Direct API keys use x-api-key
         // Include prompt-caching beta header
-        req = req.header("x-api-key", &token).header(
-            "anthropic-beta",
-            if is_1m_model(model_name) {
-                "prompt-caching-2024-07-31,context-1m-2025-08-07"
-            } else {
-                "prompt-caching-2024-07-31"
-            },
-        );
+        let beta_header = if is_1m_model(model_name) {
+            "prompt-caching-2024-07-31,context-1m-2025-08-07"
+        } else {
+            "prompt-caching-2024-07-31"
+        };
+        let beta_header =
+            anthropic_beta_header_with_thinking(beta_header, request.thinking.is_some());
+        req = req
+            .header("x-api-key", &token)
+            .header("anthropic-beta", beta_header);
     }
 
     let response = req
@@ -1450,6 +1663,7 @@ async fn stream_response(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut current_tool_use: Option<ToolUseAccumulator> = None;
+    let mut current_thinking_block = false;
     let mut input_tokens: Option<u64> = None;
     let mut output_tokens: Option<u64> = None;
     let mut cache_read_input_tokens: Option<u64> = None;
@@ -1474,6 +1688,7 @@ async fn stream_response(
             let events = process_sse_event(
                 &event,
                 &mut current_tool_use,
+                &mut current_thinking_block,
                 &mut input_tokens,
                 &mut output_tokens,
                 &mut cache_read_input_tokens,
@@ -1544,6 +1759,14 @@ fn is_oauth_auth_error(error_str: &str) -> bool {
             && (error_str.contains("oauth") || error_str.contains("token")))
 }
 
+fn anthropic_beta_header_with_thinking(base: &str, thinking_enabled: bool) -> String {
+    if thinking_enabled && !base.contains("interleaved-thinking-2025-05-14") {
+        format!("{base},interleaved-thinking-2025-05-14")
+    } else {
+        base.to_string()
+    }
+}
+
 /// Accumulator for tool_use blocks (input comes in chunks)
 struct ToolUseAccumulator {
     input_json: String,
@@ -1584,6 +1807,7 @@ struct SseEvent {
 fn process_sse_event(
     event: &SseEvent,
     current_tool_use: &mut Option<ToolUseAccumulator>,
+    current_thinking_block: &mut bool,
     input_tokens: &mut Option<u64>,
     output_tokens: &mut Option<u64>,
     cache_read_input_tokens: &mut Option<u64>,
@@ -1608,6 +1832,17 @@ fn process_sse_event(
                 match parsed.content_block {
                     ApiContentBlockStart::Text { .. } => {
                         // Text block starting - nothing to emit yet
+                    }
+                    ApiContentBlockStart::Thinking { _thinking, .. } => {
+                        *current_thinking_block = true;
+                        events.push(StreamEvent::ThinkingStart);
+                        if !_thinking.is_empty() {
+                            events.push(StreamEvent::ThinkingDelta(_thinking));
+                        }
+                    }
+                    ApiContentBlockStart::RedactedThinking { .. } => {
+                        *current_thinking_block = true;
+                        events.push(StreamEvent::ThinkingStart);
                     }
                     ApiContentBlockStart::ToolUse { id, name } => {
                         let mapped_name = if is_oauth {
@@ -1639,6 +1874,12 @@ fn process_sse_event(
                         }
                         events.push(StreamEvent::ToolInputDelta(partial_json));
                     }
+                    ApiDelta::ThinkingDelta { thinking } => {
+                        events.push(StreamEvent::ThinkingDelta(thinking));
+                    }
+                    ApiDelta::SignatureDelta { signature } => {
+                        events.push(StreamEvent::ThinkingSignatureDelta(signature));
+                    }
                 }
             }
         }
@@ -1646,6 +1887,9 @@ fn process_sse_event(
             // If we were accumulating a tool_use, it's complete now
             if current_tool_use.take().is_some() {
                 events.push(StreamEvent::ToolUseEnd);
+            } else if *current_thinking_block {
+                *current_thinking_block = false;
+                events.push(StreamEvent::ThinkingEnd);
             }
         }
         "message_delta" => {
@@ -1697,8 +1941,29 @@ struct ApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<ApiMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ApiThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<ApiOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiThinking {
+    Adaptive {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<&'static str>,
+    },
+    Enabled {
+        budget_tokens: u32,
+    },
+}
+
+#[derive(Serialize, Clone)]
+struct ApiOutputConfig {
+    effort: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1933,6 +2198,8 @@ enum ApiContentBlock {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "image")]
     Image { source: ApiImageSource },
 }
@@ -1997,6 +2264,18 @@ enum ApiContentBlockStart {
         #[serde(rename = "text")]
         _text: String,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default, rename = "thinking")]
+        _thinking: String,
+        #[serde(default, rename = "signature")]
+        _signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(default, rename = "data")]
+        _data: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse { id: String, name: String },
 }
@@ -2015,6 +2294,13 @@ enum ApiDelta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
+    #[serde(rename = "signature_delta")]
+    SignatureDelta {
+        #[serde(rename = "signature")]
+        signature: String,
+    },
 }
 
 #[derive(Deserialize)]

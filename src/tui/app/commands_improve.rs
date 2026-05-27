@@ -423,6 +423,7 @@ pub(super) fn start_synthetic_user_turn(app: &mut App, content: String) {
     app.streaming_output_tokens = 0;
     app.streaming_cache_read_tokens = None;
     app.streaming_cache_creation_tokens = None;
+    app.current_api_usage_recorded = false;
     app.upstream_provider = None;
     app.status_detail = None;
     app.streaming_tps_start = None;
@@ -499,7 +500,13 @@ pub(super) fn format_improve_status(app: &App) -> String {
             } else {
                 "⬜"
             };
-            lines.push(format!("- {} [{}] {}", icon, todo.priority, todo.content));
+            lines.push(format!(
+                "- {} [{}] {}{}",
+                icon,
+                todo.priority,
+                todo.content,
+                todo_confidence_suffix(todo)
+            ));
         }
         if incomplete.len() > 5 {
             lines.push(format!("- …and {} more", incomplete.len() - 5));
@@ -562,7 +569,13 @@ pub(super) fn format_refactor_status(app: &App) -> String {
             } else {
                 "⬜"
             };
-            lines.push(format!("- {} [{}] {}", icon, todo.priority, todo.content));
+            lines.push(format!(
+                "- {} [{}] {}{}",
+                icon,
+                todo.priority,
+                todo.content,
+                todo_confidence_suffix(todo)
+            ));
         }
         if incomplete.len() > 5 {
             lines.push(format!("- …and {} more", incomplete.len() - 5));
@@ -575,6 +588,13 @@ pub(super) fn format_refactor_status(app: &App) -> String {
     lines.push(String::new());
     lines.push("Use `/refactor` to start/continue, `/refactor resume` to continue the last saved mode, `/refactor plan` for plan-only mode, or `/refactor stop` to halt after a safe point.".to_string());
     lines.join("\n")
+}
+
+fn todo_confidence_suffix(todo: &crate::todo::TodoItem) -> String {
+    match todo.confidence {
+        Some(score) => format!(" · confidence {}%", score),
+        None => " · confidence unknown".to_string(),
+    }
 }
 
 pub(super) fn handle_improve_command_local(app: &mut App, command: ImproveCommand) {

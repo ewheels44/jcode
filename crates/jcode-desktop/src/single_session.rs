@@ -1,6 +1,5 @@
 use crate::{
-    desktop_rich_text,
-    session_data::{self, SessionTranscriptMessage},
+    desktop_rich_text, session_data,
     session_launch::{
         DesktopModelChoice, DesktopSessionEvent, DesktopSessionHandle, DesktopSessionStatus,
     },
@@ -10,12 +9,17 @@ use jcode_tui_messages::DisplayMessage;
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
-use workspace::{KeyInput, KeyOutcome};
+use std::io::{BufRead, BufReader};
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+use workspace::{KeyInput, KeyOutcome, SessionTranscriptMessage};
 
 pub(crate) const SINGLE_SESSION_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+pub(crate) const SINGLE_SESSION_USER_FONT_FAMILY: &str = "Kalam";
 pub(crate) const SINGLE_SESSION_ASSISTANT_FONT_FAMILY: &str = SINGLE_SESSION_FONT_FAMILY;
 pub(crate) const SINGLE_SESSION_WELCOME_FONT_FAMILY: &str = "Homemade Apple";
 pub(crate) const SINGLE_SESSION_FONT_WEIGHT: &str = "Light";
@@ -24,6 +28,103 @@ pub(crate) const SINGLE_SESSION_FONT_FALLBACKS: &[&str] = &[
     "JetBrains Mono",
     "monospace",
 ];
+
+pub(crate) const SINGLE_SESSION_HANDWRITING_FONT_FAMILIES: &[&str] = &[
+    "Homemade Apple",
+    "Kalam",
+    "Shadows Into Light Two",
+    "Patrick Hand",
+    "Gaegu",
+    "Caveat",
+    "Indie Flower",
+    "Gloria Hallelujah",
+    "Handlee",
+    "Reenie Beanie",
+];
+
+static DESKTOP_USER_FONT_INDEX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static DESKTOP_ASSISTANT_FONT_INDEX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub(crate) fn single_session_user_font_family() -> &'static str {
+    desktop_font_family_from_index(
+        DESKTOP_USER_FONT_INDEX.load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .or_else(|| desktop_font_family_from_env("JCODE_DESKTOP_USER_FONT"))
+    .unwrap_or(SINGLE_SESSION_USER_FONT_FAMILY)
+}
+
+pub(crate) fn single_session_assistant_font_family() -> &'static str {
+    desktop_font_family_from_index(
+        DESKTOP_ASSISTANT_FONT_INDEX.load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .or_else(|| desktop_font_family_from_env("JCODE_DESKTOP_AI_FONT"))
+    .or_else(|| desktop_font_family_from_env("JCODE_DESKTOP_ASSISTANT_FONT"))
+    .unwrap_or(SINGLE_SESSION_ASSISTANT_FONT_FAMILY)
+}
+
+pub(crate) fn set_single_session_user_font_family(value: &str) -> Option<&'static str> {
+    let (index, family) = desktop_font_family_index_from_key(value)?;
+    DESKTOP_USER_FONT_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+    Some(family)
+}
+
+pub(crate) fn set_single_session_assistant_font_family(value: &str) -> Option<&'static str> {
+    let (index, family) = desktop_font_family_index_from_key(value)?;
+    DESKTOP_ASSISTANT_FONT_INDEX.store(index, std::sync::atomic::Ordering::Relaxed);
+    Some(family)
+}
+
+fn desktop_font_family_from_index(index: usize) -> Option<&'static str> {
+    match index {
+        0 => Some(SINGLE_SESSION_FONT_FAMILY),
+        index => SINGLE_SESSION_HANDWRITING_FONT_FAMILIES
+            .get(index - 1)
+            .copied(),
+    }
+}
+
+fn desktop_font_family_index_from_key(value: &str) -> Option<(usize, &'static str)> {
+    let family = desktop_font_family_from_key(value)?;
+    if family == SINGLE_SESSION_FONT_FAMILY {
+        return Some((0, family));
+    }
+    SINGLE_SESSION_HANDWRITING_FONT_FAMILIES
+        .iter()
+        .position(|candidate| *candidate == family)
+        .map(|index| (index + 1, family))
+}
+
+fn desktop_font_family_from_env(name: &str) -> Option<&'static str> {
+    let value = std::env::var(name).ok()?;
+    desktop_font_family_from_key(&value)
+}
+
+pub(crate) fn desktop_font_family_from_key(value: &str) -> Option<&'static str> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    match normalized.as_str() {
+        "jetbrains" | "jetbrainsmono" | "jetbrainsmononerdfont" | "default" => {
+            Some(SINGLE_SESSION_FONT_FAMILY)
+        }
+        "homemadeapple" => Some("Homemade Apple"),
+        "kalam" => Some("Kalam"),
+        "shadowsintolighttwo" | "shadowsintolight" => Some("Shadows Into Light Two"),
+        "patrickhand" => Some("Patrick Hand"),
+        "gaegu" => Some("Gaegu"),
+        "caveat" => Some("Caveat"),
+        "indieflower" => Some("Indie Flower"),
+        "gloriahallelujah" => Some("Gloria Hallelujah"),
+        "handlee" => Some("Handlee"),
+        "reeniebeanie" => Some("Reenie Beanie"),
+        _ => None,
+    }
+}
 pub(crate) const SINGLE_SESSION_DEFAULT_FONT_SIZE: f32 = 22.0;
 pub(crate) const SINGLE_SESSION_TITLE_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE;
 pub(crate) const SINGLE_SESSION_BODY_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE * 1.55;
@@ -45,10 +146,19 @@ const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "reset to a fresh desktop session"),
     ("/resume", "open the recent session switcher"),
     ("/sessions", "open the recent session switcher"),
+    ("/session", "alias for /sessions"),
+    ("/issues", "toggle the local GitHub issue browser"),
     ("/model [name]", "open model picker or switch to a model"),
     ("/models", "alias for /model"),
     ("/refresh-model-list", "refresh provider model catalogs"),
+    ("/reload", "force reload the desktop window using handoff"),
+    ("/force-reload", "alias for /reload"),
     ("/effort [level]", "show or change reasoning effort"),
+    (
+        "/font [user|ai] [name]",
+        "show or hot-swap desktop transcript fonts",
+    ),
+    ("/fonts", "alias for /font"),
     ("/fast [on|off|status]", "show or toggle OpenAI fast mode"),
     ("/transport [mode]", "show or change OpenAI transport"),
     (
@@ -66,13 +176,21 @@ const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/commit", "make logical commits from current changes"),
     ("/stop", "interrupt the running generation"),
+    ("/cancel", "alias for /stop"),
     ("/status", "show current desktop session status"),
+    ("/info", "alias for /status"),
     ("/quit", "exit the desktop app"),
+    ("/exit", "alias for /quit"),
 ];
 pub(crate) const DESKTOP_SLASH_SUGGESTION_ROW_LIMIT: usize = 7;
 
+const DESKTOP_REASONING_EFFORTS_OPENAI: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+const DESKTOP_REASONING_EFFORTS_ANTHROPIC_STANDARD: &[&str] = &["none", "low", "medium", "high"];
+const DESKTOP_REASONING_EFFORTS_DEEPSEEK: &[&str] = &["none", "low", "medium", "high", "max"];
+
 #[cfg_attr(test, allow(dead_code))]
 const INLINE_WIDGET_REVEAL_DURATION: Duration = Duration::from_millis(180);
+const INLINE_WIDGET_EXIT_DURATION: Duration = Duration::from_millis(140);
 pub(crate) const MODEL_PICKER_INLINE_ROW_LIMIT: usize = 5;
 pub(crate) const INLINE_WIDGET_DEFAULT_VISIBLE_LINE_LIMIT: usize = 12;
 
@@ -154,12 +272,319 @@ pub(crate) struct SingleSessionApp {
     runtime: SingleSessionRuntimeState,
     tool: SingleSessionToolState,
     view: SingleSessionViewState,
+    side_panel: DesktopSidePanelState,
+    pending_issue_sync_request: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DesktopSidePanelState {
+    pub(crate) visible: bool,
+    pub(crate) focus: DesktopSidePanelFocus,
+    pub(crate) github_issues: GitHubIssueBrowserState,
+    pub(crate) github_issue_sync: GitHubIssueSyncUiState,
+}
+
+impl Default for DesktopSidePanelState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            focus: DesktopSidePanelFocus::Chat,
+            github_issues: GitHubIssueBrowserState::sample(),
+            github_issue_sync: GitHubIssueSyncUiState::default(),
+        }
+    }
+}
+
+impl DesktopSidePanelState {
+    fn focus_next(&mut self) {
+        self.focus = match self.focus {
+            DesktopSidePanelFocus::IssueList => DesktopSidePanelFocus::IssuePreview,
+            DesktopSidePanelFocus::IssuePreview => DesktopSidePanelFocus::Chat,
+            DesktopSidePanelFocus::Chat => DesktopSidePanelFocus::IssueList,
+        };
+    }
+
+    fn focus_previous(&mut self) {
+        self.focus = match self.focus {
+            DesktopSidePanelFocus::IssueList => DesktopSidePanelFocus::Chat,
+            DesktopSidePanelFocus::IssuePreview => DesktopSidePanelFocus::IssueList,
+            DesktopSidePanelFocus::Chat => DesktopSidePanelFocus::IssuePreview,
+        };
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DesktopSidePanelFocus {
+    IssueList,
+    IssuePreview,
+    Chat,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GitHubIssueSyncUiState {
+    pub(crate) syncing: bool,
+    pub(crate) last_message: Option<String>,
+    pub(crate) last_error: Option<String>,
+}
+
+impl GitHubIssueSyncUiState {
+    pub(crate) fn label(&self) -> Option<String> {
+        if self.syncing {
+            return Some("syncing from GitHub in the background".to_string());
+        }
+        if let Some(error) = &self.last_error {
+            return Some(format!("sync failed · {error}"));
+        }
+        self.last_message.clone()
+    }
+
+    pub(crate) fn guidance(&self) -> Option<String> {
+        let error = self.last_error.as_deref()?;
+        Some(issue_sync_error_guidance(error).to_string())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubIssueBrowserState {
+    pub(crate) repo: String,
+    pub(crate) filter_label: String,
+    pub(crate) selected: usize,
+    pub(crate) list_scroll: usize,
+    pub(crate) preview_scroll: usize,
+    pub(crate) issues: Vec<GitHubIssuePreview>,
+}
+
+impl GitHubIssueBrowserState {
+    fn sample() -> Self {
+        Self {
+            repo: "1jehuang/jcode".to_string(),
+            filter_label: "priority · open · local cache".to_string(),
+            selected: 0,
+            list_scroll: 0,
+            preview_scroll: 0,
+            issues: vec![
+                GitHubIssuePreview {
+                    number: 342,
+                    priority: "P0".to_string(),
+                    title: "Desktop reload can lose the active chat surface".to_string(),
+                    labels: vec!["bug".to_string(), "desktop".to_string(), "regression".to_string()],
+                    age: "2d".to_string(),
+                    comments: 8,
+                    state: GitHubIssueVisualState::Selected,
+                    body_lines: vec![
+                        "When the desktop process reloads while a session is streaming, the window sometimes returns to the welcome state instead of the active chat.".to_string(),
+                        "Expected: reload handoff preserves the session id, transcript, draft, and scroll position.".to_string(),
+                        "Observed: the app opens, paints the shell, then falls back to a fresh session.".to_string(),
+                    ],
+                    comment_lines: vec![
+                        "maintainer: happens more often after resizing during handoff".to_string(),
+                        "agent note: likely snapshot restore ordering or worker init race".to_string(),
+                    ],
+                    priority_reason: "explicit regression label, data-loss risk, bounded desktop repro".to_string(),
+                },
+                GitHubIssuePreview {
+                    number: 337,
+                    priority: "P1".to_string(),
+                    title: "Tool-card animation does too much work offscreen".to_string(),
+                    labels: vec!["performance".to_string(), "desktop".to_string()],
+                    age: "5d".to_string(),
+                    comments: 4,
+                    state: GitHubIssueVisualState::Idle,
+                    body_lines: vec![
+                        "Large transcripts still spend frame time walking tool-card metadata for rows far outside the viewport.".to_string(),
+                        "The UI remains correct, but long sessions can miss frame budget during streaming.".to_string(),
+                    ],
+                    comment_lines: vec![
+                        "profiling: check viewport clipping before card motion".to_string(),
+                    ],
+                    priority_reason: "perf label plus objective frame-time validation path".to_string(),
+                },
+                GitHubIssuePreview {
+                    number: 329,
+                    priority: "P2".to_string(),
+                    title: "Provider auth errors should link to doctor output".to_string(),
+                    labels: vec!["auth".to_string(), "ux".to_string()],
+                    age: "1w".to_string(),
+                    comments: 2,
+                    state: GitHubIssueVisualState::Idle,
+                    body_lines: vec![
+                        "Desktop auth failures currently show a terse provider error.".to_string(),
+                        "It should offer a one-click path to the same diagnostic information as `jcode auth doctor`.".to_string(),
+                    ],
+                    comment_lines: vec!["nice to have after core desktop stability".to_string()],
+                    priority_reason: "important UX improvement, but not blocking active work".to_string(),
+                },
+            ],
+        }
+    }
+
+    pub(crate) fn selected_issue(&self) -> Option<&GitHubIssuePreview> {
+        self.issues.get(self.selected)
+    }
+
+    fn selected_issue_mut(&mut self) -> Option<&mut GitHubIssuePreview> {
+        self.issues.get_mut(self.selected)
+    }
+
+    fn select_first(&mut self) {
+        self.set_selected(0);
+    }
+
+    fn select_last(&mut self) {
+        self.set_selected(self.issues.len().saturating_sub(1));
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.issues.is_empty() {
+            self.selected = 0;
+            self.list_scroll = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        let selected = self.selected as i32 + delta;
+        self.set_selected(selected.clamp(0, self.issues.len().saturating_sub(1) as i32) as usize);
+    }
+
+    fn set_selected(&mut self, selected: usize) {
+        if self.issues.is_empty() {
+            self.selected = 0;
+            self.list_scroll = 0;
+            self.preview_scroll = 0;
+            return;
+        }
+        self.selected = selected.min(self.issues.len() - 1);
+        self.preview_scroll = 0;
+        let visible_rows = 6usize;
+        if self.selected < self.list_scroll {
+            self.list_scroll = self.selected;
+        } else if self.selected >= self.list_scroll.saturating_add(visible_rows) {
+            self.list_scroll = self.selected.saturating_sub(visible_rows - 1);
+        }
+        self.sync_visual_selection_state();
+    }
+
+    fn sync_visual_selection_state(&mut self) {
+        for (index, issue) in self.issues.iter_mut().enumerate() {
+            if issue.state != GitHubIssueVisualState::Active {
+                issue.state = if index == self.selected {
+                    GitHubIssueVisualState::Selected
+                } else {
+                    GitHubIssueVisualState::Idle
+                };
+            }
+        }
+    }
+
+    fn scroll_preview_lines(&mut self, lines: i32) {
+        let max_scroll = self
+            .selected_issue()
+            .map(|issue| issue.body_lines.len().saturating_sub(1))
+            .unwrap_or_default();
+        if lines > 0 {
+            self.preview_scroll = self.preview_scroll.saturating_sub(lines as usize);
+        } else if lines < 0 {
+            self.preview_scroll = self
+                .preview_scroll
+                .saturating_add(lines.unsigned_abs() as usize)
+                .min(max_scroll);
+        }
+    }
+
+    fn mark_selected_active(&mut self) {
+        for issue in &mut self.issues {
+            if issue.state == GitHubIssueVisualState::Active {
+                issue.state = GitHubIssueVisualState::Idle;
+            }
+        }
+        if let Some(issue) = self.selected_issue_mut() {
+            issue.state = GitHubIssueVisualState::Active;
+        }
+    }
+
+    pub(crate) fn selected_issue_context_prompt(&self) -> Option<String> {
+        let issue = self.selected_issue()?;
+        Some(issue_context_prompt(&self.repo, issue))
+    }
+}
+
+fn issue_context_prompt(repo: &str, issue: &GitHubIssuePreview) -> String {
+    let labels = if issue.labels.is_empty() {
+        "none".to_string()
+    } else {
+        issue.labels.join(", ")
+    };
+    let body = issue.body_lines.join("\n");
+    let comments = if issue.comment_lines.is_empty() {
+        "none".to_string()
+    } else {
+        issue.comment_lines.join("\n")
+    };
+    format!(
+        "GitHub issue mission\n\nRepository: {repo}\nIssue: #{}\nTitle: {}\nPriority: {}\nLabels: {labels}\nAge: {}\nComment count: {}\nPriority rationale: {}\n\nIssue body:\n{body}\n\nRecent comments:\n{comments}\n\nMission objective: investigate and, when safe, implement a fix for this issue in the local repository.\n\nOperating instructions:\n1. Start by inspecting the relevant code and reproducing or narrowing the behavior.\n2. Preserve existing user changes and avoid destructive actions.\n3. If implementing a fix, add or update targeted tests.\n4. Run the maximum reasonable validation before reporting completion.\n5. Report evidence, remaining gaps, and any follow-up work.\n6. Do not rely on the GitHub web UI unless local cache context is insufficient.",
+        issue.number, issue.title, issue.priority, issue.age, issue.comments, issue.priority_reason
+    )
+}
+
+fn issue_sync_error_guidance(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("not installed")
+        || lower.contains("not on path")
+        || lower.contains("no such file")
+    {
+        "Install GitHub CLI `gh`, authenticate it, then press r or Ctrl+R to sync."
+    } else if lower.contains("auth")
+        || lower.contains("authentication")
+        || lower.contains("login")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
+        "Run `gh auth login` or refresh GitHub CLI auth, then press r or Ctrl+R to sync."
+    } else if lower.contains("could not find a github origin") || lower.contains("origin remote") {
+        "Add a GitHub origin remote for this repository, then press r or Ctrl+R to sync."
+    } else {
+        "Using cached GitHub issues. Press r or Ctrl+R to retry background sync."
+    }
+}
+
+fn compact_issue_sync_error(error: &str) -> String {
+    let mut compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() > 160 {
+        compact.truncate(157);
+        compact.push_str("...");
+    }
+    if compact.is_empty() {
+        "unknown error".to_string()
+    } else {
+        compact
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitHubIssueVisualState {
+    Idle,
+    Selected,
+    Active,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubIssuePreview {
+    pub(crate) number: u64,
+    pub(crate) priority: String,
+    pub(crate) title: String,
+    pub(crate) labels: Vec<String>,
+    pub(crate) age: String,
+    pub(crate) comments: u32,
+    pub(crate) state: GitHubIssueVisualState,
+    pub(crate) body_lines: Vec<String>,
+    pub(crate) comment_lines: Vec<String>,
+    pub(crate) priority_reason: String,
 }
 
 #[derive(Clone, Debug)]
 struct SingleSessionWelcomeState {
     name: Option<String>,
     recovery_session_count: usize,
+    continuation_suggestion: Option<String>,
     // True for the fresh-start chat that owns the welcome hero as visual UI.
     // The hero must stay out of `body_styled_lines()` so it never becomes part
     // of the persisted/rendered transcript text.
@@ -174,6 +599,7 @@ impl SingleSessionWelcomeState {
         Self {
             name,
             recovery_session_count: 0,
+            continuation_suggestion: latest_external_cli_continuation_suggestion(),
             timeline: !has_session,
             hero_phrase_index,
         }
@@ -226,24 +652,100 @@ struct SingleSessionRuntimeSettings {
     service_tier: Option<String>,
     transport: Option<String>,
     compaction_mode: Option<String>,
+    connection_type: Option<String>,
+    status_detail: Option<String>,
+    upstream_provider: Option<String>,
+    token_usage: Option<SingleSessionTokenUsage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SingleSessionTokenUsage {
+    input: u64,
+    output: u64,
+    cache_read_input: Option<u64>,
+    cache_creation_input: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct SingleSessionToolState {
     active_message_index: Option<usize>,
+    active_call_id: Option<String>,
     input_buffer: String,
+    event_sequence: u64,
+    runs: Vec<SingleSessionToolRun>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SingleSessionToolRun {
+    pub(crate) call_id: String,
+    pub(crate) message_index: usize,
+    pub(crate) name: String,
+    pub(crate) state: SingleSessionToolVisualState,
+    pub(crate) summary: Option<String>,
+    pub(crate) input_raw: String,
+    pub(crate) input_preview: Option<String>,
+    pub(crate) stdin_prompt: Option<String>,
+    pub(crate) started_sequence: u64,
+    pub(crate) updated_sequence: u64,
+    pub(crate) completed_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SingleSessionToolVisualState {
+    Preparing,
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+    Group,
+}
+
+impl SingleSessionToolVisualState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Running => "running",
+            Self::Succeeded => "done",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Group => "tools",
+        }
+    }
+
+    pub(crate) fn from_tool_state_text(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "preparing" | "pending" | "queued" | "waiting" => Self::Preparing,
+            "running" | "executing" | "active" => Self::Running,
+            "done" | "success" | "succeeded" | "passed" => Self::Succeeded,
+            "failed" | "failure" | "error" | "errored" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        matches!(self, Self::Preparing | Self::Running)
+    }
 }
 
 #[derive(Clone, Debug)]
 struct SingleSessionViewState {
     inline_widget_opened_at: Option<Instant>,
+    closing_inline_widget: Option<ClosingInlineWidgetState>,
     text_scale: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ClosingInlineWidgetState {
+    kind: InlineWidgetKind,
+    lines: Vec<SingleSessionStyledLine>,
+    started_at: Instant,
 }
 
 impl Default for SingleSessionViewState {
     fn default() -> Self {
         Self {
             inline_widget_opened_at: None,
+            closing_inline_widget: None,
             text_scale: 1.0,
         }
     }
@@ -273,6 +775,25 @@ pub(crate) struct SingleSessionStyledLine {
     pub(crate) text: String,
     pub(crate) style: SingleSessionLineStyle,
     pub(crate) inline_spans: Vec<SingleSessionInlineSpan>,
+    pub(crate) tool: Option<SingleSessionToolLineMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SingleSessionToolLineMetadata {
+    pub(crate) call_id: String,
+    pub(crate) name: String,
+    pub(crate) state: SingleSessionToolVisualState,
+    pub(crate) kind: SingleSessionToolLineKind,
+    pub(crate) active: bool,
+    pub(crate) expanded: bool,
+    pub(crate) stdin_prompt: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SingleSessionToolLineKind {
+    Header,
+    Detail,
+    GroupSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -303,7 +824,7 @@ pub(crate) enum InlineWidgetMode {
     Interactive,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum InlineWidgetKind {
     HotkeyHelp,
     SessionInfo,
@@ -320,6 +841,13 @@ pub(crate) enum SingleSessionOverlay {
         kind: InlineWidgetKind,
         mode: InlineWidgetMode,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReasoningEffortCycleOutcome {
+    Set(String),
+    AlreadyAtLimit { effort: String, limit: &'static str },
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -421,6 +949,10 @@ impl SingleSessionOverlay {
                 mode: InlineWidgetMode::ReadOnly,
             } => false,
             Self::Inline {
+                kind: InlineWidgetKind::SessionSwitcher,
+                mode: InlineWidgetMode::ReadOnly,
+            } => false,
+            Self::Inline {
                 kind: InlineWidgetKind::SlashSuggestions,
                 mode: InlineWidgetMode::ReadOnly,
             } => false,
@@ -437,6 +969,7 @@ impl InlineWidgetKind {
             }
             Self::ModelPicker if app.model_picker.preview => InlineWidgetMode::ReadOnly,
             Self::ModelPicker => InlineWidgetMode::Interactive,
+            Self::SessionSwitcher if app.session_switcher.preview => InlineWidgetMode::ReadOnly,
             Self::SessionSwitcher => InlineWidgetMode::Interactive,
         }
     }
@@ -482,6 +1015,7 @@ pub(crate) enum SingleSessionLineStyle {
     AssistantQuote,
     AssistantTable,
     AssistantLink,
+    AssistantMedia,
     CodeHeader,
     Code,
     User,
@@ -502,6 +1036,7 @@ impl SingleSessionStyledLine {
             text: text.into(),
             style,
             inline_spans: Vec::new(),
+            tool: None,
         }
     }
 
@@ -514,7 +1049,13 @@ impl SingleSessionStyledLine {
             text: text.into(),
             style,
             inline_spans,
+            tool: None,
         }
+    }
+
+    pub(crate) fn with_tool_metadata(mut self, tool: SingleSessionToolLineMetadata) -> Self {
+        self.tool = Some(tool);
+        self
     }
 }
 
@@ -538,6 +1079,8 @@ pub(crate) struct ModelPickerState {
     pub(crate) current_model: Option<String>,
     pub(crate) provider_name: Option<String>,
     pub(crate) choices: Vec<DesktopModelChoice>,
+    search_texts: Vec<String>,
+    visible_indices: Vec<usize>,
     pub(crate) error: Option<String>,
 }
 
@@ -547,6 +1090,7 @@ impl ModelPickerState {
         self.loading = true;
         self.preview = false;
         self.error = None;
+        self.refresh_visible_indices();
         self.selected = self.current_choice_index().unwrap_or(0);
         self.column = 0;
     }
@@ -557,6 +1101,7 @@ impl ModelPickerState {
         self.preview = true;
         self.filter = filter;
         self.error = None;
+        self.refresh_visible_indices();
         self.selected = self.current_visible_position().unwrap_or(0);
         self.column = 0;
     }
@@ -583,10 +1128,12 @@ impl ModelPickerState {
         }
         if !choices.is_empty() {
             self.choices = dedupe_model_choices(choices);
+            self.rebuild_search_texts();
         }
         self.loading = false;
         self.error = None;
         self.ensure_current_choice_present();
+        self.refresh_visible_indices();
         self.selected = self.current_visible_position().unwrap_or(0);
         self.clamp_selection();
         self.column = self.column.min(2);
@@ -604,6 +1151,7 @@ impl ModelPickerState {
             self.provider_name = provider_name;
         }
         self.ensure_current_choice_present();
+        self.refresh_visible_indices();
         self.selected = self.current_visible_position().unwrap_or(self.selected);
         self.clamp_selection();
     }
@@ -639,12 +1187,14 @@ impl ModelPickerState {
 
     fn push_filter_text(&mut self, text: &str) {
         self.filter.push_str(text);
+        self.refresh_visible_indices();
         self.selected = 0;
         self.column = 0;
     }
 
     fn pop_filter_char(&mut self) {
         self.filter.pop();
+        self.refresh_visible_indices();
         self.selected = 0;
         self.column = 0;
     }
@@ -652,25 +1202,51 @@ impl ModelPickerState {
     fn set_filter(&mut self, filter: String) {
         if self.filter != filter {
             self.filter = filter;
+            self.refresh_visible_indices();
             self.selected = 0;
             self.column = 0;
         }
         self.clamp_selection();
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
+    fn filtered_indices(&self) -> &[usize] {
+        &self.visible_indices
+    }
+
+    fn refresh_visible_indices(&mut self) {
+        self.ensure_search_texts_current();
         let query = self.filter.trim().to_lowercase();
-        self.choices
+        if query.is_empty() {
+            self.visible_indices = (0..self.choices.len()).collect();
+            return;
+        }
+
+        let substring_matches = self
+            .search_texts
             .iter()
             .enumerate()
-            .filter_map(|(index, choice)| {
-                if query.is_empty() || model_choice_search_text(choice).contains(&query) {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .collect()
+            .filter_map(|(index, search_text)| search_text.contains(&query).then_some(index))
+            .collect::<Vec<_>>();
+        if !substring_matches.is_empty() {
+            self.visible_indices = substring_matches;
+            return;
+        }
+
+        let mut fuzzy_matches = Vec::new();
+        for (index, search_text) in self.search_texts.iter().enumerate() {
+            if let Some(score) = model_picker_fuzzy_score(&query, search_text) {
+                fuzzy_matches.push((score, search_text.len(), index));
+            }
+        }
+        fuzzy_matches.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        self.visible_indices = fuzzy_matches
+            .into_iter()
+            .map(|(_, _, index)| index)
+            .collect();
     }
 
     pub(crate) fn visible_row_window(&self, limit: usize) -> (usize, Vec<usize>) {
@@ -683,15 +1259,6 @@ impl ModelPickerState {
         let start = selected.saturating_sub(limit / 2).min(max_start);
         let end = (start + limit).min(visible.len());
         (start, visible[start..end].to_vec())
-    }
-
-    pub(crate) fn selected_row_in_window(&self, limit: usize) -> Option<usize> {
-        let (start, visible) = self.visible_row_window(limit);
-        if visible.is_empty() {
-            None
-        } else {
-            Some(self.selected.saturating_sub(start).min(visible.len() - 1))
-        }
     }
 
     fn current_choice_index(&self) -> Option<usize> {
@@ -717,6 +1284,16 @@ impl ModelPickerState {
         }
     }
 
+    fn rebuild_search_texts(&mut self) {
+        self.search_texts = self.choices.iter().map(model_choice_search_text).collect();
+    }
+
+    fn ensure_search_texts_current(&mut self) {
+        if self.search_texts.len() != self.choices.len() {
+            self.rebuild_search_texts();
+        }
+    }
+
     fn ensure_current_choice_present(&mut self) {
         let Some(current_model) = self.current_model.clone() else {
             return;
@@ -728,16 +1305,16 @@ impl ModelPickerState {
         {
             return;
         }
-        self.choices.insert(
-            0,
-            DesktopModelChoice {
-                model: current_model,
-                provider: self.provider_name.clone(),
-                api_method: Some("current".to_string()),
-                detail: Some("current model".to_string()),
-                available: true,
-            },
-        );
+        let choice = DesktopModelChoice {
+            model: current_model,
+            provider: self.provider_name.clone(),
+            api_method: Some("current".to_string()),
+            detail: Some("current model".to_string()),
+            available: true,
+        };
+        let search_text = model_choice_search_text(&choice);
+        self.choices.insert(0, choice);
+        self.search_texts.insert(0, search_text);
     }
 }
 
@@ -745,15 +1322,17 @@ impl ModelPickerState {
 pub(crate) struct SessionSwitcherState {
     pub(crate) open: bool,
     pub(crate) loading: bool,
+    pub(crate) preview: bool,
     pub(crate) filter: String,
     pub(crate) selected: usize,
     pub(crate) sessions: Vec<workspace::SessionCard>,
+    visible_indices: Vec<usize>,
     preview_scroll: usize,
-    focus: SessionSwitcherPane,
+    pub(crate) focus: SessionSwitcherPane,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-enum SessionSwitcherPane {
+pub(crate) enum SessionSwitcherPane {
     #[default]
     Sessions,
     Preview,
@@ -761,18 +1340,30 @@ enum SessionSwitcherPane {
 
 impl SessionSwitcherState {
     fn open_loading(&mut self, current_session_id: Option<&str>) {
-        self.open_loading_with_filter(current_session_id, String::new());
+        self.open_loading_with_filter(current_session_id, String::new(), false);
+    }
+
+    fn open_preview_loading(&mut self, current_session_id: Option<&str>, filter: String) {
+        self.open_loading_with_filter(current_session_id, filter, true);
     }
 
     fn refresh_loading(&mut self, current_session_id: Option<&str>) {
         let filter = self.filter.clone();
-        self.open_loading_with_filter(current_session_id, filter);
+        let preview = self.preview;
+        self.open_loading_with_filter(current_session_id, filter, preview);
     }
 
-    fn open_loading_with_filter(&mut self, current_session_id: Option<&str>, filter: String) {
+    fn open_loading_with_filter(
+        &mut self,
+        current_session_id: Option<&str>,
+        filter: String,
+        preview: bool,
+    ) {
         self.open = true;
         self.loading = true;
+        self.preview = preview;
         self.filter = filter;
+        self.refresh_visible_indices();
         self.focus = SessionSwitcherPane::Sessions;
         self.preview_scroll = 0;
         self.selected = self
@@ -784,6 +1375,7 @@ impl SessionSwitcherState {
     fn close(&mut self) {
         self.open = false;
         self.loading = false;
+        self.preview = false;
     }
 
     fn apply_sessions(
@@ -792,6 +1384,7 @@ impl SessionSwitcherState {
         current_session_id: Option<&str>,
     ) {
         self.sessions = sessions;
+        self.refresh_visible_indices();
         self.loading = false;
         self.selected = self
             .current_visible_position(current_session_id)
@@ -801,11 +1394,14 @@ impl SessionSwitcherState {
     }
 
     fn selected_session(&self) -> Option<workspace::SessionCard> {
+        self.selected_session_ref().cloned()
+    }
+
+    fn selected_session_ref(&self) -> Option<&workspace::SessionCard> {
         let visible = self.filtered_indices();
         visible
             .get(self.selected)
             .and_then(|index| self.sessions.get(*index))
-            .cloned()
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -834,28 +1430,58 @@ impl SessionSwitcherState {
 
     fn push_filter_text(&mut self, text: &str) {
         self.filter.push_str(text);
+        self.refresh_visible_indices();
         self.selected = 0;
         self.preview_scroll = 0;
     }
 
     fn pop_filter_char(&mut self) {
         self.filter.pop();
+        self.refresh_visible_indices();
         self.selected = 0;
         self.preview_scroll = 0;
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
+    fn set_filter(&mut self, filter: String) {
+        if self.filter != filter {
+            self.filter = filter;
+            self.refresh_visible_indices();
+            self.selected = 0;
+            self.preview_scroll = 0;
+        }
+        self.clamp_selection();
+    }
+
+    fn filtered_indices(&self) -> &[usize] {
+        &self.visible_indices
+    }
+
+    fn refresh_visible_indices(&mut self) {
         let query = self.filter.trim().to_lowercase();
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| {
-                if query.is_empty() || session_card_search_text(session).contains(&query) {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
+        if query.is_empty() {
+            self.visible_indices = (0..self.sessions.len()).collect();
+            return;
+        }
+
+        let mut substring_matches = Vec::new();
+        let mut fuzzy_matches = Vec::new();
+        for (index, session) in self.sessions.iter().enumerate() {
+            let search_text = session_card_search_text(session);
+            if search_text.contains(&query) {
+                substring_matches.push(index);
+            } else if let Some(score) = session_switcher_fuzzy_score(&query, &search_text) {
+                fuzzy_matches.push((score, search_text.len(), index));
+            }
+        }
+        fuzzy_matches.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        self.visible_indices = substring_matches
+            .into_iter()
+            .chain(fuzzy_matches.into_iter().map(|(_, _, index)| index))
             .collect()
     }
 
@@ -905,8 +1531,8 @@ impl SessionSwitcherState {
     }
 
     fn preview_line_count(&self) -> usize {
-        self.selected_session()
-            .map(|session| session_switcher_preview_lines_for_session(&session).len())
+        self.selected_session_ref()
+            .map(session_switcher_preview_line_count_for_session)
             .unwrap_or(0)
     }
 
@@ -1088,9 +1714,39 @@ fn hash_text_cache_fingerprint<H: Hasher>(text: &str, hasher: &mut H) {
     bytes[bytes.len() - BODY_CACHE_TEXT_EDGE_BYTES..].hash(hasher);
 }
 
+fn hash_tool_cache_fingerprint<H: Hasher>(tool: &SingleSessionToolState, hasher: &mut H) {
+    tool.active_message_index.hash(hasher);
+    tool.active_call_id.hash(hasher);
+    visible_active_tool_input_preview(tool).hash(hasher);
+    for run in &tool.runs {
+        run.call_id.hash(hasher);
+        run.message_index.hash(hasher);
+        run.name.hash(hasher);
+        run.state.hash(hasher);
+        run.summary.hash(hasher);
+        run.input_preview.hash(hasher);
+        run.stdin_prompt.hash(hasher);
+    }
+}
+
+fn visible_active_tool_input_preview(tool: &SingleSessionToolState) -> Option<String> {
+    if tool.input_buffer.is_empty() {
+        return None;
+    }
+    let tool_name = tool
+        .active_call_id
+        .as_ref()
+        .and_then(|call_id| tool.runs.iter().find(|run| &run.call_id == call_id))
+        .or_else(|| tool.runs.last())
+        .map(|run| run.name.as_str())
+        .unwrap_or("tool");
+    compact_tool_metadata(&formatted_tool_input_lines(tool_name, &tool.input_buffer))
+}
+
 fn hash_session_switcher_cache_state<H: Hasher>(switcher: &SessionSwitcherState, hasher: &mut H) {
     switcher.open.hash(hasher);
     switcher.loading.hash(hasher);
+    switcher.preview.hash(hasher);
     switcher.filter.hash(hasher);
     switcher.selected.hash(hasher);
     switcher.preview_scroll.hash(hasher);
@@ -1115,13 +1771,25 @@ fn hash_session_switcher_cache_state<H: Hasher>(switcher: &SessionSwitcherState,
 impl SingleSessionApp {
     pub(crate) fn new(session: Option<workspace::SessionCard>) -> Self {
         let welcome = SingleSessionWelcomeState::new(session.is_some());
+        let messages = session
+            .as_ref()
+            .filter(|session| !session.transcript_messages.is_empty())
+            .map(|session| {
+                session
+                    .transcript_messages
+                    .iter()
+                    .cloned()
+                    .map(SingleSessionMessage::from_session_transcript)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             session,
             draft: String::new(),
             draft_cursor: 0,
             detail_scroll: 0,
             live_session_id: None,
-            messages: Vec::new(),
+            messages,
             streaming_response: String::new(),
             status: None,
             status_kind: None,
@@ -1142,6 +1810,8 @@ impl SingleSessionApp {
             runtime: SingleSessionRuntimeState::default(),
             tool: SingleSessionToolState::default(),
             view: SingleSessionViewState::default(),
+            side_panel: DesktopSidePanelState::default(),
+            pending_issue_sync_request: false,
         }
     }
 
@@ -1163,6 +1833,83 @@ impl SingleSessionApp {
         self.detail_scroll = 0;
     }
 
+    #[cfg(test)]
+    pub(crate) fn reasoning_effort(&self) -> Option<&str> {
+        self.runtime_settings.reasoning_effort.as_deref()
+    }
+
+    pub(crate) fn preview_reasoning_effort_set(&mut self, effort: &str) -> Option<String> {
+        let normalized = self.normalize_reasoning_effort_for_current_context(effort)?;
+        self.runtime_settings.reasoning_effort = Some(normalized.clone());
+        self.set_status_label(format!("thinking level: {normalized}"));
+        Some(normalized)
+    }
+
+    pub(crate) fn preview_reasoning_effort_cycle(
+        &mut self,
+        direction: i8,
+    ) -> ReasoningEffortCycleOutcome {
+        let efforts = self.available_reasoning_efforts_for_current_context();
+        if efforts.is_empty() {
+            self.set_status_label("thinking level is not available for this model");
+            return ReasoningEffortCycleOutcome::Unavailable;
+        }
+
+        let current = self.runtime_settings.reasoning_effort.as_deref();
+        let current_index = current
+            .and_then(|effort| efforts.iter().position(|candidate| *candidate == effort))
+            .unwrap_or(efforts.len() - 1);
+        let next_index = if direction > 0 {
+            (current_index + 1).min(efforts.len() - 1)
+        } else {
+            current_index.saturating_sub(1)
+        };
+        let next_effort = efforts[next_index];
+        if next_index == current_index {
+            let limit = if direction > 0 { "max" } else { "min" };
+            self.set_status_label(format!(
+                "thinking level: {next_effort} (already at {limit})"
+            ));
+            return ReasoningEffortCycleOutcome::AlreadyAtLimit {
+                effort: next_effort.to_string(),
+                limit,
+            };
+        }
+
+        self.runtime_settings.reasoning_effort = Some(next_effort.to_string());
+        self.set_status_label(format!("thinking level: {next_effort}"));
+        ReasoningEffortCycleOutcome::Set(next_effort.to_string())
+    }
+
+    fn normalize_reasoning_effort_for_current_context(&self, raw: &str) -> Option<String> {
+        let requested = raw.trim().to_ascii_lowercase();
+        if requested.is_empty() {
+            return None;
+        }
+        let efforts = self.available_reasoning_efforts_for_current_context();
+        if efforts.is_empty() {
+            return None;
+        }
+        if efforts.contains(&requested.as_str()) {
+            return Some(requested);
+        }
+        if requested == "max" && efforts.contains(&"xhigh") {
+            return Some("xhigh".to_string());
+        }
+        if requested == "xhigh" && efforts.contains(&"max") {
+            return Some("max".to_string());
+        }
+        efforts.last().map(|effort| (*effort).to_string())
+    }
+
+    fn available_reasoning_efforts_for_current_context(&self) -> &'static [&'static str] {
+        inferred_desktop_reasoning_efforts(
+            self.model_picker.provider_name.as_deref(),
+            self.model_picker.current_model.as_deref(),
+            self.runtime_settings.reasoning_effort.as_deref(),
+        )
+    }
+
     pub(crate) fn initialize_resumed_session(&mut self, session_id: &str) {
         self.live_session_id = Some(session_id.to_string());
         self.detail_scroll = 0;
@@ -1180,6 +1927,7 @@ impl SingleSessionApp {
         self.tool.input_buffer.clear();
         self.runtime.reload_phase = ReloadPhase::Stable;
         self.view.inline_widget_opened_at = None;
+        self.view.closing_inline_widget = None;
         self.welcome.timeline = false;
     }
 
@@ -1242,6 +1990,290 @@ impl SingleSessionApp {
         self.runtime_settings = SingleSessionRuntimeSettings::default();
         self.tool = SingleSessionToolState::default();
         self.view.inline_widget_opened_at = None;
+        self.view.closing_inline_widget = None;
+        self.side_panel = DesktopSidePanelState::default();
+        self.pending_issue_sync_request = false;
+    }
+
+    pub(crate) fn side_panel(&self) -> &DesktopSidePanelState {
+        &self.side_panel
+    }
+
+    pub(crate) fn take_github_issue_sync_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_issue_sync_request)
+    }
+
+    pub(crate) fn note_github_issue_sync_already_running(&mut self) {
+        self.side_panel.github_issue_sync.syncing = true;
+        self.side_panel.github_issue_sync.last_error = None;
+        self.side_panel.github_issue_sync.last_message =
+            Some("GitHub issue sync already running; cached issues remain interactive".to_string());
+    }
+
+    pub(crate) fn apply_github_issue_sync_result(
+        &mut self,
+        result: std::result::Result<crate::desktop_issue_cache::GitHubIssueSyncSummary, String>,
+    ) {
+        self.pending_issue_sync_request = false;
+        self.side_panel.github_issue_sync.syncing = false;
+        match result {
+            Ok(summary) => {
+                let warning_label = if summary.comment_fetch_errors == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " · {} comment refresh warning(s)",
+                        summary.comment_fetch_errors
+                    )
+                };
+                let message = format!(
+                    "synced {} GitHub issues for {} in {}ms · cache {}{}",
+                    summary.issue_count,
+                    summary.repo,
+                    summary.elapsed.as_millis(),
+                    summary.cache_path.display(),
+                    warning_label
+                );
+                self.side_panel.github_issues = summary.browser;
+                self.side_panel.github_issue_sync.last_error = None;
+                self.side_panel.github_issue_sync.last_message = Some(message.clone());
+                self.set_status(SingleSessionStatus::Info(message));
+            }
+            Err(error) => {
+                let compact_error = compact_issue_sync_error(&error);
+                self.side_panel.github_issue_sync.last_error = Some(compact_error.clone());
+                self.side_panel.github_issue_sync.last_message =
+                    Some(issue_sync_error_guidance(&error).to_string());
+                self.set_status(SingleSessionStatus::Info(format!(
+                    "GitHub issue sync failed · {compact_error}"
+                )));
+            }
+        }
+    }
+
+    pub(crate) fn issue_browser_visible(&self) -> bool {
+        self.side_panel.visible
+    }
+
+    fn request_issue_browser_sync(&mut self) {
+        self.pending_issue_sync_request = true;
+        self.side_panel.github_issue_sync.syncing = true;
+        self.side_panel.github_issue_sync.last_error = None;
+        self.side_panel.github_issue_sync.last_message =
+            Some("syncing from GitHub via gh; cached issues remain interactive".to_string());
+    }
+
+    fn toggle_issue_browser(&mut self, visible: Option<bool>) -> KeyOutcome {
+        let visible = visible.unwrap_or(!self.side_panel.visible);
+        self.side_panel.visible = visible;
+        self.side_panel.focus = if visible {
+            DesktopSidePanelFocus::IssueList
+        } else {
+            DesktopSidePanelFocus::Chat
+        };
+        let cache_status = visible
+            .then(|| self.refresh_issue_browser_from_cache())
+            .flatten();
+        if visible {
+            self.request_issue_browser_sync();
+        }
+        self.draft.clear();
+        self.draft_cursor = 0;
+        self.composer.input_undo_stack.clear();
+        self.set_status(SingleSessionStatus::Info(cache_status.unwrap_or_else(
+            || {
+                if visible {
+                    "showing local GitHub issue browser".to_string()
+                } else {
+                    "hid local GitHub issue browser".to_string()
+                }
+            },
+        )));
+        KeyOutcome::Redraw
+    }
+
+    #[cfg(not(test))]
+    fn refresh_issue_browser_from_cache(&mut self) -> Option<String> {
+        match crate::desktop_issue_cache::load_current_repo_issue_browser() {
+            Ok(Some(browser)) => {
+                let repo = browser.repo.clone();
+                let count = browser.issues.len();
+                self.side_panel.github_issues = browser;
+                Some(format!("showing {count} cached GitHub issues for {repo}"))
+            }
+            Ok(None) => None,
+            Err(error) => Some(format!(
+                "showing sample issues; cache unavailable: {error:#}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn refresh_issue_browser_from_cache(&mut self) -> Option<String> {
+        None
+    }
+
+    fn handle_issue_browser_key(&mut self, key: &KeyInput) -> Option<KeyOutcome> {
+        if !self.side_panel.visible {
+            return None;
+        }
+
+        if matches!(key, KeyInput::Autocomplete) && self.draft.is_empty() {
+            self.side_panel.focus_next();
+            return Some(KeyOutcome::Redraw);
+        }
+
+        if let KeyInput::Character(text) = key
+            && text.starts_with('/')
+        {
+            self.side_panel.focus = DesktopSidePanelFocus::Chat;
+            return None;
+        }
+
+        if matches!(key, KeyInput::RefreshSessions) {
+            self.request_issue_browser_sync();
+            return Some(KeyOutcome::Redraw);
+        }
+
+        match self.side_panel.focus {
+            DesktopSidePanelFocus::Chat => None,
+            DesktopSidePanelFocus::IssueList => Some(self.handle_issue_list_key(key)),
+            DesktopSidePanelFocus::IssuePreview => Some(self.handle_issue_preview_key(key)),
+        }
+    }
+
+    fn handle_issue_list_key(&mut self, key: &KeyInput) -> KeyOutcome {
+        match key {
+            KeyInput::Escape => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::SubmitDraft => self.investigate_selected_issue(),
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("r") => {
+                self.request_issue_browser_sync();
+                KeyOutcome::Redraw
+            }
+            KeyInput::ModelPickerMove(delta) => {
+                self.side_panel.github_issues.move_selection(*delta);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyPages(pages) => {
+                self.side_panel.github_issues.move_selection(-pages * 5);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "j" => {
+                self.side_panel.github_issues.move_selection(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.side_panel.github_issues.move_selection(-1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "g" => {
+                self.side_panel.github_issues.select_first();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "G" => {
+                self.side_panel.github_issues.select_last();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.side_panel.focus = DesktopSidePanelFocus::IssuePreview;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.side_panel.focus_previous();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("q") => {
+                self.toggle_issue_browser(Some(false))
+            }
+            _ => KeyOutcome::None,
+        }
+    }
+
+    fn handle_issue_preview_key(&mut self, key: &KeyInput) -> KeyOutcome {
+        match key {
+            KeyInput::Escape => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::SubmitDraft => self.investigate_selected_issue(),
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("r") => {
+                self.request_issue_browser_sync();
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyLines(lines) => {
+                self.side_panel.github_issues.scroll_preview_lines(*lines);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyPages(pages) => {
+                self.side_panel
+                    .github_issues
+                    .scroll_preview_lines(*pages * 6);
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyToTop => {
+                self.side_panel.github_issues.preview_scroll = 0;
+                KeyOutcome::Redraw
+            }
+            KeyInput::ScrollBodyToBottom => {
+                self.side_panel
+                    .github_issues
+                    .scroll_preview_lines(i32::MIN + 1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "j" => {
+                self.side_panel.github_issues.scroll_preview_lines(-1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.side_panel.github_issues.scroll_preview_lines(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.side_panel.focus = DesktopSidePanelFocus::IssueList;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.side_panel.focus = DesktopSidePanelFocus::Chat;
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text.eq_ignore_ascii_case("q") => {
+                self.toggle_issue_browser(Some(false))
+            }
+            KeyInput::ModelPickerMove(delta) => {
+                self.side_panel.github_issues.move_selection(*delta);
+                KeyOutcome::Redraw
+            }
+            _ => KeyOutcome::None,
+        }
+    }
+
+    fn investigate_selected_issue(&mut self) -> KeyOutcome {
+        let Some(message) = self
+            .side_panel
+            .github_issues
+            .selected_issue_context_prompt()
+        else {
+            return KeyOutcome::None;
+        };
+        self.side_panel.github_issues.mark_selected_active();
+        self.side_panel.focus = DesktopSidePanelFocus::Chat;
+        self.record_user_submit(&message, &[]);
+        if let Some(session) = &self.session {
+            KeyOutcome::SendDraft {
+                session_id: session.session_id.clone(),
+                title: session.title.clone(),
+                message,
+                images: Vec::new(),
+            }
+        } else {
+            KeyOutcome::StartFreshSession {
+                message,
+                images: Vec::new(),
+            }
+        }
     }
 
     pub(crate) fn status_title(&self) -> String {
@@ -1282,18 +2314,55 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn has_frame_animation(&self) -> bool {
-        self.has_activity_indicator() || self.inline_widget_reveal_in_progress()
+        self.has_activity_indicator()
+            || self.inline_widget_reveal_in_progress()
+            || self.inline_widget_exit_in_progress()
     }
 
     fn mark_inline_widget_opened(&mut self) {
         self.view.inline_widget_opened_at = Some(Instant::now());
+        self.view.closing_inline_widget = None;
+    }
+
+    fn capture_inline_widget_exit(&mut self) {
+        if crate::animation::desktop_reduced_motion_enabled() {
+            self.view.closing_inline_widget = None;
+            return;
+        }
+        let Some(kind) = self.active_inline_widget() else {
+            return;
+        };
+        let lines = self.inline_widget_styled_lines();
+        self.capture_inline_widget_exit_snapshot(kind, lines);
+    }
+
+    fn capture_inline_widget_exit_snapshot(
+        &mut self,
+        kind: InlineWidgetKind,
+        lines: Vec<SingleSessionStyledLine>,
+    ) {
+        if crate::animation::desktop_reduced_motion_enabled() {
+            self.view.closing_inline_widget = None;
+            return;
+        }
+        if lines.is_empty() {
+            self.view.closing_inline_widget = None;
+            return;
+        }
+        self.view.closing_inline_widget = Some(ClosingInlineWidgetState {
+            kind,
+            lines,
+            started_at: Instant::now(),
+        });
     }
 
     fn close_inline_widgets(&mut self) {
+        self.capture_inline_widget_exit();
         self.show_help = false;
         self.show_session_info = false;
         self.model_picker.close();
         self.session_switcher.close();
+        self.view.inline_widget_opened_at = None;
     }
 
     fn open_read_only_inline_widget(&mut self, kind: InlineWidgetKind) {
@@ -1322,9 +2391,16 @@ impl SingleSessionApp {
         self.active_inline_widget().is_some() && self.inline_widget_reveal_progress() < 1.0
     }
 
+    fn inline_widget_exit_in_progress(&self) -> bool {
+        self.active_inline_widget().is_none() && self.render_inline_widget_reveal_progress() > 0.001
+    }
+
     pub(crate) fn inline_widget_reveal_progress(&self) -> f32 {
         if self.active_inline_widget().is_none() {
             return 0.0;
+        }
+        if crate::animation::desktop_reduced_motion_enabled() {
+            return 1.0;
         }
 
         #[cfg(test)]
@@ -1342,6 +2418,84 @@ impl SingleSessionApp {
             .clamp(0.0, 1.0);
             1.0 - (1.0 - raw).powi(3)
         }
+    }
+
+    pub(crate) fn render_inline_widget_kind(&self) -> Option<InlineWidgetKind> {
+        self.active_inline_widget().or_else(|| {
+            (self.render_inline_widget_reveal_progress() > 0.001)
+                .then(|| {
+                    self.view
+                        .closing_inline_widget
+                        .as_ref()
+                        .map(|closing| closing.kind)
+                })
+                .flatten()
+        })
+    }
+
+    pub(crate) fn render_inline_widget_styled_lines(&self) -> Vec<SingleSessionStyledLine> {
+        if self.active_inline_widget().is_some() {
+            return self.inline_widget_styled_lines();
+        }
+        if self.render_inline_widget_reveal_progress() <= 0.001 {
+            return Vec::new();
+        }
+        self.view
+            .closing_inline_widget
+            .as_ref()
+            .map(|closing| closing.lines.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn render_inline_widget_line_count(&self) -> usize {
+        if let Some(kind) = self.active_inline_widget() {
+            return self.active_inline_widget_line_count(kind);
+        }
+        if self.render_inline_widget_reveal_progress() <= 0.001 {
+            return 0;
+        }
+        self.view
+            .closing_inline_widget
+            .as_ref()
+            .map(|closing| closing.lines.len())
+            .unwrap_or(0)
+    }
+
+    fn active_inline_widget_line_count(&self, kind: InlineWidgetKind) -> usize {
+        match kind {
+            InlineWidgetKind::HotkeyHelp => hotkey_help_inline_line_count(),
+            InlineWidgetKind::ModelPicker => model_picker_inline_line_count(&self.model_picker),
+            InlineWidgetKind::SessionSwitcher => {
+                session_switcher_line_count(&self.session_switcher, self.current_session_id())
+            }
+            InlineWidgetKind::SessionInfo => session_info_inline_line_count(self),
+            InlineWidgetKind::SlashSuggestions => self.slash_suggestion_line_count(),
+        }
+    }
+
+    pub(crate) fn render_inline_widget_visible_line_count(&self) -> usize {
+        let line_count = self.render_inline_widget_line_count();
+        let limit = self
+            .render_inline_widget_kind()
+            .map(InlineWidgetKind::visible_line_limit)
+            .unwrap_or(INLINE_WIDGET_DEFAULT_VISIBLE_LINE_LIMIT);
+        line_count.min(limit)
+    }
+
+    pub(crate) fn render_inline_widget_reveal_progress(&self) -> f32 {
+        if self.active_inline_widget().is_some() {
+            return self.inline_widget_reveal_progress();
+        }
+        if crate::animation::desktop_reduced_motion_enabled() {
+            return 0.0;
+        }
+        let Some(closing) = &self.view.closing_inline_widget else {
+            return 0.0;
+        };
+        let raw = (closing.started_at.elapsed().as_secs_f32()
+            / INLINE_WIDGET_EXIT_DURATION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        1.0 - raw.powi(3)
     }
 
     fn current_session_id(&self) -> Option<&str> {
@@ -1386,6 +2540,13 @@ impl SingleSessionApp {
     }
 
     #[cfg(test)]
+    pub(crate) fn finish_inline_widget_exit_animation_for_test(&mut self) {
+        if let Some(closing) = &mut self.view.closing_inline_widget {
+            closing.started_at = Instant::now() - INLINE_WIDGET_EXIT_DURATION * 2;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn activity_indicator_active(&self) -> bool {
         self.has_activity_indicator()
     }
@@ -1414,7 +2575,7 @@ impl SingleSessionApp {
             DesktopSessionStatus::ReasoningEffort(effort) => {
                 self.runtime_settings.reasoning_effort = Some(effort.clone());
                 self.messages.push(SingleSessionMessage::meta(format!(
-                    "reasoning effort set to {effort}"
+                    "thinking level set to {effort}"
                 )));
             }
             DesktopSessionStatus::ServiceTier(service_tier) => {
@@ -1466,6 +2627,13 @@ impl SingleSessionApp {
             return self.handle_stdin_response_key(key);
         }
 
+        if self.session_switcher.open
+            && self.session_switcher.preview
+            && let Some(outcome) = self.handle_session_switcher_preview_key(&key)
+        {
+            return outcome;
+        }
+
         if self.session_switcher.open {
             return self.handle_session_switcher_key(key);
         }
@@ -1488,6 +2656,10 @@ impl SingleSessionApp {
         if self.active_inline_widget() == Some(InlineWidgetKind::SlashSuggestions)
             && let Some(outcome) = self.handle_slash_suggestion_key(&key)
         {
+            return outcome;
+        }
+
+        if let Some(outcome) = self.handle_issue_browser_key(&key) {
             return outcome;
         }
 
@@ -1549,6 +2721,9 @@ impl SingleSessionApp {
             KeyInput::CopyTranscript => self.copy_transcript(),
             KeyInput::ModelPickerMove(_) => KeyOutcome::None,
             KeyInput::CycleModel(direction) => KeyOutcome::CycleModel(direction),
+            KeyInput::CycleReasoningEffort(direction) => {
+                KeyOutcome::CycleReasoningEffort(direction)
+            }
             KeyInput::AttachClipboardImage => KeyOutcome::AttachClipboardImage,
             KeyInput::ClearAttachedImages => {
                 if self.clear_attached_images() {
@@ -1563,11 +2738,11 @@ impl SingleSessionApp {
             KeyInput::QueueDraft => self.submit_draft(),
             KeyInput::SubmitDraft => self.submit_draft(),
             KeyInput::Escape if self.show_help => {
-                self.show_help = false;
+                self.close_inline_widgets();
                 KeyOutcome::Redraw
             }
             KeyInput::Escape if self.show_session_info => {
-                self.show_session_info = false;
+                self.close_inline_widgets();
                 KeyOutcome::Redraw
             }
             KeyInput::Character(text)
@@ -1704,9 +2879,24 @@ impl SingleSessionApp {
         KeyOutcome::LoadModelCatalog
     }
 
+    fn open_session_switcher_preview(&mut self, filter: String) -> KeyOutcome {
+        let was_open = self.session_switcher.open;
+        self.close_inline_widgets();
+        let current_session_id = self.current_session_id().map(str::to_string);
+        self.session_switcher
+            .open_preview_loading(current_session_id.as_deref(), filter);
+        if !was_open {
+            self.mark_inline_widget_opened();
+        }
+        self.set_status(SingleSessionStatus::LoadingRecentSessions);
+        self.scroll_body_to_bottom();
+        KeyOutcome::LoadSessionSwitcher
+    }
+
     fn sync_model_picker_preview_from_draft(&mut self) -> Option<KeyOutcome> {
         let Some(filter) = model_picker_preview_filter(&self.draft) else {
             if self.model_picker.open && self.model_picker.preview {
+                self.capture_inline_widget_exit();
                 self.model_picker.close();
                 return Some(KeyOutcome::Redraw);
             }
@@ -1721,14 +2911,47 @@ impl SingleSessionApp {
         }
     }
 
+    fn sync_session_switcher_preview_from_draft(&mut self) -> Option<KeyOutcome> {
+        if !self.pending_images.is_empty() {
+            if self.session_switcher.open && self.session_switcher.preview {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                return Some(KeyOutcome::Redraw);
+            }
+            return None;
+        }
+
+        let Some(filter) = session_switcher_preview_filter(&self.draft) else {
+            if self.session_switcher.open && self.session_switcher.preview {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                return Some(KeyOutcome::Redraw);
+            }
+            return None;
+        };
+
+        if self.session_switcher.open && self.session_switcher.preview {
+            self.session_switcher.set_filter(filter);
+            Some(KeyOutcome::Redraw)
+        } else {
+            Some(self.open_session_switcher_preview(filter))
+        }
+    }
+
     fn sync_inline_previews_from_draft(&mut self) -> Option<KeyOutcome> {
         self.sync_slash_suggestions_from_draft();
         self.sync_model_picker_preview_from_draft()
+            .or_else(|| self.sync_session_switcher_preview_from_draft())
     }
 
     fn sync_slash_suggestions_from_draft(&mut self) {
         let was_visible = self.slash_suggestions_visible();
         let Some(query) = slash_suggestion_query(&self.draft, self.draft_cursor) else {
+            if was_visible
+                && self.active_inline_widget() == Some(InlineWidgetKind::SlashSuggestions)
+            {
+                self.capture_inline_widget_exit();
+            }
             self.slash_suggestions.query.clear();
             self.slash_suggestions.selected = 0;
             return;
@@ -1743,12 +2966,18 @@ impl SingleSessionApp {
             self.slash_suggestions.dismissed_for_draft = None;
         }
 
+        let previous_slash_lines = (was_visible
+            && self.active_inline_widget() == Some(InlineWidgetKind::SlashSuggestions))
+        .then(|| self.inline_widget_styled_lines());
         if self.slash_suggestions.query != query {
             self.slash_suggestions.query = query;
             self.slash_suggestions.selected = 0;
         }
         let candidate_count = self.slash_suggestion_candidates().len();
         if candidate_count == 0 {
+            if let Some(lines) = previous_slash_lines {
+                self.capture_inline_widget_exit_snapshot(InlineWidgetKind::SlashSuggestions, lines);
+            }
             self.slash_suggestions.selected = 0;
             return;
         }
@@ -1762,6 +2991,7 @@ impl SingleSessionApp {
     fn handle_slash_suggestion_key(&mut self, key: &KeyInput) -> Option<KeyOutcome> {
         match key {
             KeyInput::Escape => {
+                self.capture_inline_widget_exit();
                 self.slash_suggestions.dismissed_for_draft = Some(self.draft.clone());
                 Some(KeyOutcome::Redraw)
             }
@@ -1775,6 +3005,7 @@ impl SingleSessionApp {
             }
             KeyInput::Autocomplete => self.complete_selected_slash_suggestion(),
             KeyInput::SubmitDraft => {
+                self.capture_inline_widget_exit();
                 self.complete_selected_slash_suggestion();
                 Some(self.submit_draft())
             }
@@ -1817,7 +3048,32 @@ impl SingleSessionApp {
 
     fn handle_model_picker_preview_key(&mut self, key: &KeyInput) -> Option<KeyOutcome> {
         match key {
+            KeyInput::Character(text) if text == "j" => {
+                self.model_picker.move_selection(1);
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.model_picker.move_selection(-1);
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "g" => {
+                self.model_picker.select_first();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "G" => {
+                self.model_picker.select_last();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "q" => {
+                self.capture_inline_widget_exit();
+                self.model_picker.close();
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                Some(KeyOutcome::Redraw)
+            }
             KeyInput::Escape => {
+                self.capture_inline_widget_exit();
                 self.model_picker.close();
                 self.draft.clear();
                 self.draft_cursor = 0;
@@ -1843,12 +3099,14 @@ impl SingleSessionApp {
             }
             KeyInput::SubmitDraft => {
                 let Some(model) = self.model_picker.selected_model() else {
+                    self.capture_inline_widget_exit();
                     self.model_picker.close();
                     self.draft.clear();
                     self.draft_cursor = 0;
                     self.composer.input_undo_stack.clear();
                     return Some(KeyOutcome::Redraw);
                 };
+                self.capture_inline_widget_exit();
                 self.model_picker.close();
                 self.draft.clear();
                 self.draft_cursor = 0;
@@ -1860,6 +3118,144 @@ impl SingleSessionApp {
                 self.model_picker.open_preview_loading(filter);
                 self.set_status(SingleSessionStatus::LoadingModels);
                 Some(KeyOutcome::LoadModelCatalog)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_session_switcher_preview_key(&mut self, key: &KeyInput) -> Option<KeyOutcome> {
+        match key {
+            KeyInput::Character(text) if text == "j" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.scroll_preview(1);
+                } else {
+                    self.session_switcher.move_selection(1);
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "k" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.scroll_preview(-1);
+                } else {
+                    self.session_switcher.move_selection(-1);
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.session_switcher.focus_sessions();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.session_switcher.focus_preview();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "g" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll = 0;
+                } else {
+                    self.session_switcher.select_first();
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "G" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll =
+                        self.session_switcher.preview_line_count().saturating_sub(1);
+                } else {
+                    self.session_switcher.select_last();
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Character(text) if text == "q" => {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Escape => {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::ModelPickerMove(delta) => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.scroll_preview(*delta);
+                } else {
+                    self.session_switcher.move_selection(*delta);
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::ScrollBodyPages(pages) => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher
+                        .scroll_preview(if *pages > 0 { -8 } else { 8 });
+                } else {
+                    self.session_switcher
+                        .move_selection(if *pages > 0 { -5 } else { 5 });
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::Autocomplete => {
+                self.session_switcher.toggle_focus();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::MoveCursorLeft => {
+                self.session_switcher.focus_sessions();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::MoveCursorRight => {
+                self.session_switcher.focus_preview();
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::MoveToLineStart => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll = 0;
+                } else {
+                    self.session_switcher.select_first();
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::MoveToLineEnd => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll =
+                        self.session_switcher.preview_line_count().saturating_sub(1);
+                } else {
+                    self.session_switcher.select_last();
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            KeyInput::SubmitDraft => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                Some(self.resume_selected_switcher_session())
+            }
+            KeyInput::QueueDraft => {
+                let Some(session) = self.session_switcher.selected_session() else {
+                    return Some(KeyOutcome::None);
+                };
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                Some(KeyOutcome::OpenSession {
+                    session_id: session.session_id,
+                    title: session.title,
+                })
+            }
+            KeyInput::RefreshSessions => {
+                let current_session_id = self.current_session_id().map(str::to_string);
+                let filter = self.session_switcher.filter.clone();
+                self.session_switcher
+                    .open_preview_loading(current_session_id.as_deref(), filter);
+                self.set_status(SingleSessionStatus::LoadingRecentSessions);
+                Some(KeyOutcome::LoadSessionSwitcher)
             }
             _ => None,
         }
@@ -1878,18 +3274,45 @@ impl SingleSessionApp {
 
     fn handle_model_picker_key(&mut self, key: KeyInput) -> KeyOutcome {
         match key {
+            KeyInput::Character(text) if text == "j" => {
+                self.model_picker.move_selection(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                self.model_picker.move_selection(-1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.model_picker.column = self.model_picker.column.saturating_sub(1);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.model_picker.column = (self.model_picker.column + 1).min(2);
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "g" => {
+                self.model_picker.select_first();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "G" => {
+                self.model_picker.select_last();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "q" => {
+                self.capture_inline_widget_exit();
+                self.model_picker.close();
+                KeyOutcome::Redraw
+            }
             KeyInput::Escape if !self.model_picker.filter.is_empty() => {
                 self.model_picker.set_filter(String::new());
                 KeyOutcome::Redraw
             }
             KeyInput::Escape | KeyInput::OpenModelPicker => {
+                self.capture_inline_widget_exit();
                 self.model_picker.close();
                 KeyOutcome::Redraw
             }
-            KeyInput::OpenSessionSwitcher => {
-                self.model_picker.close();
-                self.open_session_switcher()
-            }
+            KeyInput::OpenSessionSwitcher => self.open_session_switcher(),
             KeyInput::RefreshSessions => {
                 self.model_picker.open_loading();
                 self.set_status(SingleSessionStatus::LoadingModels);
@@ -1925,6 +3348,7 @@ impl SingleSessionApp {
                 let Some(model) = self.model_picker.selected_model() else {
                     return KeyOutcome::None;
                 };
+                self.capture_inline_widget_exit();
                 self.model_picker.close();
                 KeyOutcome::SetModel(model)
             }
@@ -1946,7 +3370,54 @@ impl SingleSessionApp {
 
     fn handle_session_switcher_key(&mut self, key: KeyInput) -> KeyOutcome {
         match key {
+            KeyInput::Character(text) if text == "j" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.scroll_preview(1);
+                } else {
+                    self.session_switcher.move_selection(1);
+                }
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "k" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.scroll_preview(-1);
+                } else {
+                    self.session_switcher.move_selection(-1);
+                }
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "h" => {
+                self.session_switcher.focus_sessions();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "l" => {
+                self.session_switcher.focus_preview();
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "g" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll = 0;
+                } else {
+                    self.session_switcher.select_first();
+                }
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "G" => {
+                if self.session_switcher.focus == SessionSwitcherPane::Preview {
+                    self.session_switcher.preview_scroll =
+                        self.session_switcher.preview_line_count().saturating_sub(1);
+                } else {
+                    self.session_switcher.select_last();
+                }
+                KeyOutcome::Redraw
+            }
+            KeyInput::Character(text) if text == "q" => {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                KeyOutcome::Redraw
+            }
             KeyInput::Escape | KeyInput::OpenSessionSwitcher => {
+                self.capture_inline_widget_exit();
                 self.session_switcher.close();
                 KeyOutcome::Redraw
             }
@@ -2009,6 +3480,7 @@ impl SingleSessionApp {
                 let Some(session) = self.session_switcher.selected_session() else {
                     return KeyOutcome::None;
                 };
+                self.capture_inline_widget_exit();
                 self.session_switcher.close();
                 KeyOutcome::OpenSession {
                     session_id: session.session_id,
@@ -2028,11 +3500,9 @@ impl SingleSessionApp {
                 self.open_read_only_inline_widget(InlineWidgetKind::HotkeyHelp);
                 KeyOutcome::Redraw
             }
-            KeyInput::OpenModelPicker => {
-                self.session_switcher.close();
-                self.open_model_picker()
-            }
+            KeyInput::OpenModelPicker => self.open_model_picker(),
             KeyInput::SpawnPanel => {
+                self.capture_inline_widget_exit();
                 self.session_switcher.close();
                 KeyOutcome::SpawnSession
             }
@@ -2160,10 +3630,12 @@ impl SingleSessionApp {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn inline_widget_line_count(&self) -> usize {
         self.inline_widget_styled_lines().len()
     }
 
+    #[cfg(test)]
     pub(crate) fn inline_widget_visible_line_count(&self) -> usize {
         let line_count = self.inline_widget_line_count();
         let limit = self
@@ -2191,6 +3663,12 @@ impl SingleSessionApp {
             .slash_suggestions
             .selected
             .min(candidates.len().saturating_sub(1));
+        let usage_width = candidates
+            .iter()
+            .map(|(usage, _)| usage.chars().count())
+            .max()
+            .unwrap_or(0)
+            .clamp(10, 20);
         lines.extend(
             candidates
                 .into_iter()
@@ -2201,10 +3679,26 @@ impl SingleSessionApp {
                     } else {
                         SingleSessionLineStyle::Overlay
                     };
-                    styled_line(format!("  {usage:<24} {description}"), style)
+                    styled_line(
+                        format!(" {:<width$}  {}", usage, description, width = usage_width),
+                        style,
+                    )
                 }),
         );
         lines
+    }
+
+    fn slash_suggestion_line_count(&self) -> usize {
+        let candidate_count = self.slash_suggestion_candidate_count();
+        if candidate_count == 0 {
+            0
+        } else {
+            1 + candidate_count
+        }
+    }
+
+    fn slash_suggestion_candidate_count(&self) -> usize {
+        self.slash_suggestion_candidates().len()
     }
 
     fn slash_suggestion_candidates(&self) -> Vec<(&'static str, &'static str)> {
@@ -2246,7 +3740,7 @@ impl SingleSessionApp {
         fuzzy_matches.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.2.cmp(b.2))
         });
 
         prefix_matches
@@ -2281,7 +3775,7 @@ impl SingleSessionApp {
         if self.session_switcher.open {
             return SingleSessionOverlay::Inline {
                 kind: InlineWidgetKind::SessionSwitcher,
-                mode: InlineWidgetMode::Interactive,
+                mode: InlineWidgetKind::SessionSwitcher.mode(self),
             };
         }
         if self.model_picker.open {
@@ -2311,6 +3805,7 @@ impl SingleSessionApp {
         SingleSessionOverlay::None
     }
 
+    #[cfg(test)]
     pub(crate) fn active_inline_widget_uses_card_chrome(&self) -> bool {
         self.active_inline_widget().is_some()
     }
@@ -2409,6 +3904,8 @@ impl SingleSessionApp {
                     for (offset, tool_message) in tool_messages.iter().enumerate() {
                         let is_active_tool = self.tool.active_message_index
                             == Some(group_start.saturating_add(offset));
+                        let tool_run =
+                            self.tool_run_for_message_index(group_start.saturating_add(offset));
                         append_chat_message_lines(
                             &mut lines,
                             tool_message,
@@ -2419,12 +3916,13 @@ impl SingleSessionApp {
                             } else {
                                 None
                             },
+                            tool_run,
                         );
                     }
                 }
                 continue;
             }
-            append_chat_message_lines(&mut lines, message, &mut user_turn, false, None);
+            append_chat_message_lines(&mut lines, message, &mut user_turn, false, None, None);
             message_index += 1;
         }
         if include_streaming_response && !self.streaming_response.is_empty() {
@@ -2463,8 +3961,7 @@ impl SingleSessionApp {
             .hash(&mut hasher);
         hash_messages_cache_fingerprint(&self.messages, &mut hasher);
         hash_text_cache_fingerprint(&self.streaming_response, &mut hasher);
-        self.tool.active_message_index.hash(&mut hasher);
-        hash_text_cache_fingerprint(&self.tool.input_buffer, &mut hasher);
+        hash_tool_cache_fingerprint(&self.tool, &mut hasher);
         self.status.hash(&mut hasher);
         self.error.hash(&mut hasher);
         self.show_help.hash(&mut hasher);
@@ -2476,6 +3973,7 @@ impl SingleSessionApp {
         self.stdin_response.hash(&mut hasher);
         self.welcome.name.hash(&mut hasher);
         self.welcome.recovery_session_count.hash(&mut hasher);
+        self.welcome.continuation_suggestion.hash(&mut hasher);
         self.welcome.timeline.hash(&mut hasher);
         self.welcome.hero_phrase_index.hash(&mut hasher);
         self.view.text_scale.to_bits().hash(&mut hasher);
@@ -2499,8 +3997,7 @@ impl SingleSessionApp {
             })
             .hash(&mut hasher);
         hash_messages_cache_fingerprint(&self.messages, &mut hasher);
-        self.tool.active_message_index.hash(&mut hasher);
-        hash_text_cache_fingerprint(&self.tool.input_buffer, &mut hasher);
+        hash_tool_cache_fingerprint(&self.tool, &mut hasher);
         self.status.hash(&mut hasher);
         self.error.hash(&mut hasher);
         self.show_help.hash(&mut hasher);
@@ -2520,6 +4017,10 @@ impl SingleSessionApp {
 
     pub(crate) fn welcome_hero_text(&self) -> String {
         handwritten_welcome_phrase(self.welcome.hero_phrase_index).to_string()
+    }
+
+    pub(crate) fn welcome_continuation_suggestion(&self) -> Option<&str> {
+        self.welcome.continuation_suggestion.as_deref()
     }
 
     pub(crate) fn is_welcome_timeline_visible(&self) -> bool {
@@ -2556,6 +4057,75 @@ impl SingleSessionApp {
                 self.set_status(SingleSessionStatus::ServerReloading);
                 self.is_processing = true;
                 self.runtime.reload_phase = ReloadPhase::AwaitingReconnect;
+            }
+            DesktopSessionEvent::ReloadProgress {
+                step,
+                message,
+                success,
+                output,
+            } => {
+                let marker = match success {
+                    Some(true) => "✓ ",
+                    Some(false) => "✗ ",
+                    None => "",
+                };
+                let mut line = format!("reload {step}: {marker}{message}");
+                if let Some(output) = output.as_deref().filter(|output| !output.trim().is_empty()) {
+                    line.push_str(" — ");
+                    line.push_str(output.trim());
+                }
+                self.messages.push(SingleSessionMessage::meta(line));
+                self.set_status(SingleSessionStatus::Info(format!("reload: {message}")));
+            }
+            DesktopSessionEvent::RuntimeMetadata {
+                connection_type,
+                status_detail,
+                upstream_provider,
+            } => {
+                if let Some(connection_type) = connection_type {
+                    self.runtime_settings.connection_type = Some(connection_type);
+                }
+                if let Some(upstream_provider) = upstream_provider {
+                    self.runtime_settings.upstream_provider = Some(upstream_provider);
+                }
+                if let Some(status_detail) = status_detail {
+                    self.runtime_settings.status_detail = Some(status_detail.clone());
+                    self.set_status(SingleSessionStatus::Info(status_detail));
+                }
+            }
+            DesktopSessionEvent::TokenUsage {
+                input,
+                output,
+                cache_read_input,
+                cache_creation_input,
+            } => {
+                self.runtime_settings.token_usage = Some(SingleSessionTokenUsage {
+                    input,
+                    output,
+                    cache_read_input,
+                    cache_creation_input,
+                });
+            }
+            DesktopSessionEvent::SystemNotice { title, message } => {
+                let line = message
+                    .as_deref()
+                    .filter(|message| !message.trim().is_empty())
+                    .map(|message| format!("{title}: {}", message.trim()))
+                    .unwrap_or(title.clone());
+                self.messages.push(SingleSessionMessage::meta(line));
+                self.set_status(SingleSessionStatus::Info(title));
+            }
+            DesktopSessionEvent::SessionCloseRequested { reason } => {
+                self.finish_streaming_response();
+                self.is_processing = false;
+                self.stdin_response = None;
+                self.runtime.session_handle = None;
+                self.set_status(SingleSessionStatus::Info(
+                    "session close requested".to_string(),
+                ));
+                self.messages.push(SingleSessionMessage::meta(format!(
+                    "session close requested by server: {reason}"
+                )));
             }
             DesktopSessionEvent::Reloaded { session_id } => {
                 self.live_session_id = Some(session_id);
@@ -2596,7 +4166,7 @@ impl SingleSessionApp {
                 self.streaming_response = text;
                 self.set_status(SingleSessionStatus::Receiving);
             }
-            DesktopSessionEvent::ToolStarted { name } => {
+            DesktopSessionEvent::ToolStarted { id, name } => {
                 self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.collapse_active_tool_message();
@@ -2605,19 +4175,24 @@ impl SingleSessionApp {
                 self.messages
                     .push(SingleSessionMessage::tool(format!("▾ {name} preparing")));
                 self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
+                let message_index = self.messages.len().saturating_sub(1);
+                self.start_tool_run(id, &name, message_index);
             }
-            DesktopSessionEvent::ToolExecuting { name } => {
+            DesktopSessionEvent::ToolExecuting { id, name } => {
                 self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
                 self.set_status(SingleSessionStatus::ToolUsing(name.clone()));
+                self.update_tool_run_state(id, &name, SingleSessionToolVisualState::Running, None);
                 self.replace_active_tool_header(&format!("▾ {name} running"));
             }
-            DesktopSessionEvent::ToolInput { delta } => {
+            DesktopSessionEvent::ToolInput { id, delta } => {
                 self.runtime.reload_phase = ReloadPhase::Stable;
                 self.finish_streaming_response();
+                self.append_tool_run_input(id, &delta);
                 self.append_active_tool_input(&delta);
             }
             DesktopSessionEvent::ToolFinished {
+                id,
                 name,
                 summary,
                 is_error,
@@ -2630,6 +4205,16 @@ impl SingleSessionApp {
                 });
                 let marker = if is_error { "failed" } else { "done" };
                 let line = format!("▾ {name} {marker}: {summary}");
+                let finished_call_id = self.update_tool_run_state(
+                    id,
+                    &name,
+                    if is_error {
+                        SingleSessionToolVisualState::Failed
+                    } else {
+                        SingleSessionToolVisualState::Succeeded
+                    },
+                    Some(summary.clone()),
+                );
                 self.flush_active_tool_input_to_message();
                 if let Some(index) = self.tool.active_message_index
                     && let Some(message) = self.messages.get_mut(index)
@@ -2640,7 +4225,16 @@ impl SingleSessionApp {
                     message.set_content(replacement);
                 } else {
                     self.messages.push(SingleSessionMessage::tool(line));
-                    self.tool.active_message_index = Some(self.messages.len().saturating_sub(1));
+                    let message_index = self.messages.len().saturating_sub(1);
+                    self.tool.active_message_index = Some(message_index);
+                    if let Some(run) = self
+                        .tool
+                        .runs
+                        .iter_mut()
+                        .find(|run| run.call_id == finished_call_id)
+                    {
+                        run.message_index = message_index;
+                    }
                 }
             }
             DesktopSessionEvent::ModelChanged {
@@ -2715,6 +4309,7 @@ impl SingleSessionApp {
                     tool_call_id: tool_call_id.clone(),
                     input: String::new(),
                 });
+                self.mark_tool_stdin_prompt(&tool_call_id, display_prompt);
                 let sensitive = if is_password { " password" } else { "" };
                 self.messages.push(SingleSessionMessage::meta(format!(
                     "interactive{sensitive} input requested by {tool_call_id} ({request_id}): {display_prompt}"
@@ -2731,7 +4326,9 @@ impl SingleSessionApp {
                 self.stdin_response = None;
                 self.runtime.session_handle = None;
                 self.tool.active_message_index = None;
+                self.tool.active_call_id = None;
                 self.tool.input_buffer.clear();
+                self.clear_tool_stdin_prompts();
                 self.set_status(SingleSessionStatus::Ready);
             }
             DesktopSessionEvent::Error(error) => {
@@ -2741,7 +4338,9 @@ impl SingleSessionApp {
                 self.stdin_response = None;
                 self.runtime.session_handle = None;
                 self.tool.active_message_index = None;
+                self.tool.active_call_id = None;
                 self.tool.input_buffer.clear();
+                self.clear_tool_stdin_prompts();
                 self.set_status(SingleSessionStatus::Error);
                 self.error = Some(error);
             }
@@ -2759,6 +4358,7 @@ impl SingleSessionApp {
         match handle.cancel() {
             Ok(()) => {
                 self.stdin_response = None;
+                self.clear_tool_stdin_prompts();
                 self.set_status(SingleSessionStatus::Cancelling);
                 true
             }
@@ -2766,6 +4366,7 @@ impl SingleSessionApp {
                 self.error = Some(format!("{error:#}"));
                 self.is_processing = false;
                 self.stdin_response = None;
+                self.clear_tool_stdin_prompts();
                 self.runtime.session_handle = None;
                 true
             }
@@ -3048,6 +4649,10 @@ impl SingleSessionApp {
         let command = parts.next().unwrap_or_default();
         let args = parts.next().unwrap_or_default().trim();
 
+        if self.active_inline_widget() == Some(InlineWidgetKind::SlashSuggestions) {
+            self.capture_inline_widget_exit();
+        }
+
         let outcome = match command {
             "/help" | "/?" | "/commands" => {
                 self.draft.clear();
@@ -3085,6 +4690,22 @@ impl SingleSessionApp {
                 self.composer.input_undo_stack.clear();
                 KeyOutcome::SpawnSession
             }
+            "/issues" => {
+                if matches!(args, "refresh" | "sync") {
+                    return Some(self.toggle_issue_browser(Some(true)));
+                }
+                if args == "preview" {
+                    let outcome = self.toggle_issue_browser(Some(true));
+                    self.side_panel.focus = DesktopSidePanelFocus::IssuePreview;
+                    return Some(outcome);
+                }
+                let visible = match args {
+                    "on" | "open" | "show" => Some(true),
+                    "off" | "close" | "hide" => Some(false),
+                    _ => None,
+                };
+                self.toggle_issue_browser(visible)
+            }
             "/sessions" | "/session" | "/resume" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
@@ -3110,6 +4731,15 @@ impl SingleSessionApp {
                 ));
                 KeyOutcome::RefreshModelCatalog
             }
+            "/reload" | "/force-reload" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "force reloading desktop".to_string(),
+                ));
+                KeyOutcome::ForceReload
+            }
             "/effort" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
@@ -3121,16 +4751,63 @@ impl SingleSessionApp {
                         .as_deref()
                         .unwrap_or("default");
                     self.set_status(SingleSessionStatus::Info(format!(
-                        "effort: {current} · use /effort <none|low|medium|high|xhigh>"
+                        "effort: {current} · use /effort <none|low|medium|high|xhigh|max>"
                     )));
                     KeyOutcome::Redraw
-                } else if matches!(args, "none" | "low" | "medium" | "high" | "xhigh") {
+                } else if matches!(args, "none" | "low" | "medium" | "high" | "xhigh" | "max") {
                     KeyOutcome::SetReasoningEffort(args.to_string())
                 } else {
                     self.set_status(SingleSessionStatus::Info(
-                        "usage: /effort <none|low|medium|high|xhigh>".to_string(),
+                        "usage: /effort <none|low|medium|high|xhigh|max>".to_string(),
                     ));
                     KeyOutcome::Redraw
+                }
+            }
+            "/font" | "/fonts" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                let mut args = args.split_whitespace();
+                match (args.next(), args.collect::<Vec<_>>().join(" ")) {
+                    (None, _) | (Some("status"), _) => {
+                        let options = SINGLE_SESSION_HANDWRITING_FONT_FAMILIES.join(", ");
+                        self.set_status(SingleSessionStatus::Info(format!(
+                            "fonts: user={} · ai={} · options: default, {options}",
+                            single_session_user_font_family(),
+                            single_session_assistant_font_family()
+                        )));
+                        KeyOutcome::Redraw
+                    }
+                    (Some("user"), value) if !value.is_empty() => {
+                        if let Some(family) = set_single_session_user_font_family(&value) {
+                            self.set_status(SingleSessionStatus::Info(format!(
+                                "user font set to {family}"
+                            )));
+                        } else {
+                            self.set_status(SingleSessionStatus::Info(
+                                "unknown font · try /font status".to_string(),
+                            ));
+                        }
+                        KeyOutcome::Redraw
+                    }
+                    (Some("ai" | "assistant"), value) if !value.is_empty() => {
+                        if let Some(family) = set_single_session_assistant_font_family(&value) {
+                            self.set_status(SingleSessionStatus::Info(format!(
+                                "AI font set to {family}"
+                            )));
+                        } else {
+                            self.set_status(SingleSessionStatus::Info(
+                                "unknown font · try /font status".to_string(),
+                            ));
+                        }
+                        KeyOutcome::Redraw
+                    }
+                    _ => {
+                        self.set_status(SingleSessionStatus::Info(
+                            "usage: /font [status|user <name>|ai <name>]".to_string(),
+                        ));
+                        KeyOutcome::Redraw
+                    }
                 }
             }
             "/fast" => {
@@ -3339,7 +5016,7 @@ impl SingleSessionApp {
                     KeyOutcome::Redraw
                 }
             }
-            "/status" => {
+            "/status" | "/info" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
                 self.composer.input_undo_stack.clear();
@@ -3407,10 +5084,21 @@ impl SingleSessionApp {
             anyhow::bail!("no active desktop session to receive interactive input");
         };
         handle.send_stdin_response(request_id, input)?;
+        self.clear_tool_stdin_prompts();
         self.set_status(SingleSessionStatus::Info(
             "interactive input sent".to_string(),
         ));
         Ok(())
+    }
+
+    pub(crate) fn set_reasoning_effort_via_active_session(
+        &mut self,
+        effort: String,
+    ) -> anyhow::Result<()> {
+        let Some(handle) = &self.runtime.session_handle else {
+            anyhow::bail!("no active desktop session to receive reasoning effort change");
+        };
+        handle.set_reasoning_effort(effort)
     }
 
     fn queue_draft(&mut self) -> KeyOutcome {
@@ -3710,10 +5398,168 @@ impl SingleSessionApp {
         self.streaming_response.clear();
     }
 
+    fn next_tool_event_sequence(&mut self) -> u64 {
+        self.tool.event_sequence = self.tool.event_sequence.saturating_add(1);
+        self.tool.event_sequence
+    }
+
+    fn start_tool_run(&mut self, id: Option<String>, name: &str, message_index: usize) -> String {
+        let sequence = self.next_tool_event_sequence();
+        let call_id =
+            normalized_tool_call_id(id).unwrap_or_else(|| format!("desktop-tool-{sequence}"));
+        if let Some(run) = self.tool.runs.iter_mut().find(|run| run.call_id == call_id) {
+            run.message_index = message_index;
+            run.name = name.to_string();
+            run.state = SingleSessionToolVisualState::Preparing;
+            run.summary = None;
+            run.input_raw.clear();
+            run.input_preview = None;
+            run.stdin_prompt = None;
+            run.updated_sequence = sequence;
+            run.completed_sequence = None;
+        } else {
+            self.tool.runs.push(SingleSessionToolRun {
+                call_id: call_id.clone(),
+                message_index,
+                name: name.to_string(),
+                state: SingleSessionToolVisualState::Preparing,
+                summary: None,
+                input_raw: String::new(),
+                input_preview: None,
+                stdin_prompt: None,
+                started_sequence: sequence,
+                updated_sequence: sequence,
+                completed_sequence: None,
+            });
+        }
+        self.tool.active_call_id = Some(call_id.clone());
+        call_id
+    }
+
+    fn update_tool_run_state(
+        &mut self,
+        id: Option<String>,
+        name: &str,
+        state: SingleSessionToolVisualState,
+        summary: Option<String>,
+    ) -> String {
+        let sequence = self.next_tool_event_sequence();
+        let call_id = normalized_tool_call_id(id)
+            .or_else(|| self.tool.active_call_id.clone())
+            .or_else(|| {
+                self.tool
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|run| run.name == name && run.state.is_active())
+                    .map(|run| run.call_id.clone())
+            })
+            .unwrap_or_else(|| format!("desktop-tool-{sequence}"));
+        let message_index = self
+            .tool
+            .active_message_index
+            .unwrap_or_else(|| self.messages.len().saturating_sub(1));
+        let summary = summary.filter(|summary| !summary.trim().is_empty());
+        if let Some(run) = self.tool.runs.iter_mut().find(|run| run.call_id == call_id) {
+            run.message_index = message_index;
+            run.name = name.to_string();
+            run.state = state;
+            run.summary = summary.clone();
+            run.updated_sequence = sequence;
+            run.completed_sequence = matches!(
+                state,
+                SingleSessionToolVisualState::Succeeded | SingleSessionToolVisualState::Failed
+            )
+            .then_some(sequence);
+        } else {
+            self.tool.runs.push(SingleSessionToolRun {
+                call_id: call_id.clone(),
+                message_index,
+                name: name.to_string(),
+                state,
+                summary,
+                input_raw: String::new(),
+                input_preview: None,
+                stdin_prompt: None,
+                started_sequence: sequence,
+                updated_sequence: sequence,
+                completed_sequence: matches!(
+                    state,
+                    SingleSessionToolVisualState::Succeeded | SingleSessionToolVisualState::Failed
+                )
+                .then_some(sequence),
+            });
+        }
+        self.tool.active_call_id = Some(call_id.clone());
+        call_id
+    }
+
+    fn append_tool_run_input(&mut self, id: Option<String>, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let sequence = self.next_tool_event_sequence();
+        let call_id = normalized_tool_call_id(id)
+            .or_else(|| self.tool.active_call_id.clone())
+            .or_else(|| self.tool.runs.last().map(|run| run.call_id.clone()));
+        let Some(call_id) = call_id else {
+            return;
+        };
+        if let Some(run) = self.tool.runs.iter_mut().find(|run| run.call_id == call_id) {
+            run.input_raw.push_str(delta);
+            run.input_preview =
+                compact_tool_metadata(&formatted_tool_input_lines(&run.name, &run.input_raw));
+            run.updated_sequence = sequence;
+        }
+    }
+
+    fn mark_tool_stdin_prompt(&mut self, tool_call_id: &str, prompt: &str) {
+        let sequence = self.next_tool_event_sequence();
+        if let Some(run) = self
+            .tool
+            .runs
+            .iter_mut()
+            .rev()
+            .find(|run| run.call_id == tool_call_id)
+        {
+            run.stdin_prompt = Some(prompt.to_string());
+            run.updated_sequence = sequence;
+            return;
+        }
+        if let Some(run) = self
+            .tool
+            .runs
+            .iter_mut()
+            .rev()
+            .find(|run| run.state.is_active())
+        {
+            run.stdin_prompt = Some(prompt.to_string());
+            run.updated_sequence = sequence;
+        }
+    }
+
+    fn clear_tool_stdin_prompts(&mut self) {
+        let sequence = self.next_tool_event_sequence();
+        for run in &mut self.tool.runs {
+            if run.stdin_prompt.is_some() {
+                run.stdin_prompt = None;
+                run.updated_sequence = sequence;
+            }
+        }
+    }
+
+    fn tool_run_for_message_index(&self, message_index: usize) -> Option<&SingleSessionToolRun> {
+        self.tool
+            .runs
+            .iter()
+            .find(|run| run.message_index == message_index)
+    }
+
     fn collapse_active_tool_message(&mut self) {
         let Some(index) = self.tool.active_message_index.take() else {
             return;
         };
+        self.tool.active_call_id = None;
         let Some(message) = self.messages.get_mut(index) else {
             return;
         };
@@ -3907,7 +5753,12 @@ impl SingleSessionApp {
         self.draft_cursor = 0;
         self.clear_draft_selection();
         if self.model_picker.open && self.model_picker.preview {
+            self.capture_inline_widget_exit();
             self.model_picker.close();
+        }
+        if self.session_switcher.open && self.session_switcher.preview {
+            self.capture_inline_widget_exit();
+            self.session_switcher.close();
         }
         self.set_status(SingleSessionStatus::Info(
             "Input cleared - Ctrl+Z to restore".to_string(),
@@ -3916,20 +5767,12 @@ impl SingleSessionApp {
     }
 
     fn autocomplete_draft(&mut self) -> KeyOutcome {
-        const DESKTOP_SLASH_COMPLETIONS: &[&str] = &[
-            "/help",
-            "/clear",
-            "/new",
-            "/sessions",
-            "/model",
-            "/copy",
-            "/search",
-            "/stop",
-            "/status",
-            "/quit",
-        ];
+        let completions = DESKTOP_SLASH_COMMANDS
+            .iter()
+            .map(|(usage, _)| usage.split_whitespace().next().unwrap_or(*usage))
+            .collect::<Vec<_>>();
         let Some((draft, cursor)) =
-            complete_slash_command(&self.draft, self.draft_cursor, DESKTOP_SLASH_COMPLETIONS)
+            complete_slash_command(&self.draft, self.draft_cursor, &completions)
         else {
             return KeyOutcome::None;
         };
@@ -4100,6 +5943,210 @@ pub(crate) fn sanitize_welcome_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+#[derive(Clone, Debug)]
+struct ExternalCliSessionCandidate {
+    source: &'static str,
+    modified: SystemTime,
+    working_dir: Option<String>,
+    context: Option<String>,
+}
+
+fn latest_external_cli_continuation_suggestion() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        latest_external_cli_continuation_suggestion_from_home(&home)
+    }))
+    .ok()
+    .flatten()
+}
+
+fn latest_external_cli_continuation_suggestion_from_home(home: &Path) -> Option<String> {
+    let mut candidates = Vec::new();
+    candidates.extend(latest_jsonl_candidates(
+        &home.join(".codex/sessions"),
+        "Codex",
+        32,
+    ));
+    candidates.extend(latest_jsonl_candidates(
+        &home.join(".claude/projects"),
+        "Claude Code",
+        32,
+    ));
+    latest_external_cli_continuation_suggestion_from_candidates(candidates)
+}
+
+fn latest_external_cli_continuation_suggestion_from_candidates(
+    candidates: Vec<ExternalCliSessionCandidate>,
+) -> Option<String> {
+    let candidate = candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.modified)?;
+    let location = candidate
+        .working_dir
+        .as_deref()
+        .and_then(|dir| Path::new(dir).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!(" in {name}"))
+        .unwrap_or_default();
+    let context = candidate
+        .context
+        .as_deref()
+        .map(|context| format!(": {}", compact_tool_text(context, 72)))
+        .unwrap_or_default();
+    Some(format!(
+        "continue the latest {source} session{location}{context}",
+        source = candidate.source
+    ))
+}
+
+fn latest_jsonl_candidates(
+    root: &Path,
+    source: &'static str,
+    scan_limit: usize,
+) -> Vec<ExternalCliSessionCandidate> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    collect_recent_jsonl_files(root, &mut files, scan_limit.saturating_mul(8));
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.truncate(scan_limit);
+    files
+        .into_iter()
+        .filter_map(|(path, modified)| external_cli_candidate_from_jsonl(&path, source, modified))
+        .collect()
+}
+
+fn collect_recent_jsonl_files(
+    root: &Path,
+    files: &mut Vec<(PathBuf, SystemTime)>,
+    max_files: usize,
+) {
+    if files.len() >= max_files {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= max_files {
+            break;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_recent_jsonl_files(&path, files, max_files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push((path, metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+        }
+    }
+}
+
+fn external_cli_candidate_from_jsonl(
+    path: &Path,
+    source: &'static str,
+    modified: SystemTime,
+) -> Option<ExternalCliSessionCandidate> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut working_dir = None;
+    let mut last_user_text = None;
+    let mut summary_text = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if working_dir.is_none() {
+            working_dir = value
+                .get("cwd")
+                .or_else(|| value.get("payload").and_then(|payload| payload.get("cwd")))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+        }
+        if summary_text.is_none() {
+            summary_text = value
+                .get("summary")
+                .or_else(|| {
+                    value
+                        .get("payload")
+                        .and_then(|payload| payload.get("summary"))
+                })
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+        }
+        if jsonl_message_role(&value) == Some("user")
+            && let Some(text) = jsonl_message_text(&value)
+            && !text.trim().is_empty()
+        {
+            last_user_text = Some(text);
+        }
+    }
+    if working_dir.is_none() && last_user_text.is_none() && summary_text.is_none() {
+        return None;
+    }
+    Some(ExternalCliSessionCandidate {
+        source,
+        modified,
+        working_dir,
+        context: last_user_text.or(summary_text),
+    })
+}
+
+fn jsonl_message_role(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .or_else(|| value.get("role"))
+        .or_else(|| value.get("payload").and_then(|payload| payload.get("role")))
+        .and_then(|role| role.as_str())
+}
+
+fn jsonl_message_text(value: &serde_json::Value) -> Option<String> {
+    let content = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .or_else(|| value.get("content"))
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("content"))
+        })?;
+    text_from_json_content(content)
+}
+
+fn text_from_json_content(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    let blocks = value.as_array()?;
+    let text = blocks
+        .iter()
+        .filter_map(|block| {
+            block
+                .get("text")
+                .or_else(|| block.get("content"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() { None } else { Some(text) }
+}
+
 fn stdin_response_styled_lines(state: &StdinResponseState) -> Vec<SingleSessionStyledLine> {
     let kind = if state.is_password {
         "interactive password input"
@@ -4167,25 +6214,40 @@ fn session_switcher_styled_lines(
     switcher: &SessionSwitcherState,
     current_session_id: Option<&str>,
 ) -> Vec<SingleSessionStyledLine> {
+    let visible = switcher.filtered_indices();
+    let session_count = if switcher.filter.trim().is_empty() {
+        switcher.sessions.len().to_string()
+    } else {
+        format!("{}/{}", visible.len(), switcher.sessions.len())
+    };
+    let filter_label = if switcher.filter.trim().is_empty() {
+        "all".to_string()
+    } else {
+        format!("filter {}", switcher.filter.trim())
+    };
+    let selected_label = switcher
+        .selected_session()
+        .map(|session| compact_tool_text(&session.title, 44))
+        .unwrap_or_else(|| "no session selected".to_string());
     let mut lines = vec![
         styled_line(
-            "desktop session switcher",
+            format!("Resume sessions · {session_count} sessions · {filter_label}"),
             SingleSessionLineStyle::OverlayTitle,
         ),
         styled_line(
-            "↑/↓ select · Tab/←/→ panes · PgUp/PgDn scroll · type filter · Enter resume here · Ctrl+Enter terminal · Ctrl+R reload · Ctrl+P/Esc close",
+            "Type to filter · Up/Down select · Tab or Left/Right preview · PageUp/PageDown scroll · Enter resume here · Ctrl+Enter open terminal · Esc close",
             SingleSessionLineStyle::Overlay,
         ),
         styled_line(
             format!(
-                "filter: {} · focus: {} · sessions: {}",
+                "selected: {} · filter: {} · focus: {}",
+                selected_label,
                 if switcher.filter.is_empty() {
                     "<none>"
                 } else {
                     switcher.filter.as_str()
                 },
                 session_switcher_focus_label(switcher.focus),
-                switcher.sessions.len()
             ),
             SingleSessionLineStyle::Meta,
         ),
@@ -4199,7 +6261,6 @@ fn session_switcher_styled_lines(
         ));
     }
 
-    let visible = switcher.filtered_indices();
     if visible.is_empty() && !switcher.loading {
         let message = if switcher.sessions.is_empty() {
             "no recent sessions found"
@@ -4214,102 +6275,93 @@ fn session_switcher_styled_lines(
         return lines;
     }
 
-    const ROW_LIMIT: usize = 16;
-    const LIST_COLUMNS: usize = 58;
-    const PREVIEW_COLUMNS: usize = 78;
+    const CARD_LIMIT: usize = 5;
+    const BODY_ROW_LIMIT: usize = 9;
+    const CONTENT_COLUMNS: usize = 92;
 
-    let list_header = if switcher.focus == SessionSwitcherPane::Sessions {
-        "sessions ›"
+    let sessions_header = if switcher.focus == SessionSwitcherPane::Sessions {
+        "Recent sessions · focused"
     } else {
-        "sessions"
-    };
-    let preview_header = if switcher.focus == SessionSwitcherPane::Preview {
-        "preview ›"
-    } else {
-        "preview"
+        "Recent sessions"
     };
     lines.push(styled_line(
-        format!(
-            "{} │ {}",
-            pad_columns(list_header, LIST_COLUMNS),
-            truncate_chars(preview_header, PREVIEW_COLUMNS)
-        ),
+        format!("{sessions_header} · newest first"),
         SingleSessionLineStyle::OverlayTitle,
     ));
+
+    let (window_start, row_indices) = switcher.visible_row_window(CARD_LIMIT);
+    let row_count = row_indices.len();
+    for (offset, index) in row_indices.iter().enumerate() {
+        if let Some(session) = switcher.sessions.get(*index) {
+            let position = window_start + offset;
+            lines.extend(
+                session_switcher_list_card_lines(
+                    switcher,
+                    current_session_id,
+                    position,
+                    session,
+                    CONTENT_COLUMNS,
+                )
+                .into_iter()
+                .map(|line| styled_line(line.text, line.style)),
+            );
+            if offset + 1 < row_count {
+                lines.push(blank_styled_line());
+            }
+        }
+    }
+
+    if window_start + row_indices.len() < visible.len() {
+        lines.push(styled_line(
+            format!(
+                "{} more sessions · keep pressing ↓ or type to filter",
+                visible.len() - window_start - row_indices.len()
+            ),
+            SingleSessionLineStyle::Overlay,
+        ));
+    }
+
+    lines.push(blank_styled_line());
+    let preview_header = if switcher.focus == SessionSwitcherPane::Preview {
+        "Preview · focused"
+    } else {
+        "Preview"
+    };
     lines.push(styled_line(
-        format!(
-            "{}─┼─{}",
-            "─".repeat(LIST_COLUMNS),
-            "─".repeat(PREVIEW_COLUMNS.min(72))
-        ),
-        SingleSessionLineStyle::Meta,
+        format!("{preview_header} · selected session transcript"),
+        SingleSessionLineStyle::OverlayTitle,
     ));
 
-    let (window_start, row_indices) = switcher.visible_row_window(ROW_LIMIT);
     let preview_lines = switcher
         .selected_session()
         .map(|session| session_switcher_preview_lines_for_session(&session))
-        .unwrap_or_else(|| vec!["No session selected".to_string()]);
+        .unwrap_or_else(|| {
+            vec![SessionSwitcherRenderedLine::new(
+                "No session selected".to_string(),
+                SingleSessionLineStyle::Meta,
+            )]
+        });
     let preview_scroll = switcher
         .preview_scroll
         .min(preview_lines.len().saturating_sub(1));
     let preview_visible = preview_lines
         .iter()
         .skip(preview_scroll)
-        .take(ROW_LIMIT)
+        .take(BODY_ROW_LIMIT)
         .cloned()
         .collect::<Vec<_>>();
-    let row_count = row_indices.len().max(preview_visible.len()).max(1);
-
-    for row in 0..row_count {
-        let absolute_position = window_start + row;
-        let list_cell = row_indices
-            .get(row)
-            .and_then(|index| switcher.sessions.get(*index))
-            .map(|session| {
-                session_switcher_list_cell(
-                    switcher,
-                    current_session_id,
-                    absolute_position,
-                    session,
-                    LIST_COLUMNS,
-                )
-            })
-            .unwrap_or_else(|| " ".repeat(LIST_COLUMNS));
-        let preview_cell = preview_visible
-            .get(row)
-            .map(|line| truncate_chars(line, PREVIEW_COLUMNS))
-            .unwrap_or_default();
-        let selected_row = absolute_position == switcher.selected && row < row_indices.len();
-        lines.push(styled_line(
-            format!(
-                "{} │ {}",
-                pad_columns(&list_cell, LIST_COLUMNS),
-                preview_cell
-            ),
-            if selected_row {
-                SingleSessionLineStyle::OverlaySelection
-            } else {
-                SingleSessionLineStyle::Overlay
-            },
-        ));
-    }
-
-    if window_start + row_indices.len() < visible.len() {
-        lines.push(styled_line(
-            format!(
-                "… {} more sessions",
-                visible.len() - window_start - row_indices.len()
-            ),
-            SingleSessionLineStyle::Overlay,
-        ));
-    }
-    if preview_scroll > 0 || preview_scroll + preview_visible.len() < preview_lines.len() {
+    let preview_visible_len = preview_visible.len();
+    lines.extend(
+        preview_visible
+            .into_iter()
+            .map(|line| styled_line(truncate_chars(&line.text, CONTENT_COLUMNS), line.style)),
+    );
+    if preview_scroll > 0 || preview_scroll + preview_visible_len < preview_lines.len() {
         lines.push(styled_line(
             format!(
                 "preview lines {}-{} of {}",
                 preview_scroll + 1,
-                preview_scroll + preview_visible.len(),
+                preview_scroll + preview_visible_len,
                 preview_lines.len()
             ),
             SingleSessionLineStyle::Meta,
@@ -4319,6 +6371,63 @@ fn session_switcher_styled_lines(
     lines
 }
 
+fn session_switcher_line_count(
+    switcher: &SessionSwitcherState,
+    current_session_id: Option<&str>,
+) -> usize {
+    let visible_len = switcher.filtered_indices().len();
+    let mut count = 4;
+
+    if switcher.loading {
+        count += 1;
+    }
+
+    if visible_len == 0 && !switcher.loading {
+        return count + 2;
+    }
+
+    const CARD_LIMIT: usize = 5;
+    const BODY_ROW_LIMIT: usize = 9;
+    count += 1; // Recent sessions header.
+    let (window_start, window_len) = row_window_bounds(visible_len, switcher.selected, CARD_LIMIT);
+    count += window_len * 4 + window_len.saturating_sub(1);
+    if window_start + window_len < visible_len {
+        count += 1;
+    }
+
+    count += 2; // Blank spacer and preview header.
+    let preview_len = switcher
+        .selected_session_ref()
+        .map(session_switcher_preview_line_count_for_session)
+        .unwrap_or(1);
+    let preview_scroll = switcher.preview_scroll.min(preview_len.saturating_sub(1));
+    let preview_visible_len = preview_len
+        .saturating_sub(preview_scroll)
+        .min(BODY_ROW_LIMIT);
+    count += preview_visible_len;
+    if preview_scroll > 0 || preview_scroll + preview_visible_len < preview_len {
+        count += 1;
+    }
+
+    let _ = current_session_id;
+    count
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionSwitcherRenderedLine {
+    text: String,
+    style: SingleSessionLineStyle,
+}
+
+impl SessionSwitcherRenderedLine {
+    fn new(text: impl Into<String>, style: SingleSessionLineStyle) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
 fn session_switcher_focus_label(focus: SessionSwitcherPane) -> &'static str {
     match focus {
         SessionSwitcherPane::Sessions => "sessions",
@@ -4326,41 +6435,87 @@ fn session_switcher_focus_label(focus: SessionSwitcherPane) -> &'static str {
     }
 }
 
-fn session_switcher_list_cell(
+fn session_switcher_list_card_lines(
     switcher: &SessionSwitcherState,
     current_session_id: Option<&str>,
     position: usize,
     session: &workspace::SessionCard,
     width: usize,
-) -> String {
-    let selector = if position == switcher.selected {
-        "›"
-    } else {
-        " "
-    };
+) -> Vec<SessionSwitcherRenderedLine> {
     let current_marker = if Some(session.session_id.as_str()) == current_session_id {
-        "✓"
+        "current · "
     } else {
-        " "
+        ""
+    };
+    let selected = position == switcher.selected;
+    let primary_style = if selected {
+        SingleSessionLineStyle::OverlaySelection
+    } else {
+        SingleSessionLineStyle::Overlay
+    };
+    let meta_style = if selected {
+        SingleSessionLineStyle::OverlaySelection
+    } else {
+        SingleSessionLineStyle::Meta
+    };
+    let preview_style = if selected {
+        SingleSessionLineStyle::OverlaySelection
+    } else {
+        SingleSessionLineStyle::Overlay
     };
     let status = session_status_badge(session);
-    let line = format!(
-        "{selector} {current_marker} {} · {status} · {}",
-        session.title, session.detail
-    );
-    truncate_chars(&line, width)
+    let model = session_model_label(session).unwrap_or_else(|| "model unknown".to_string());
+    let preview = session
+        .preview_lines
+        .last()
+        .or_else(|| session.detail_lines.last())
+        .map(|line| session_switcher_compact_transcript_line(line, width.saturating_sub(8)))
+        .unwrap_or_else(|| "no transcript preview yet".to_string());
+    let card_text = |text: String| -> String {
+        format!("      {}", truncate_chars(&text, width.saturating_sub(6)))
+    };
+    vec![
+        SessionSwitcherRenderedLine::new(
+            card_text(format!(
+                "{} session · {current_marker}{}",
+                session_status_label(session),
+                session.title
+            )),
+            primary_style,
+        ),
+        SessionSwitcherRenderedLine::new(
+            card_text(format!("Status {status} · Model {model}")),
+            meta_style,
+        ),
+        SessionSwitcherRenderedLine::new(card_text(session.detail.clone()), meta_style),
+        SessionSwitcherRenderedLine::new(card_text(preview), preview_style),
+    ]
 }
 
-fn session_switcher_preview_lines_for_session(session: &workspace::SessionCard) -> Vec<String> {
+fn session_switcher_preview_lines_for_session(
+    session: &workspace::SessionCard,
+) -> Vec<SessionSwitcherRenderedLine> {
     let mut lines = vec![
-        format!("{}", session.title),
-        format!("id: {}", session.session_id),
+        SessionSwitcherRenderedLine::new(
+            session.title.clone(),
+            SingleSessionLineStyle::OverlayTitle,
+        ),
+        SessionSwitcherRenderedLine::new(
+            format!("id: {}", session.session_id),
+            SingleSessionLineStyle::Meta,
+        ),
     ];
     if !session.subtitle.is_empty() {
-        lines.push(session.subtitle.clone());
+        lines.push(SessionSwitcherRenderedLine::new(
+            session.subtitle.to_string(),
+            SingleSessionLineStyle::Status,
+        ));
     }
     if !session.detail.is_empty() {
-        lines.push(session.detail.clone());
+        lines.push(SessionSwitcherRenderedLine::new(
+            session.detail.clone(),
+            SingleSessionLineStyle::Meta,
+        ));
     }
     let transcript = if session.detail_lines.is_empty() {
         &session.preview_lines
@@ -4368,41 +6523,132 @@ fn session_switcher_preview_lines_for_session(session: &workspace::SessionCard) 
         &session.detail_lines
     };
     if transcript.is_empty() {
-        lines.push("no transcript preview available".to_string());
+        lines.push(SessionSwitcherRenderedLine::new(
+            "no transcript preview available".to_string(),
+            SingleSessionLineStyle::Meta,
+        ));
     } else {
-        lines.push("recent transcript".to_string());
-        lines.extend(transcript.iter().cloned());
+        lines.push(SessionSwitcherRenderedLine::new(
+            "recent transcript".to_string(),
+            SingleSessionLineStyle::OverlayTitle,
+        ));
+        let mut user_turn = 1usize;
+        for line in transcript {
+            lines.push(session_switcher_transcript_preview_line(
+                line,
+                &mut user_turn,
+            ));
+        }
     }
     lines
 }
 
+fn session_switcher_preview_line_count_for_session(session: &workspace::SessionCard) -> usize {
+    let mut count = 2;
+    if !session.subtitle.is_empty() {
+        count += 1;
+    }
+    if !session.detail.is_empty() {
+        count += 1;
+    }
+    let transcript_len = if session.detail_lines.is_empty() {
+        session.preview_lines.len()
+    } else {
+        session.detail_lines.len()
+    };
+    if transcript_len == 0 {
+        count + 1
+    } else {
+        count + 1 + transcript_len
+    }
+}
+
 fn session_status_badge(session: &workspace::SessionCard) -> String {
-    let status = session
+    let status = session_status_label(session);
+    status.to_string()
+}
+
+fn session_status_label(session: &workspace::SessionCard) -> &str {
+    session
         .subtitle
         .split('·')
         .next()
         .map(str::trim)
         .filter(|status| !status.is_empty())
-        .unwrap_or("unknown");
-    let icon = match status {
-        "active" => "▶",
-        "closed" => "✓",
-        "crashed" => "💥",
-        "reloaded" => "↻",
-        "compacted" => "📦",
-        status if status.contains("error") => "✕",
-        _ => "•",
-    };
-    format!("{icon} {status}")
+        .unwrap_or("unknown")
 }
 
-fn pad_columns(text: &str, width: usize) -> String {
-    let text = truncate_chars(text, width);
-    let len = text.chars().count();
-    if len >= width {
-        text
-    } else {
-        format!("{text}{}", " ".repeat(width - len))
+fn session_model_label(session: &workspace::SessionCard) -> Option<String> {
+    session
+        .subtitle
+        .split('·')
+        .nth(1)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn session_switcher_compact_transcript_line(line: &str, width: usize) -> String {
+    let (role, content) = session_switcher_split_preview_role(line);
+    let compact = match role {
+        Some("user") => format!("latest prompt: {content}"),
+        Some("asst" | "assistant") => format!("latest answer: {content}"),
+        Some("tool") => format!("tool: {content}"),
+        Some("sys" | "system") => format!("system: {content}"),
+        Some("task" | "background_task") => format!("task: {content}"),
+        Some("meta") => format!("meta: {content}"),
+        _ => line.trim().to_string(),
+    };
+    truncate_chars(&compact, width)
+}
+
+fn session_switcher_transcript_preview_line(
+    line: &str,
+    user_turn: &mut usize,
+) -> SessionSwitcherRenderedLine {
+    let (role, content) = session_switcher_split_preview_role(line);
+    match role {
+        Some("user") => {
+            let rendered = format!("Prompt {}  {}", *user_turn, content);
+            *user_turn = (*user_turn).saturating_add(1);
+            SessionSwitcherRenderedLine::new(rendered, SingleSessionLineStyle::User)
+        }
+        Some("asst" | "assistant") => SessionSwitcherRenderedLine::new(
+            format!("Assistant  {content}"),
+            SingleSessionLineStyle::Assistant,
+        ),
+        Some("tool") => SessionSwitcherRenderedLine::new(
+            format!("Tool  {content}"),
+            SingleSessionLineStyle::Tool,
+        ),
+        Some("sys" | "system") => SessionSwitcherRenderedLine::new(
+            format!("System  {content}"),
+            SingleSessionLineStyle::Meta,
+        ),
+        Some("task" | "background_task") => SessionSwitcherRenderedLine::new(
+            format!("Task  {content}"),
+            SingleSessionLineStyle::Meta,
+        ),
+        Some("meta") => SessionSwitcherRenderedLine::new(
+            format!("Meta  {content}"),
+            SingleSessionLineStyle::Meta,
+        ),
+        _ => SessionSwitcherRenderedLine::new(
+            line.trim().to_string(),
+            SingleSessionLineStyle::Overlay,
+        ),
+    }
+}
+
+fn session_switcher_split_preview_role(line: &str) -> (Option<&str>, &str) {
+    let trimmed = line.trim();
+    let Some((role, content)) = trimmed.split_once(char::is_whitespace) else {
+        return (None, trimmed);
+    };
+    match role {
+        "user" | "asst" | "assistant" | "tool" | "sys" | "system" | "task" | "background_task"
+        | "meta" => (Some(role), content.trim()),
+        _ => (None, trimmed),
     }
 }
 
@@ -4420,6 +6666,34 @@ fn session_card_search_text(session: &workspace::SessionCard) -> String {
         text.push_str(line);
     }
     text.to_lowercase()
+}
+
+fn session_switcher_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack
+        .split_whitespace()
+        .filter_map(|token| session_switcher_token_fuzzy_score(needle, token))
+        .min()
+}
+
+fn session_switcher_token_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
+    let mut score = 0usize;
+    let mut position = 0usize;
+    for ch in needle.chars() {
+        let offset = haystack[position..].find(ch)?;
+        score += offset;
+        position += offset + ch.len_utf8();
+    }
+
+    if needle.len() > 1 && score > needle.len() * 6 {
+        return None;
+    }
+
+    Some(score)
 }
 
 fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSessionStyledLine> {
@@ -4574,6 +6848,18 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
     lines
 }
 
+fn session_info_inline_line_count(app: &SingleSessionApp) -> usize {
+    12 + usize::from(
+        app.session
+            .as_ref()
+            .is_some_and(|session| !session.subtitle.trim().is_empty()),
+    ) + usize::from(
+        app.session
+            .as_ref()
+            .is_some_and(|session| !session.detail.trim().is_empty()),
+    ) + usize::from(app.error.is_some())
+}
+
 fn session_message_role_counts(
     messages: &[SingleSessionMessage],
 ) -> (usize, usize, usize, usize, usize) {
@@ -4656,11 +6942,6 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
             continue;
         };
         let visible_position = window_start + row_offset;
-        let selector = if visible_position == picker.selected {
-            "›"
-        } else {
-            " "
-        };
         let provider = choice.provider.as_deref().unwrap_or("auto");
         let method = choice.api_method.as_deref().unwrap_or("auto");
         let current_badge = if Some(choice.model.as_str()) == current {
@@ -4684,11 +6965,7 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
             SingleSessionLineStyle::Overlay
         };
         lines.push(styled_line(
-            format!(
-                "{selector} {}{}",
-                truncate_chars(&choice.model, 54),
-                current_badge,
-            ),
+            format!("{}{}", truncate_chars(&choice.model, 54), current_badge,),
             row_style,
         ));
         lines.push(styled_line(
@@ -4704,20 +6981,53 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
     if visible.len() > window_start + window.len() {
         lines.push(styled_line(
             format!(
-                "… {} more models",
+                "{} more models",
                 visible.len() - window_start - window.len()
             ),
             SingleSessionLineStyle::Overlay,
         ));
     }
     let footer = if picker.preview {
-        "↑↓/PgUp/PgDn select   Home/End top/bottom   Enter use model   Esc clear /model"
+        "Up/Down/PageUp/PageDown select   Home/End top/bottom   Enter use model   Esc clear /model"
     } else {
-        "↑↓/PgUp/PgDn select   Home/End top/bottom   Type filter   Enter use   Esc close"
+        "Up/Down/PageUp/PageDown select   Home/End top/bottom   Type filter   Enter use   Esc close"
     };
     lines.push(styled_line(footer, SingleSessionLineStyle::Overlay));
 
     lines
+}
+
+fn model_picker_inline_line_count(picker: &ModelPickerState) -> usize {
+    let visible_len = picker.filtered_indices().len();
+    let mut count = 2;
+    if picker.loading {
+        count += 1;
+    }
+    if picker.error.is_some() {
+        count += 1;
+    }
+    if visible_len == 0 && !picker.loading {
+        return count + 2;
+    }
+
+    let (window_start, window_len) =
+        row_window_bounds(visible_len, picker.selected, MODEL_PICKER_INLINE_ROW_LIMIT);
+    count += window_len * 2;
+    if visible_len > window_start + window_len {
+        count += 1;
+    }
+    count + 1
+}
+
+fn row_window_bounds(visible_len: usize, selected: usize, limit: usize) -> (usize, usize) {
+    if visible_len == 0 || limit == 0 {
+        return (0, 0);
+    }
+    let max_start = visible_len.saturating_sub(limit);
+    let selected = selected.min(visible_len - 1);
+    let start = selected.saturating_sub(limit / 2).min(max_start);
+    let end = (start + limit).min(visible_len);
+    (start, end - start)
 }
 
 fn model_picker_preview_filter(input: &str) -> Option<String> {
@@ -4725,6 +7035,21 @@ fn model_picker_preview_filter(input: &str) -> Option<String> {
     let rest = trimmed
         .strip_prefix("/model")
         .or_else(|| trimmed.strip_prefix("/models"))?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    rest.chars()
+        .next()
+        .filter(|ch| ch.is_whitespace())
+        .map(|_| rest.trim_start().to_string())
+}
+
+fn session_switcher_preview_filter(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    let rest = trimmed
+        .strip_prefix("/resume")
+        .or_else(|| trimmed.strip_prefix("/sessions"))
+        .or_else(|| trimmed.strip_prefix("/session"))?;
     if rest.is_empty() {
         return Some(String::new());
     }
@@ -4756,6 +7081,43 @@ fn model_picker_current_label(provider_name: Option<&str>, current_model: Option
     }
 }
 
+fn inferred_desktop_reasoning_efforts(
+    provider_name: Option<&str>,
+    model_name: Option<&str>,
+    current_effort: Option<&str>,
+) -> &'static [&'static str] {
+    let provider = provider_name.unwrap_or_default().to_ascii_lowercase();
+    let model = model_name.unwrap_or_default().to_ascii_lowercase();
+    let current = current_effort.unwrap_or_default().to_ascii_lowercase();
+
+    if provider.contains("openrouter") {
+        if model.contains("deepseek") || current == "max" {
+            return DESKTOP_REASONING_EFFORTS_DEEPSEEK;
+        }
+        return DESKTOP_REASONING_EFFORTS_OPENAI;
+    }
+
+    if provider.contains("deepseek") || model.contains("deepseek") || current == "max" {
+        return DESKTOP_REASONING_EFFORTS_DEEPSEEK;
+    }
+
+    let is_anthropic = provider.contains("anthropic")
+        || provider.contains("claude")
+        || model.starts_with("claude-")
+        || model.contains("/claude-");
+    if is_anthropic {
+        if model.contains("claude-opus-4-7") || current == "xhigh" {
+            return DESKTOP_REASONING_EFFORTS_OPENAI;
+        }
+        return DESKTOP_REASONING_EFFORTS_ANTHROPIC_STANDARD;
+    }
+
+    // Before the model catalog arrives, the desktop may only know the current
+    // runtime setting. Keep the shortcut responsive by falling back to the
+    // common OpenAI/Anthropic order instead of doing a blocking history lookup.
+    DESKTOP_REASONING_EFFORTS_OPENAI
+}
+
 fn model_choice_search_text(choice: &DesktopModelChoice) -> String {
     format!(
         "{} {} {} {}",
@@ -4765,6 +7127,34 @@ fn model_choice_search_text(choice: &DesktopModelChoice) -> String {
         choice.detail.as_deref().unwrap_or_default()
     )
     .to_lowercase()
+}
+
+fn model_picker_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack
+        .split_whitespace()
+        .filter_map(|token| model_picker_token_fuzzy_score(needle, token))
+        .min()
+}
+
+fn model_picker_token_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
+    let mut score = 0usize;
+    let mut position = 0usize;
+    for ch in needle.chars() {
+        let offset = haystack[position..].find(ch)?;
+        score += offset;
+        position += offset + ch.len_utf8();
+    }
+
+    if needle.len() > 1 && score > needle.len() * 6 {
+        return None;
+    }
+
+    Some(score)
 }
 
 fn desktop_slash_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
@@ -4800,14 +7190,16 @@ fn desktop_slash_fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
 }
 
 fn dedupe_model_choices(choices: Vec<DesktopModelChoice>) -> Vec<DesktopModelChoice> {
-    let mut deduped: Vec<DesktopModelChoice> = Vec::new();
+    let mut seen = HashSet::with_capacity(choices.len());
+    let mut deduped: Vec<DesktopModelChoice> = Vec::with_capacity(choices.len());
     for choice in choices {
-        if deduped.iter().any(|existing| {
-            existing.model == choice.model
-                && existing.provider == choice.provider
-                && existing.api_method == choice.api_method
-                && existing.detail == choice.detail
-        }) {
+        let key = (
+            choice.model.clone(),
+            choice.provider.clone(),
+            choice.api_method.clone(),
+            choice.detail.clone(),
+        );
+        if !seen.insert(key) {
             continue;
         }
         deduped.push(choice);
@@ -4841,6 +7233,7 @@ const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
             ("Ctrl+M/N", "switch to next/previous model"),
             ("Ctrl+Tab", "switch to next model"),
             ("Ctrl+Shift+Tab", "switch to previous model"),
+            ("Alt+←/→", "change thinking level"),
             ("Ctrl+P/O", "open recent session switcher"),
             ("Ctrl+Shift+S", "toggle inline session info/stats"),
         ],
@@ -4864,7 +7257,7 @@ const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
             ("Ctrl+U/K", "delete to line start/end"),
             ("Ctrl+W/Ctrl+Backspace", "delete previous word"),
             ("Alt+Backspace", "delete previous word, terminal-style"),
-            ("Ctrl/Alt+←/→, Ctrl+B/F", "move by word"),
+            ("Ctrl+←/→, Ctrl+B/F", "move by word"),
             ("Alt+B/F", "move by word, terminal-style"),
             ("Alt+D", "delete next word"),
             ("Tab", "complete slash command suggestion"),
@@ -4924,12 +7317,26 @@ fn hotkey_help_inline_widget() -> ReadOnlyInlineWidget {
     ReadOnlyInlineWidget::new("desktop shortcuts", single_session_help_styled_lines())
 }
 
+fn hotkey_help_inline_line_count() -> usize {
+    single_session_help_styled_line_count() + 2
+}
+
+fn single_session_help_styled_line_count() -> usize {
+    DESKTOP_SLASH_COMMANDS.len()
+        + 1
+        + SINGLE_SESSION_HELP_SECTIONS
+            .iter()
+            .map(|section| 2 + section.shortcuts.len())
+            .sum::<usize>()
+}
+
 fn append_chat_message_lines(
     lines: &mut Vec<SingleSessionStyledLine>,
     message: &SingleSessionMessage,
     user_turn: &mut usize,
     is_active_tool: bool,
     active_tool_input: Option<&str>,
+    tool_run: Option<&SingleSessionToolRun>,
 ) {
     match message.role() {
         SingleSessionRole::User => {
@@ -4942,6 +7349,7 @@ fn append_chat_message_lines(
             message.content().trim(),
             is_active_tool,
             active_tool_input,
+            tool_run,
         ),
         SingleSessionRole::System | SingleSessionRole::Meta => {
             append_meta_lines(lines, message.content().trim())
@@ -4955,15 +7363,27 @@ fn append_user_lines(lines: &mut Vec<SingleSessionStyledLine>, turn: usize, cont
         return;
     };
     lines.push(styled_line(
-        format!("{turn}  {first}"),
+        format!("{turn}  {}", compact_single_session_visible_line(first)),
         SingleSessionLineStyle::User,
     ));
     for line in content_lines {
         lines.push(styled_line(
-            format!("   {line}"),
+            format!("   {}", compact_single_session_visible_line(line)),
             SingleSessionLineStyle::UserContinuation,
         ));
     }
+}
+
+fn compact_single_session_visible_line(line: &str) -> String {
+    const MAX_VISIBLE_BYTES: usize = 512;
+
+    if line.len() <= MAX_VISIBLE_BYTES {
+        return line.to_string();
+    }
+
+    let prefix_len = safe_utf8_prefix_len(line, MAX_VISIBLE_BYTES);
+    let omitted = line.len().saturating_sub(prefix_len);
+    format!("{}… <{} bytes omitted>", &line[..prefix_len], omitted)
 }
 
 fn is_user_prompt_line(line: &str) -> bool {
@@ -5462,7 +7882,7 @@ impl AssistantMarkdownRenderer {
             self.current.push_str(&image.dest_url);
         }
         if self.current_style == SingleSessionLineStyle::Assistant {
-            self.line_style_override = Some(SingleSessionLineStyle::AssistantLink);
+            self.line_style_override = Some(SingleSessionLineStyle::AssistantMedia);
         }
     }
 
@@ -5934,6 +8354,7 @@ fn append_tool_lines(
     content: &str,
     active: bool,
     active_input: Option<&str>,
+    tool_run: Option<&SingleSessionToolRun>,
 ) {
     if content.is_empty() {
         return;
@@ -5942,6 +8363,7 @@ fn append_tool_lines(
     let Some(header) = raw_lines.next() else {
         return;
     };
+    let header_is_expanded = header.trim_start().starts_with('▾');
     if !header.trim_start().starts_with(['▾', '▸']) {
         for line in std::iter::once(header).chain(raw_lines) {
             if !line.trim().is_empty() {
@@ -5954,6 +8376,29 @@ fn append_tool_lines(
         return;
     }
     let header = parse_tool_header(header);
+    let tool_state = tool_run
+        .map(|run| run.state)
+        .or_else(|| {
+            header
+                .state
+                .as_deref()
+                .map(SingleSessionToolVisualState::from_tool_state_text)
+        })
+        .unwrap_or(SingleSessionToolVisualState::Unknown);
+    let expanded = active || header_is_expanded;
+    let base_metadata = SingleSessionToolLineMetadata {
+        call_id: tool_run
+            .map(|run| run.call_id.clone())
+            .unwrap_or_else(|| fallback_tool_line_call_id(&header)),
+        name: tool_run
+            .map(|run| run.name.clone())
+            .unwrap_or_else(|| header.name.clone()),
+        state: tool_state,
+        kind: SingleSessionToolLineKind::Header,
+        active: active && tool_state.is_active(),
+        expanded,
+        stdin_prompt: tool_run.and_then(|run| run.stdin_prompt.clone()),
+    };
     let mut metadata_lines = Vec::new();
     let mut widget_lines = Vec::new();
     for line in raw_lines {
@@ -5966,11 +8411,22 @@ fn append_tool_lines(
     if let Some(raw_input) = active_input.filter(|input| !input.is_empty()) {
         metadata_lines.extend(formatted_tool_input_lines(&header.name, raw_input));
     }
+    if metadata_lines.is_empty()
+        && let Some(input_preview) = tool_run.and_then(|run| run.input_preview.as_deref())
+    {
+        metadata_lines.push(input_preview.to_string());
+    }
+    if let Some(stdin_prompt) = &base_metadata.stdin_prompt {
+        metadata_lines.push(format!("input needed: {stdin_prompt}"));
+    }
 
-    lines.push(styled_line(
-        format_tool_header_line_with_metadata(&header, &metadata_lines),
-        SingleSessionLineStyle::Tool,
-    ));
+    lines.push(
+        styled_line(
+            format_tool_header_line_with_metadata(&header, &metadata_lines),
+            SingleSessionLineStyle::Tool,
+        )
+        .with_tool_metadata(base_metadata.clone()),
+    );
 
     if active
         && widget_lines.is_empty()
@@ -5979,9 +8435,18 @@ fn append_tool_lines(
         widget_lines.push("waiting for tool output…".to_string());
     }
 
-    if active && !widget_lines.is_empty() {
-        append_tool_content_widget(lines, &widget_lines);
+    if expanded && !widget_lines.is_empty() {
+        append_tool_content_widget(lines, &widget_lines, &base_metadata);
     }
+}
+
+fn fallback_tool_line_call_id(header: &ToolHeader) -> String {
+    format!(
+        "legacy-tool:{}:{}:{}",
+        header.name,
+        header.state.as_deref().unwrap_or("unknown"),
+        header.summary.as_deref().unwrap_or_default()
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -6059,39 +8524,34 @@ fn compact_tool_metadata(metadata_lines: &[String]) -> Option<String> {
     (!metadata.is_empty()).then(|| compact_tool_text(&metadata, 116))
 }
 
-fn append_tool_content_widget(lines: &mut Vec<SingleSessionStyledLine>, content_lines: &[String]) {
+fn append_tool_content_widget(
+    lines: &mut Vec<SingleSessionStyledLine>,
+    content_lines: &[String],
+    base_metadata: &SingleSessionToolLineMetadata,
+) {
     const MAX_WIDGET_LINES: usize = 12;
-    const WIDGET_WIDTH: usize = 68;
-
-    lines.push(styled_line(
-        format!("  ╭{}╮", "─".repeat(WIDGET_WIDTH)),
-        SingleSessionLineStyle::Tool,
-    ));
     for line in content_lines.iter().take(MAX_WIDGET_LINES) {
-        lines.push(styled_line(
-            format_tool_widget_content_line(line, WIDGET_WIDTH),
-            SingleSessionLineStyle::Tool,
-        ));
+        lines.push(tool_detail_styled_line(line, base_metadata));
     }
     if content_lines.len() > MAX_WIDGET_LINES {
-        lines.push(styled_line(
-            format_tool_widget_content_line(
-                &format!("… {} more lines", content_lines.len() - MAX_WIDGET_LINES),
-                WIDGET_WIDTH,
-            ),
-            SingleSessionLineStyle::Tool,
+        lines.push(tool_detail_styled_line(
+            &format!("… {} more lines", content_lines.len() - MAX_WIDGET_LINES),
+            base_metadata,
         ));
     }
-    lines.push(styled_line(
-        format!("  ╰{}╯", "─".repeat(WIDGET_WIDTH)),
-        SingleSessionLineStyle::Tool,
-    ));
 }
 
-fn format_tool_widget_content_line(line: &str, width: usize) -> String {
-    let line = compact_tool_widget_text(line, width);
-    let padding = width.saturating_sub(line.chars().count());
-    format!("  │{line}{}│", " ".repeat(padding))
+fn tool_detail_styled_line(
+    line: &str,
+    base_metadata: &SingleSessionToolLineMetadata,
+) -> SingleSessionStyledLine {
+    let mut metadata = base_metadata.clone();
+    metadata.kind = SingleSessionToolLineKind::Detail;
+    styled_line(
+        format!("    {}", compact_tool_widget_text(line, 118)),
+        SingleSessionLineStyle::Tool,
+    )
+    .with_tool_metadata(metadata)
 }
 
 fn compact_tool_widget_text(text: &str, max_chars: usize) -> String {
@@ -6112,6 +8572,8 @@ fn append_tool_group_summary(
     lines: &mut Vec<SingleSessionStyledLine>,
     tool_messages: &[SingleSessionMessage],
 ) {
+    const TOOL_GROUP_SUMMARY_VISIBLE_FRAGMENT_LIMIT: usize = 6;
+
     if tool_messages.is_empty() {
         return;
     }
@@ -6121,7 +8583,12 @@ fn append_tool_group_summary(
     let mut approx_tokens = 0usize;
 
     for message in tool_messages {
-        approx_tokens += message.content().chars().count().div_ceil(4);
+        // This is only a collapsed-card estimate. Counting Unicode scalar
+        // values scans every byte of large tool outputs and made first content
+        // frames visibly stall for transcripts with huge tool groups. Use the
+        // byte length's O(1) metadata instead; it is a good enough token proxy
+        // for a summary that is intentionally approximate.
+        approx_tokens += message.content().len().div_ceil(4);
         let name = tool_summary_name(message.content());
         if let Some(index) = names.iter().position(|existing| existing == &name) {
             counts[index] += 1;
@@ -6131,17 +8598,41 @@ fn append_tool_group_summary(
         }
     }
 
-    let fragments = names
+    let total_distinct_tools = names.len();
+    let mut summary_hasher = DefaultHasher::new();
+    names.hash(&mut summary_hasher);
+    counts.hash(&mut summary_hasher);
+    approx_tokens.hash(&mut summary_hasher);
+    let summary_hash = summary_hasher.finish();
+
+    let mut fragments = names
         .into_iter()
         .zip(counts)
+        .take(TOOL_GROUP_SUMMARY_VISIBLE_FRAGMENT_LIMIT)
         .map(|(name, count)| format!("{count} {name}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    if total_distinct_tools > TOOL_GROUP_SUMMARY_VISIBLE_FRAGMENT_LIMIT {
+        fragments.push(format!(
+            "{} more kinds",
+            total_distinct_tools - TOOL_GROUP_SUMMARY_VISIBLE_FRAGMENT_LIMIT
+        ));
+    }
+    let fragments = fragments.join(", ");
     let token_fragment = format_approx_tokens(approx_tokens);
-    lines.push(styled_line(
-        format!("  ▸ tools: {fragments} · ~{token_fragment} tokens"),
-        SingleSessionLineStyle::Tool,
-    ));
+    let line = format!("  ▸ tools: {fragments} · ~{token_fragment} tokens");
+    lines.push(
+        styled_line(line.clone(), SingleSessionLineStyle::Tool).with_tool_metadata(
+            SingleSessionToolLineMetadata {
+                call_id: format!("tool-group:{summary_hash:016x}"),
+                name: "tools".to_string(),
+                state: SingleSessionToolVisualState::Group,
+                kind: SingleSessionToolLineKind::GroupSummary,
+                active: false,
+                expanded: false,
+                stdin_prompt: None,
+            },
+        ),
+    );
 }
 
 fn tool_summary_name(content: &str) -> String {
@@ -6173,6 +8664,10 @@ fn formatted_tool_input_lines(tool_name: &str, raw_input: &str) -> Vec<String> {
     let raw_input = raw_input.trim();
     if raw_input.is_empty() {
         return vec!["input: <empty>".to_string()];
+    }
+
+    if !looks_like_json_value(raw_input) {
+        return vec![format!("input: {}", compact_tool_text(raw_input, 132))];
     }
 
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_input) else {
@@ -6214,6 +8709,13 @@ fn formatted_tool_input_lines(tool_name: &str, raw_input: &str) -> Vec<String> {
         rendered.push(format!("… {} more", total - MAX_INPUT_LINES));
     }
     rendered
+}
+
+fn looks_like_json_value(text: &str) -> bool {
+    matches!(
+        text.as_bytes().first().copied(),
+        Some(b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n')
+    )
 }
 
 fn formatted_tool_input_summary(
@@ -6407,12 +8909,37 @@ fn is_sensitive_tool_input_key(key: &str) -> bool {
 }
 
 fn compact_tool_text(text: &str, max_chars: usize) -> String {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() > max_chars {
-        format!("{}…", text.chars().take(max_chars).collect::<String>())
-    } else {
-        text
+    let mut compacted = String::new();
+    let mut chars = 0usize;
+    let mut first_word = true;
+
+    for word in text.split_whitespace() {
+        if first_word {
+            first_word = false;
+        } else if chars == max_chars {
+            compacted.push('…');
+            return compacted;
+        } else {
+            compacted.push(' ');
+            chars += 1;
+        }
+
+        for ch in word.chars() {
+            if chars == max_chars {
+                compacted.push('…');
+                return compacted;
+            }
+            compacted.push(ch);
+            chars += 1;
+        }
     }
+
+    compacted
+}
+
+fn normalized_tool_call_id(id: Option<String>) -> Option<String> {
+    id.map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
 }
 
 fn merge_tool_finish_with_existing_context(existing: &str, finish_line: &str) -> String {
@@ -6546,13 +9073,14 @@ fn complete_slash_command(
         return None;
     }
     let suffix = &input[cursor..];
+    let prefix_key = prefix.to_ascii_lowercase();
     let matches = completions
         .iter()
         .copied()
-        .filter(|command| command.starts_with(prefix))
+        .filter(|command| command.starts_with(&prefix_key))
         .collect::<Vec<_>>();
     let completion = match matches.as_slice() {
-        [] => return None,
+        [] => fuzzy_slash_completion(&prefix_key, completions)?,
         [only] => *only,
         _ => longest_common_prefix(&matches)?,
     };
@@ -6562,6 +9090,22 @@ fn complete_slash_command(
     let mut completed = completion.to_string();
     completed.push_str(suffix);
     Some((completed, completion.len()))
+}
+
+fn fuzzy_slash_completion(needle: &str, completions: &[&'static str]) -> Option<&'static str> {
+    let mut matches = completions
+        .iter()
+        .copied()
+        .filter_map(|command| {
+            desktop_slash_fuzzy_score(needle, command).map(|score| (score, command.len(), command))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+    matches.first().map(|(_, _, command)| *command)
 }
 
 fn longest_common_prefix<'a>(values: &'a [&'a str]) -> Option<&'a str> {
@@ -6599,6 +9143,7 @@ pub(crate) fn single_session_surface(
             .unwrap_or_else(|| "new jcode session".to_string()),
         body_lines: lines.clone(),
         detail_lines: lines,
+        transcript_messages: Vec::new(),
         session_id: session.map(|session| session.session_id.clone()),
         lane: 0,
         column: 0,
@@ -6680,10 +9225,148 @@ pub(crate) fn single_session_styled_lines(
 mod tests {
     use super::*;
 
-    fn rendered_tool_text(content: &str, active: bool) -> Vec<String> {
+    fn rendered_tool_lines(content: &str, active: bool) -> Vec<SingleSessionStyledLine> {
         let mut lines = Vec::new();
-        append_tool_lines(&mut lines, content, active, None);
-        lines.into_iter().map(|line| line.text).collect()
+        append_tool_lines(&mut lines, content, active, None, None);
+        lines
+    }
+
+    fn rendered_tool_text(content: &str, active: bool) -> Vec<String> {
+        rendered_tool_lines(content, active)
+            .into_iter()
+            .map(|line| line.text)
+            .collect()
+    }
+
+    fn test_model_choice(model: &str) -> DesktopModelChoice {
+        DesktopModelChoice {
+            model: model.to_string(),
+            provider: Some("test-provider".to_string()),
+            api_method: Some("chat".to_string()),
+            detail: Some("available".to_string()),
+            available: true,
+        }
+    }
+
+    fn test_session_card(session_id: &str, title: &str) -> workspace::SessionCard {
+        workspace::SessionCard {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            subtitle: "active · test-model".to_string(),
+            detail: "4 msgs · just now · test".to_string(),
+            preview_lines: vec!["user latest compact prompt".to_string()],
+            detail_lines: vec![
+                "user first question".to_string(),
+                "assistant first answer".to_string(),
+                "tool bash completed".to_string(),
+            ],
+            transcript_messages: Vec::new(),
+        }
+    }
+
+    fn assert_render_line_count_matches(app: &SingleSessionApp) {
+        assert_eq!(
+            app.render_inline_widget_line_count(),
+            app.render_inline_widget_styled_lines().len(),
+            "render line count should match styled-line rendering"
+        );
+    }
+
+    #[test]
+    fn latest_external_cli_suggestion_uses_newest_candidate_context() {
+        let old = ExternalCliSessionCandidate {
+            source: "Claude Code",
+            modified: SystemTime::UNIX_EPOCH,
+            working_dir: Some("/tmp/old-project".to_string()),
+            context: Some("old task".to_string()),
+        };
+        let new = ExternalCliSessionCandidate {
+            source: "Codex",
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            working_dir: Some("/home/user/jcode".to_string()),
+            context: Some("implement startup continuation suggestions".to_string()),
+        };
+
+        let suggestion =
+            latest_external_cli_continuation_suggestion_from_candidates(vec![old, new])
+                .expect("newest external session should produce a suggestion");
+
+        assert_eq!(
+            suggestion,
+            "continue the latest Codex session in jcode: implement startup continuation suggestions"
+        );
+    }
+
+    #[test]
+    fn latest_external_cli_suggestion_missing_roots_returns_none() {
+        let home =
+            std::env::temp_dir().join(format!("jcode-missing-external-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            latest_external_cli_continuation_suggestion_from_home(&home),
+            None
+        );
+    }
+
+    #[test]
+    fn latest_external_cli_suggestion_ignores_malformed_jsonl() {
+        let home = std::env::temp_dir().join(format!(
+            "jcode-malformed-external-cli-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let codex_dir = home.join(".codex/sessions");
+        std::fs::create_dir_all(&codex_dir).expect("create fake codex dir");
+        std::fs::write(
+            codex_dir.join("broken.jsonl"),
+            "not json\n{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]\n",
+        )
+        .expect("write malformed jsonl");
+
+        assert_eq!(
+            latest_external_cli_continuation_suggestion_from_home(&home),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn inline_widget_line_count_matches_rendered_lines_for_active_widgets() {
+        let mut help = SingleSessionApp::new(None);
+        help.show_help = true;
+        assert_render_line_count_matches(&help);
+
+        let mut info = SingleSessionApp::new(None);
+        info.show_session_info = true;
+        info.error = Some("test error".to_string());
+        info.session = Some(test_session_card("session_info", "Info Session"));
+        assert_render_line_count_matches(&info);
+
+        let mut slash = SingleSessionApp::new(None);
+        slash.handle_key(KeyInput::Character("/re".to_string()));
+        assert_render_line_count_matches(&slash);
+
+        let mut model = SingleSessionApp::new(None);
+        model.model_picker.open = true;
+        model.model_picker.choices = vec![test_model_choice("alpha"), test_model_choice("beta")];
+        model.model_picker.selected = 1;
+        model.model_picker.refresh_visible_indices();
+        assert_render_line_count_matches(&model);
+
+        let mut switcher = SingleSessionApp::new(None);
+        switcher.session_switcher.open = true;
+        switcher.session_switcher.sessions = vec![
+            test_session_card("session_alpha", "Alpha"),
+            test_session_card("session_beta", "Beta"),
+        ];
+        switcher.session_switcher.selected = 1;
+        switcher.session_switcher.refresh_visible_indices();
+        assert_render_line_count_matches(&switcher);
     }
 
     #[test]
@@ -6708,11 +9391,35 @@ mod tests {
             lines,
             vec![
                 "  ● bash · running · $ cargo test -p jcode-desktop · background: yes",
-                "  ╭────────────────────────────────────────────────────────────────────╮",
-                "  │waiting for tool output…                                            │",
-                "  ╰────────────────────────────────────────────────────────────────────╯",
+                "    waiting for tool output…",
             ]
         );
+    }
+
+    #[test]
+    fn active_tool_lines_carry_visual_metadata_for_native_cards() {
+        let lines = rendered_tool_lines(
+            "▾ bash running\n  input: {\"command\":\"cargo test -p jcode-desktop\"}",
+            true,
+        );
+
+        let header = lines[0]
+            .tool
+            .as_ref()
+            .expect("tool header should carry native card metadata");
+        assert_eq!(header.name, "bash");
+        assert_eq!(header.state, SingleSessionToolVisualState::Running);
+        assert_eq!(header.kind, SingleSessionToolLineKind::Header);
+        assert!(header.active);
+        assert!(header.expanded);
+
+        let detail = lines[1]
+            .tool
+            .as_ref()
+            .expect("tool detail should share native card metadata");
+        assert_eq!(detail.call_id, header.call_id);
+        assert_eq!(detail.kind, SingleSessionToolLineKind::Detail);
+        assert!(detail.active);
     }
 
     #[test]
@@ -6753,32 +9460,37 @@ mod tests {
         );
         assert_eq!(
             lines[1],
-            "  ╭────────────────────────────────────────────────────────────────────╮"
+            "    error[E0425]: cannot find value `foo` in this scope"
         );
-        assert_eq!(
-            lines[2],
-            "  │error[E0425]: cannot find value `foo` in this scope                 │"
-        );
-        assert_eq!(
-            lines[3],
-            "  │test result: FAILED                                                 │"
-        );
-        assert_eq!(
-            lines[4],
-            "  ╰────────────────────────────────────────────────────────────────────╯"
-        );
+        assert_eq!(lines[2], "    test result: FAILED");
     }
 
     #[test]
     fn inactive_tool_result_compacts_to_metadata_only() {
         let lines = rendered_tool_text(
-            "▾ bash done: tests passed\n  input: {\"command\":\"cargo test -p jcode-desktop\"}\n  test result: ok",
+            "▸ bash done: tests passed\n  input: {\"command\":\"cargo test -p jcode-desktop\"}\n  test result: ok",
             false,
         );
 
         assert_eq!(
             lines,
             vec!["  ✓ bash · done · tests passed · $ cargo test -p jcode-desktop"]
+        );
+    }
+
+    #[test]
+    fn expanded_inactive_tool_result_shows_detail_widget() {
+        let lines = rendered_tool_text(
+            "▾ edit done: updated file\n  input: {\"file_path\":\"src/lib.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}\n  Edited src/lib.rs: replaced 1 occurrence",
+            false,
+        );
+
+        assert_eq!(lines[0], "  ✓ edit · done · updated file · src/lib.rs");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Edited src/lib.rs: replaced 1 occurrence")),
+            "expanded inactive edit tool should render its detail widget: {lines:?}"
         );
     }
 
@@ -6798,6 +9510,59 @@ mod tests {
             "{\"intent\":\"describe action\",\"query\":\"tool calls\"}",
         );
         assert_eq!(lines, vec!["query: tool calls", "intent: describe action"]);
+    }
+
+    #[test]
+    fn plain_tool_input_skips_json_probe_and_renders_compactly() {
+        let lines = formatted_tool_input_lines("bash", " chunk-0 chunk-1 chunk-2");
+        assert_eq!(lines, vec!["input: chunk-0 chunk-1 chunk-2"]);
+        assert!(!looks_like_json_value("chunk-0"));
+        assert!(looks_like_json_value("{\"command\":\"cargo test\"}"));
+    }
+
+    #[test]
+    fn active_tool_cache_key_ignores_input_suffix_after_visible_preview_stabilizes() {
+        let mut app = SingleSessionApp::new(None);
+        app.apply_session_event(DesktopSessionEvent::ToolStarted {
+            id: Some("tool-a".to_string()),
+            name: "bash".to_string(),
+        });
+        app.apply_session_event(DesktopSessionEvent::ToolExecuting {
+            id: Some("tool-a".to_string()),
+            name: "bash".to_string(),
+        });
+        app.apply_session_event(DesktopSessionEvent::ToolInput {
+            id: Some("tool-a".to_string()),
+            delta: "a".repeat(160),
+        });
+
+        let body_before = app.body_lines();
+        let body_key_before = app.rendered_body_cache_key((900, 700));
+        let static_key_before = app.rendered_body_static_cache_key((900, 700));
+
+        app.apply_session_event(DesktopSessionEvent::ToolInput {
+            id: Some("tool-a".to_string()),
+            delta: "b".repeat(40),
+        });
+
+        assert_eq!(app.body_lines(), body_before);
+        assert_eq!(app.rendered_body_cache_key((900, 700)), body_key_before);
+        assert_eq!(
+            app.rendered_body_static_cache_key((900, 700)),
+            static_key_before
+        );
+    }
+
+    #[test]
+    fn compact_tool_text_collapses_whitespace_and_stops_after_visible_prefix() {
+        assert_eq!(
+            compact_tool_text("  alpha\n\tbeta   gamma  ", 32),
+            "alpha beta gamma"
+        );
+        assert_eq!(compact_tool_text("alpha beta gamma", 10), "alpha beta…");
+        assert_eq!(compact_tool_text("你好 世界 again", 5), "你好 世界…");
+        assert_eq!(compact_tool_text("alpha", 0), "…");
+        assert_eq!(compact_tool_text("   ", 0), "");
     }
 
     #[test]

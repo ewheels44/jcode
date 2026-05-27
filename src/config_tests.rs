@@ -1,6 +1,6 @@
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, ProviderConfig,
-    SessionPickerResumeAction, SwarmSpawnMode, config_env_fingerprint,
+    SessionPickerResumeAction, SwarmSpawnMode, ToolConfig, config_env_fingerprint,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -27,6 +27,11 @@ fn test_openai_fast_mode_defaults_to_priority() {
         ProviderConfig::default().openai_service_tier.as_deref(),
         Some("priority")
     );
+}
+
+#[test]
+fn preserve_reasoning_context_defaults_to_enabled() {
+    assert!(ProviderConfig::default().preserve_reasoning_context);
 }
 
 #[test]
@@ -59,6 +64,155 @@ fn swarm_spawn_mode_rejects_invalid_values() {
 }
 
 #[test]
+fn tool_config_defaults_to_full_toolset() {
+    let selection = ToolConfig::default().selection();
+    assert!(selection.allowed_tools.is_none());
+    assert!(selection.disabled_tools.contains("gmail"));
+    assert!(selection.disabled_tools.contains("lsp"));
+}
+
+#[test]
+fn tool_config_explicit_enabled_default_disabled_tools_opts_in() {
+    let cfg = ToolConfig {
+        enabled: vec!["gmail".to_string(), "lsp".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+    let allowed = selection
+        .allowed_tools
+        .expect("explicit enabled is an allow-list");
+
+    assert!(allowed.contains("gmail"));
+    assert!(allowed.contains("lsp"));
+    assert!(!selection.disabled_tools.contains("gmail"));
+    assert!(!selection.disabled_tools.contains("lsp"));
+}
+
+#[test]
+fn tool_config_all_enabled_sentinel_opts_in_gmail_without_allow_list() {
+    let cfg = ToolConfig {
+        enabled: vec!["*".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+
+    assert!(selection.allowed_tools.is_none());
+    assert!(!selection.disabled_tools.contains("gmail"));
+    assert!(!selection.disabled_tools.contains("lsp"));
+}
+
+#[test]
+fn tool_config_explicit_disabled_overrides_all_enabled_sentinel() {
+    let cfg = ToolConfig {
+        enabled: vec!["*".to_string()],
+        disabled: vec!["gmail".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+
+    assert!(selection.allowed_tools.is_none());
+    assert!(selection.disabled_tools.contains("gmail"));
+    assert!(!selection.disabled_tools.contains("lsp"));
+}
+
+#[test]
+fn tool_config_acp_profile_allows_core_coding_plus_batch() {
+    let cfg = ToolConfig {
+        profile: "acp".to_string(),
+        ..ToolConfig::default()
+    };
+    let allowed = cfg.allowed_tools().expect("acp profile is an allow-list");
+
+    assert!(allowed.contains("bash"));
+    assert!(allowed.contains("read"));
+    assert!(allowed.contains("write"));
+    assert!(allowed.contains("apply_patch"));
+    assert!(allowed.contains("agentgrep"));
+    assert!(allowed.contains("batch"));
+    assert!(!allowed.contains("swarm"));
+    assert!(!allowed.contains("subagent"));
+    assert!(!allowed.contains("side_panel"));
+}
+
+#[test]
+fn acp_config_defaults_to_standard_profile_and_acp_tools() {
+    let cfg = Config::default();
+    assert_eq!(cfg.acp.profile, "standard");
+    assert_eq!(cfg.acp.tool_profile, "acp");
+}
+
+#[test]
+fn tool_config_minimal_profile_allows_core_coding_tools() {
+    let cfg = ToolConfig {
+        profile: "minimal".to_string(),
+        ..ToolConfig::default()
+    };
+    let allowed = cfg
+        .allowed_tools()
+        .expect("minimal profile is an allow-list");
+
+    assert!(allowed.contains("bash"));
+    assert!(allowed.contains("read"));
+    assert!(allowed.contains("write"));
+    assert!(allowed.contains("apply_patch"));
+    assert!(allowed.contains("agentgrep"));
+    assert!(!allowed.contains("browser"));
+    assert!(!allowed.contains("swarm"));
+}
+
+#[test]
+fn tool_config_explicit_enabled_and_disabled_lists_compose() {
+    let cfg = ToolConfig {
+        enabled: vec![
+            "shell".to_string(),
+            "read_file".to_string(),
+            "browser".to_string(),
+        ],
+        disabled: vec!["browser".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+    let allowed = selection
+        .allowed_tools
+        .expect("explicit enabled is an allow-list");
+
+    assert!(allowed.contains("bash"));
+    assert!(allowed.contains("read"));
+    assert!(!allowed.contains("shell"));
+    assert!(!allowed.contains("read_file"));
+    assert!(!allowed.contains("browser"));
+    assert!(selection.disabled_tools.contains("browser"));
+}
+
+#[test]
+fn tool_config_none_profile_disables_all_tools() {
+    let cfg = ToolConfig {
+        profile: "none".to_string(),
+        ..ToolConfig::default()
+    };
+    assert!(
+        cfg.allowed_tools()
+            .expect("none profile is empty")
+            .is_empty()
+    );
+}
+
+#[test]
+fn tool_config_disabled_only_keeps_full_profile_with_deny_list() {
+    let cfg = ToolConfig {
+        disabled: vec!["browser".to_string(), "swarm".to_string()],
+        ..ToolConfig::default()
+    };
+    let selection = cfg.selection();
+
+    assert!(selection.allowed_tools.is_none());
+    assert!(selection.disabled_tools.contains("browser"));
+    assert!(selection.disabled_tools.contains("swarm"));
+    assert!(selection.disabled_tools.contains("gmail"));
+    assert!(selection.disabled_tools.contains("lsp"));
+}
+
+#[test]
 fn test_generated_default_config_uses_low_openai_reasoning_effort() {
     let _guard = crate::storage::lock_test_env();
     let prev_home = std::env::var_os("JCODE_HOME");
@@ -75,6 +229,14 @@ fn test_generated_default_config_uses_low_openai_reasoning_effort() {
     assert!(
         content.contains("openai_service_tier = \"priority\""),
         "generated default config should enable OpenAI fast mode"
+    );
+    assert!(
+        content.contains("[tools]") && content.contains("profile = \"full\""),
+        "generated default config should document tool profiles"
+    );
+    assert!(
+        content.contains("[acp]") && content.contains("tool_profile = \"acp\""),
+        "generated default config should document ACP profile settings"
     );
 
     if let Some(prev) = prev_home {
@@ -243,6 +405,21 @@ fn test_native_scrollbars_default_to_enabled() {
     let display = DisplayConfig::default();
     assert!(display.native_scrollbars.chat);
     assert!(display.native_scrollbars.side_panel);
+}
+
+#[test]
+fn test_copy_badge_alt_label_defaults_to_auto_and_deserializes() {
+    assert!(DisplayConfig::default().copy_badge_alt_label.is_empty());
+
+    let cfg: Config = toml::from_str(
+        r#"
+        [display]
+        copy_badge_alt_label = "Option"
+        "#,
+    )
+    .expect("config should deserialize");
+
+    assert_eq!(cfg.display.copy_badge_alt_label, "Option");
 }
 
 #[test]
