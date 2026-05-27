@@ -1722,7 +1722,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
                 let (confidence_label, confidence) = if todo.status == "completed" {
                     ("done", todo.completion_confidence.or(todo.confidence))
                 } else {
-                    ("conf", todo.confidence)
+                    ("confidence", todo.confidence)
                 };
                 let confidence = confidence
                     .map(|score| format!("{}%", score))

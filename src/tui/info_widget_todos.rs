@@ -69,7 +69,7 @@ fn push_aggregate_confidence_suffix(spans: &mut Vec<Span<'static>>, data: &InfoW
     };
     spans.push(Span::styled(" · ", Style::default().fg(rgb(100, 100, 110))));
     spans.push(Span::styled(
-        "conf ",
+        "confidence ",
         Style::default().fg(rgb(140, 140, 150)),
     ));
     spans.push(Span::styled(

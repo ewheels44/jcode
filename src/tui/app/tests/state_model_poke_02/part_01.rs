@@ -891,7 +891,7 @@ fn test_context_command_reports_session_context_snapshot() {
         assert!(msg.content.contains("## Todos"));
         assert!(msg.content.contains("## Side Panel"));
         assert!(msg.content.contains("Inspect context summary"));
-        assert!(msg.content.contains("[pending|high|conf 77%]"));
+        assert!(msg.content.contains("[pending|high|confidence 77%]"));
         assert!(msg.content.contains("active skill: debug"));
         assert!(msg.content.contains("queue mode: on"));
     });
