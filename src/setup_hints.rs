@@ -454,6 +454,17 @@ pub fn maybe_show_setup_hints() -> Option<StartupHints> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if !state.hotkey_configured && !state.hotkey_dismissed {
+            if let Err(err) = auto_install_macos_hotkey_listener(&mut state) {
+                crate::logging::warn(&format!(
+                    "failed to auto-install macOS Cmd+; hotkey listener: {err}"
+                ));
+            }
+        }
+    }
+
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         if !state.desktop_shortcut_created {
@@ -565,6 +576,19 @@ fn create_desktop_shortcut(state: &mut SetupHintsState) -> Result<()> {
         let _ = state.save();
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn auto_install_macos_hotkey_listener(state: &mut SetupHintsState) -> Result<()> {
+    let terminal = install_macos_hotkey_listener(None)?;
+    state.hotkey_configured = true;
+    state.hotkey_dismissed = true;
+    state.save()?;
+    crate::logging::info(&format!(
+        "Installed macOS Cmd+; hotkey listener for {}",
+        terminal.label()
+    ));
     Ok(())
 }
 
