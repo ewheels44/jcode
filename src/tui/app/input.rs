@@ -1030,12 +1030,12 @@ impl App {
                 return false;
             }
             self.push_display_message(DisplayMessage::system(
-                "✅ Todos complete. Auto-poke finished; queued confidence summary.".to_string(),
+                "✅ Todos complete. Auto-poke finished; queued hidden confidence reminder."
+                    .to_string(),
             ));
-            self.queued_messages
-                .push(super::commands::build_todo_confidence_summary_message(
-                    &todos,
-                ));
+            self.hidden_queued_system_messages.push(
+                super::commands::build_todo_confidence_summary_message(&todos),
+            );
             self.pending_queued_dispatch = true;
             return true;
         }

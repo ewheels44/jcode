@@ -1837,6 +1837,10 @@ fn test_poke_status_reports_current_state() {
             .push(super::commands::build_poke_message(
                 &super::commands::incomplete_poke_todos(&app),
             ));
+        app.hidden_queued_system_messages.push(
+            "All todos are done. Todo confidence summary:\n- Weighted completion confidence: 80%."
+                .to_string(),
+        );
 
         assert!(super::commands::handle_session_command(
             &mut app,
@@ -1876,6 +1880,10 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
             .push(super::commands::build_poke_message(
                 &super::commands::incomplete_poke_todos(&app),
             ));
+        app.hidden_queued_system_messages.push(
+            "All todos are done. Todo confidence summary:\n- Weighted completion confidence: 80%."
+                .to_string(),
+        );
 
         assert!(super::commands::handle_session_command(
             &mut app,
@@ -1885,10 +1893,11 @@ fn test_poke_off_disarms_and_clears_queued_followup() {
         assert!(!app.auto_poke_incomplete_todos);
         assert!(!app.pending_queued_dispatch);
         assert!(app.queued_messages().is_empty());
+        assert!(app.hidden_queued_system_messages.is_empty());
         assert_eq!(app.status_notice(), Some("Poke: OFF".to_string()));
         assert!(app.display_messages().iter().any(|msg| {
             msg.content.contains("Auto-poke disabled.")
-                && msg.content.contains("Cleared 1 queued poke follow-up")
+                && msg.content.contains("Cleared 2 queued poke follow-ups")
         }));
     });
 }
@@ -2033,9 +2042,11 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
 
         assert!(!app.auto_poke_incomplete_todos);
         assert!(app.pending_queued_dispatch);
-        assert_eq!(app.queued_messages().len(), 1);
-        let summary = &app.queued_messages()[0];
+        assert!(app.queued_messages().is_empty());
+        assert_eq!(app.hidden_queued_system_messages.len(), 1);
+        let summary = &app.hidden_queued_system_messages[0];
         assert!(super::commands::is_poke_message(summary));
+        assert!(super::commands::is_todo_confidence_summary_message(summary));
         assert!(summary.starts_with("All todos are done. Todo confidence summary:"));
         assert!(summary.contains("\n- Completed todos: 2."));
         assert!(summary.contains("\n- Weighted completion confidence: 86%."));
@@ -2048,8 +2059,21 @@ fn test_finish_turn_auto_poke_queues_confidence_summary_when_todos_done() {
         assert!(summary.contains("\n- Suggested action: validate or test before finalizing."));
         assert!(app.display_messages().iter().any(|msg| msg
             .content
-            .contains("queued confidence summary")));
+            .contains("queued hidden confidence reminder")));
     });
+}
+
+#[test]
+fn test_todo_confidence_summary_hidden_queue_is_not_user_prompt() {
+    let summary = "All todos are done. Todo confidence summary:\n- Weighted completion confidence: 94%."
+        .to_string();
+
+    let (user_messages, reminder, display_system_messages) =
+        super::helpers::partition_queued_messages(Vec::new(), vec![summary.clone()]);
+
+    assert!(user_messages.is_empty());
+    assert!(display_system_messages.is_empty());
+    assert_eq!(reminder.as_deref(), Some(summary.as_str()));
 }
 
 #[test]

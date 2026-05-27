@@ -70,15 +70,23 @@ pub(super) fn is_poke_message(message: &str) -> bool {
         || message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
 }
 
+pub(super) fn is_todo_confidence_summary_message(message: &str) -> bool {
+    message.starts_with(TODO_CONFIDENCE_SUMMARY_PREFIX)
+}
+
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
     !messages.is_empty() && messages.iter().all(|message| is_poke_message(message))
 }
 
 pub(super) fn clear_queued_poke_messages(app: &mut App) -> usize {
-    let before = app.queued_messages.len();
+    let before_queued = app.queued_messages.len();
     app.queued_messages
         .retain(|message| !is_poke_message(message));
-    let removed = before.saturating_sub(app.queued_messages.len());
+    let before_hidden = app.hidden_queued_system_messages.len();
+    app.hidden_queued_system_messages
+        .retain(|message| !is_todo_confidence_summary_message(message));
+    let removed = before_queued.saturating_sub(app.queued_messages.len())
+        + before_hidden.saturating_sub(app.hidden_queued_system_messages.len());
     if removed > 0 && !app.has_queued_followups() {
         app.pending_queued_dispatch = false;
     }
@@ -518,7 +526,11 @@ pub(super) fn poke_status_message(app: &App) -> String {
     let queued_followup = app
         .queued_messages
         .iter()
-        .any(|message| is_poke_message(message));
+        .any(|message| is_poke_message(message))
+        || app
+            .hidden_queued_system_messages
+            .iter()
+            .any(|message| is_todo_confidence_summary_message(message));
     let mut message = format!(
         "Auto-poke: **{}**. {} incomplete todo{}.",
         if app.auto_poke_incomplete_todos {
