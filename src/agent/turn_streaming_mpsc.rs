@@ -49,6 +49,7 @@ impl Agent {
         // Computing this inside the loop caused N+1 Python subprocess spawns and 303MB payloads.
         // Cache the result so tool-call round-trips reuse it without re-spawning Python.
         crate::logging::info("ENRICH_FIX_V2: Computing enrich context ONCE before loop");
+        crate::logging::info("ENRICH: Computing enrich context ONCE before loop");
         let cached_enrich_context = self.auto_enrich_task().await;
 
         loop {
@@ -109,8 +110,15 @@ impl Agent {
                 }
                 enriched.dynamic_part.push_str("# Mimir Project Context\n\n");
                 enriched.dynamic_part.push_str(context);
+                let ctx_len = context.len();
+                let total_len = enriched.dynamic_part.len();
+                logging::info(&format!(
+                    "Auto-enrich: injected Mimir context into prompt (context={}B, total_dynamic={}B)",
+                    ctx_len, total_len
+                ));
                 enriched
             } else {
+                crate::logging::debug("Auto-enrich: no cached context, prompt not enriched");
                 split_prompt
             };
 

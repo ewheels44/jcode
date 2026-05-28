@@ -65,8 +65,15 @@ impl Agent {
                 }
                 enriched.dynamic_part.push_str("# Mimir Project Context\n\n");
                 enriched.dynamic_part.push_str(context);
+                let ctx_len = context.len();
+                let total_len = enriched.dynamic_part.len();
+                logging::info(&format!(
+                    "Auto-enrich: injected Mimir context into prompt (context={}B, total_dynamic={}B)",
+                    ctx_len, total_len
+                ));
                 enriched
             } else {
+                crate::logging::debug("Auto-enrich: no cached context, prompt not enriched");
                 split_prompt
             };
             self.log_prompt_prefix_accounting(&split_prompt, &tools, Some(&context_info));
