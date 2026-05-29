@@ -112,8 +112,19 @@ impl Agent {
                 enriched.dynamic_part.push_str(context);
                 let ctx_len = context.len();
                 let total_len = enriched.dynamic_part.len();
+
+                // Log raw context from Mimir response on its own line(s) so it's
+                // visible when piping through `grep "Mimir"`.
+                if !context.is_empty() {
+                    for line in context.lines() {
+                        logging::info(&format!("(From run_turn_streaming_mpsc.rs) Mimir context: {}", line));
+                    }
+                } else {
+                    logging::info("Mimir context: (empty)");
+                }
+
                 logging::info(&format!(
-                    "Auto-enrich: injected Mimir context into prompt (context={}B, total_dynamic={}B)",
+                    "Auto-enrich (from run_turn_streaming_mpsc.rs): injected Mimir context into prompt (context={}B, total_dynamic={}B)",
                     ctx_len, total_len
                 ));
                 enriched

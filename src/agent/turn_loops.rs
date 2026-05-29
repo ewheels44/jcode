@@ -68,7 +68,7 @@ impl Agent {
                 let ctx_len = context.len();
                 let total_len = enriched.dynamic_part.len();
                 logging::info(&format!(
-                    "Auto-enrich: injected Mimir context into prompt (context={}B, total_dynamic={}B)",
+                    "Auto-enrich (from turn_loops.rs): injected Mimir context into prompt (context={}B, total_dynamic={}B)",
                     ctx_len, total_len
                 ));
                 enriched

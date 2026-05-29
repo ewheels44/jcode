@@ -14,7 +14,7 @@ impl Agent {
     pub(super) fn log_user_prompt_for_enrich(&self, task: &str) {
         let preview: String = task.chars().take(200).collect();
         logging::info(&format!(
-            "User prompt for enrich: {}{} ({} chars total)",
+            "Auto-enrich: User prompt for enrich: {}{} ({} chars total)",
             preview,
             if task.len() > 200 { "..." } else { "" },
             task.len()
@@ -178,7 +178,7 @@ impl Agent {
         crate::logging::info(&format!(
             "Auto-enrich: extracted user task ({} chars): {}",
             user_task.len(),
-            &user_task[..user_task.len().min(80)]
+            &user_task[..user_task.len().min(200)]
         ));
 
         if user_task.is_empty() {
@@ -188,13 +188,13 @@ impl Agent {
 
         // Find the Mimir bridge (reuse detection logic from mimir.rs)
         let working_dir = self.session.working_dir.as_deref().map(Path::new);
-        crate::logging::debug(&format!(
+        crate::logging::info(&format!(
             "Auto-enrich: detecting bridge path for working_dir={:?}",
             working_dir
         ));
         let bridge_path = match detect_mimir_bridge(working_dir) {
             Some(path) => {
-                crate::logging::debug(&format!(
+                crate::logging::info(&format!(
                     "Auto-enrich: bridge path detected at {}",
                     path.display()
                 ));
@@ -218,7 +218,7 @@ impl Agent {
             }
         });
         let request_str = serde_json::to_string(&request).ok()?;
-        crate::logging::debug(&format!(
+        crate::logging::info(&format!(
             "Auto-enrich: sending request ({} bytes): {}",
             request_str.len(),
             &request_str[..request_str.len().min(200)]
@@ -226,7 +226,7 @@ impl Agent {
 
         crate::logging::info(&format!(
             "Auto-enrich: calling Mimir enrich_task for task: {}",
-            &user_task[..user_task.len().min(100)]
+            &user_task[..user_task.len().min(200)]
         ));
 
         let started = std::time::Instant::now();
@@ -306,8 +306,8 @@ impl Agent {
         ));
 
         if !stderr.is_empty() {
-            let stderr_preview: String = stderr.chars().take(500).collect();
-            let stderr_preview = if stderr.len() > 500 {
+            let stderr_preview: String = stderr.chars().take(1000).collect();
+            let stderr_preview = if stderr.len() > 1000 {
                 format!("{}...", stderr_preview)
             } else {
                 stderr_preview
@@ -323,8 +323,8 @@ impl Agent {
             return None;
         }
 
-        let stdout_preview: String = stdout.chars().take(500).collect();
-        let stdout_preview = if stdout.len() > 500 {
+        let stdout_preview: String = stdout.chars().take(1000).collect();
+        let stdout_preview = if stdout.len() > 1000 {
             format!("{}...", stdout_preview)
         } else {
             stdout_preview
@@ -372,21 +372,42 @@ impl Agent {
 
         let formatted = format_mimir_enrich_response(&response);
         crate::logging::info(&format!(
-            "Auto-enrich: got context ({} chars, {}ms)",
+            "Auto-enrich - (From prompting.rs): got context ({} chars, {}ms)",
             formatted.len(),
             elapsed_ms
         ));
-        crate::logging::debug(&format!(
+
+        // Log raw context from Mimir response on its own line(s) so it's
+        // visible when piping through `grep "Mimir"`.
+        if let Some(ctx) = response.get("context").and_then(|c| c.as_str()) {
+            if !ctx.is_empty() {
+                for line in ctx.lines() {
+                    crate::logging::info(&format!("Auto-enrich: Mimir context: {}", line));
+                }
+            }
+            else{
+                crate::logging::info(&format!("No context: {:?}", ctx.lines()))
+            }
+        }
+
+        crate::logging::info(&format!(
             "Auto-enrich: formatted context preview: {}",
             {
-                let preview: String = formatted.chars().take(300).collect();
-                if formatted.len() > 300 {
+                let preview: String = formatted.chars().take(500).collect();
+                if formatted.len() > 500 {
                     format!("{}...", preview)
                 } else {
                     preview
                 }
             }
         ));
+
+        crate::logging::debug(&format!(
+            "Auto-enrich - Full Formatted Context ({} chars):\n{}",
+            formatted.len(),
+            formatted
+        ));
+
 
         Some(formatted)
     }
@@ -416,7 +437,7 @@ impl Agent {
                 crate::logging::debug(&format!(
                     "Auto-enrich: selected latest user message ({} chars): {}",
                     text.len(),
-                    text.chars().take(80).collect::<String>()
+                    text.chars().take(200).collect::<String>()
                 ));
             }
             None => {
